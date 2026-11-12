@@ -145,6 +145,15 @@ void Qwen35Engine::split_alloc_dev0() {
         }
         bytes.push_back(sz);
     }
+    std::vector<size_t> stash_bytes[2];  // tensor parallel: home's verify stash sizes (read while device 0 is current)
+    for (int s = 0; s < 2 && tp; ++s)
+        for (const Buf & b : v_stash2[s]) {
+            CUdeviceptr base = 0;
+            size_t sz = 0;
+            if (b.p && cuMemGetAddressRange(&base, &sz, CUdeviceptr(b.p)) != CUDA_SUCCESS)
+                throw std::runtime_error("tp: cannot read a stash buffer's size");
+            stash_bytes[s].push_back(sz);
+        }
     use_dev(0);
     // the RoPE scaling table (YaRN, linear) is __constant__ memory, per device: the constructor loaded it on device 0
     // only, so the first GPU's attention layers ran unscaled RoPE under --rope-scaling until this line
@@ -159,13 +168,7 @@ void Qwen35Engine::split_alloc_dev0() {
     }
     if (tp) {  // rank 0's own verify stash (home's sizes), KV pool and views, recurrent state, all-reduce buffers
         for (int s = 0; s < 2; ++s)
-            for (const Buf & b : dstash[1].stash[s]) {
-                CUdeviceptr base = 0;
-                size_t sz = 0;
-                if (b.p && cuMemGetAddressRange(&base, &sz, CUdeviceptr(b.p)) != CUDA_SUCCESS)
-                    throw std::runtime_error("tp: cannot read a stash buffer's size");
-                v_stash2[s].emplace_back(sz);
-            }
+            for (size_t sz : stash_bytes[s]) v_stash2[s].emplace_back(sz);
         alloc_seq_state();  // ends on device 1
         use_dev(0);
         const size_t xb = size_t(NBUF) * cfg.hidden * sizeof(bf16);
