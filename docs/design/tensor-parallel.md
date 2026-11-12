@@ -43,6 +43,28 @@ stream, norms and embeddings are replicated; each card holds half the heads, hal
 - **Execution.** M1: eager, interleaved host enqueue per segment (`use_dev` per card). M2: one captured graph per card
   per step with external event record / wait nodes; DFlash2 drafter on one card (it reads the replicated features).
 
+## Engine integration (qwen35 engine, found while reading the code)
+
+- **Device context.** Reuse the split's machinery: `cuda_of[2]`, `dstash[2]`, `use_dev(d)` (stream, side stream, events,
+  cuBLAS, the ~85 `dev_bufs()` scratch buffers, per-GPU `Int8Gemm`). TP adds to `DevStash`, swapped by `use_dev` in O(1):
+  `std::vector<Layer> layer` (each GPU's weight shards), `std::vector<KvRef> key_cache, value_cache` and the KV
+  `kv_mem / kv_pool / kv_seq` (half the KV heads each), `std::vector<Buf> conv_state, rec_state` (half the GDN heads),
+  `v_stash2[2]` (verify stash, sized by mix rows).
+- **Shapes.** After load, `cfg.heads`, `cfg.kvheads`, `cfg.ffn`, `cfg.lin_kheads`, `cfg.lin_vheads` hold the per-GPU
+  values (both GPUs are symmetric); `hidden`, `head_dim`, `lin_dk`, `lin_dv`, `vocab` stay full.
+- **Loading.** `g_mat` / `g_cat` read whole tensors with `f.read(t)`; TP wraps the read with a row slice (column-parallel:
+  q / k / v / gate per head, GDN mix rows per head group in the `[q k | v | z | b | a]` order, FFN gate / up) or a
+  column slice at a block boundary (row-parallel: `wo`, GDN `w_out`, `w_down`), then calls the format's `load()`.
+  Per-head vectors (q / k norms are per head-dim and replicated; GDN `conv_w`, `neg_a`, `dt_bias`, `gnorm_w` follow the
+  head slice).
+- **Hooks** (all-reduce of a bf16 partial, `n x hidden`):
+  1. mixer output `M` (attention `wo` in `attn_mixer`, GDN `mm_h(L.w_out, M, n)`), before `ffn_block`'s first
+     `add_sumsq(M, resid)`;
+  2. FFN output `X` after `mm_h(L.w_down, X, n)`, before the closing `add_sumsq(X, M)` (two places in `ffn_block`).
+- **Head.** M1: the full LM head on the home GPU only (~2 ms a step); vocabulary split later.
+- **Order of work per layer (eager, M1):** rank 0 mixer, rank 1 mixer, exchange, rank 0 FFN, rank 1 FFN, exchange. The
+  layer loop in `verify_body` becomes per-segment calls so both ranks' segments interleave on the host.
+
 ## Milestones
 
 | | Scope | Done when |
