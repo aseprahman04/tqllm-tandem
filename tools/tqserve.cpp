@@ -1,3 +1,4 @@
+// Modified in the multi-GPU fork: GET /props (llama.cpp's n_ctx field) for clients that size their context from it.
 #include "tokenizer_path.hpp"
 #include "serve/http.hpp"
 #include "serve/monitor_server.hpp"
@@ -457,12 +458,19 @@ int main(int argc, char ** argv) {
             // --np 1 (no scheduler): one generation at a time, but /health and /v1/models answer while it runs; every
             // connection has its own thread, so a long generation no longer blocks the accept loop
             static std::mutex single_slot;
-            const bool status_path = request.method == "GET" && (request.path == "/health" || request.path == "/v1/models" || request.path == "/v1/models/" + name);
+            const bool status_path = request.method == "GET" && (request.path == "/health" || request.path == "/props" ||
+                                                                 request.path == "/v1/models" || request.path == "/v1/models/" + name);
             std::unique_lock<std::mutex> hold(single_slot, std::defer_lock);
             if (!scheduler && !status_path) hold.lock();
             std::string body;
             status = 200;
-            if (request.method == "GET" && request.path == "/health") {
+            if (request.method == "GET" && request.path == "/props") {
+                // multi-GPU fork addition: llama.cpp's /props subset that clients read for the loaded context (n_ctx)
+                body = "{\"default_generation_settings\":{\"n_ctx\":" + std::to_string(model.context()) +
+                       "},\"total_slots\":1,\"model_path\":";
+                tqserve::jstr(body, name);
+                body += "}";
+            } else if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;
                 body = "{\"status\":\"ok\",\"engine\":\"" TQLLM_COMMIT "\",\"context\":" + std::to_string(model.context()) +

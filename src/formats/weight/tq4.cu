@@ -1,5 +1,7 @@
 // TQ4 weight format kernels (see src/formats/weight/tq4.cpp).
+// Modified in the multi-GPU fork: the shared-memory attribute is set on every device (PerDeviceOnce).
 #include "debug.hpp"
+#include "per_device_once.cuh"
 #include "common.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
@@ -1209,11 +1211,8 @@ template <int BITS>
 static void tq_gemm_h(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n,
                       int ldy, cudaStream_t s) {
     if (k % 128 || n < 1 || rows < 1) throw std::invalid_argument("tq_gemm_h: k % 128 == 0, n >= 1");
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(tq_gemm_h_k<BITS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tqg::kSmem));
-        attr = true;
-    }
+    static tqllm_cuda::PerDeviceOnce attr;  // multi-GPU fork: the limit is per device
+    attr([] { cudaFuncSetAttribute(tq_gemm_h_k<BITS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tqg::kSmem)); });
     const dim3 grid(unsigned((rows + tqg::BM - 1) / tqg::BM), unsigned((n + tqg::BN - 1) / tqg::BN));
     tq_gemm_h_k<BITS><<<grid, 256, tqg::kSmem, s>>>(w, sc, xh, y, rows, k, n, ldy);
 }

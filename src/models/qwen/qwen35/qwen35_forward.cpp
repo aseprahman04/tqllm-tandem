@@ -1,4 +1,6 @@
 // qwen35 engine: the forward pass (decode, prefill, layers). The class is declared in qwen35_engine.hpp.
+// Modified in the multi-GPU fork: state resets, prompt-cache copies and pending commits run on each layer's GPU;
+// prefill calibration times this GPU's matrices (TQLLM_SPLIT; see qwen35_split.cpp).
 #include "qwen35_engine.hpp"
 
 namespace tqllm {
@@ -6,6 +8,16 @@ namespace qwen35_detail {
 
 void Qwen35Engine::release_raw() {
     if (stream) cudaStreamSynchronize(stream);
+    for (auto & s : dstash) {  // layer split (fork addition): the parked device's stream, events and cuBLAS handle
+        if (s.stream) cudaStreamSynchronize(s.stream), cudaStreamDestroy(s.stream);
+        if (s.side) cudaStreamDestroy(s.side);
+        for (auto e : {s.ev_fork, s.ev_join, s.hop})
+            if (e) cudaEventDestroy(e);
+        if (s.blas) cublasDestroy(s.blas);
+        s.stream = s.side = nullptr, s.ev_fork = s.ev_join = s.hop = nullptr, s.blas = nullptr;
+    }
+    if (hop_ev) cudaEventDestroy(hop_ev);
+    hop_ev = nullptr;
     glru.clear([](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
     if (side) cudaStreamDestroy(side);
     if (kv_side) cudaStreamDestroy(kv_side);
@@ -220,11 +232,13 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
     if (!pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
     auto * h = static_cast<char *>(pc_host->p);
     for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
+        if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): copy on the state's own device
         ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                            cb, cudaMemcpyDefault, stream));
         ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
                            rb, cudaMemcpyDefault, stream));
     }
+    use_dev(home_dev);
 }
 
 uint32_t Qwen35Engine::pc_match(const std::vector<uint32_t> & prompt) {
@@ -451,9 +465,11 @@ void Qwen35Engine::reset_state() {
     cur = 0;
     if (pend_k) set_pending(0);
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
+        if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): the state lives on its layer's device
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
         ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
     }
+    use_dev(home_dev);
 }
 
 void Qwen35Engine::set_rope() {
@@ -552,6 +568,8 @@ void Qwen35Engine::calibrate_prefill() {
             if (m->p && m->fmt && !m->fmt->parts() && m->fmt->max_batch_cols() > 0) {
                 const size_t e = size_t(m->rows) * m->cols;
                 elems[m->fmt] += e; total += e;
+                // layer split (fork addition): time a matrix of this device's layers (the timing runs here)
+                if (split_at && dev_of(uint32_t(&L - layer.data())) != cur_dev) continue;
                 auto & r = rep[m->fmt];
                 if (!r || e > size_t(r->rows) * r->cols) r = m;
             }
@@ -1406,9 +1424,14 @@ void Qwen35Engine::flush_pending() {
     if (!pend_k) return;
     const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
     const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    if (split_at) {  // layer split (fork addition): each layer replays on its device; the chain table goes along
+        use_dev(0);
+        split_mirror_control();
+    }
     uint32_t lin_i = 0;
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         if (cfg.full[l]) continue;
+        use_dev(dev_of(l));
         const auto & L = layer[l];
         const int rows = mix_rows(L);
         const bf16 * T = v_stash2[pend_sp][lin_i].as<bf16>();
@@ -1420,6 +1443,7 @@ void Qwen35Engine::flush_pending() {
                               d_chain.as<int>());
         ++lin_i;
     }
+    use_dev(home_dev);
     cur = (cur + 1) % NSLOT;
     set_pending(0);
 }

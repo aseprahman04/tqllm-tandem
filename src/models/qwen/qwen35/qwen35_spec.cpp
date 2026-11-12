@@ -1,4 +1,6 @@
 // qwen35 engine: speculative decoding (DFlash, MTP, verify, slots). The class is declared in qwen35_engine.hpp.
+// Modified in the multi-GPU fork: verify and commit hand the rows from one GPU to the next at the layer split; tree
+// gathers run per GPU; split layers run eagerly (TQLLM_SPLIT; see qwen35_split.cpp).
 #include "qwen35_rules.hpp"
 #include "qwen35_engine.hpp"
 
@@ -20,6 +22,10 @@ void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t
 }
 
 void Qwen35Engine::verify_body(int n, int max_seq) {
+    if (split_at) {  // layer split (fork addition): the embedding and the first layers run on device 0
+        use_dev(0);
+        split_mirror_control();
+    }
     const int H = int(cfg.hidden), lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads);
     const int dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
     const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
@@ -40,6 +46,19 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
     }
     uint32_t attn_i = 0, lin_i = 0;
     for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (split_at && int(l) == split_at) {
+            // layer split: device 0's residual rows, their norm partials and the drafter features of its layers go on
+            // to device 1, whose own scratch takes over from here
+            const void *x0 = X, *px0 = v_px.p, *f0 = v_feat.p;
+            use_dev(1);
+            X = v_x.as<bf16>(), M = v_m.as<bf16>(), T = v_in.as<bf16>(), O = v_o.as<bf16>(), CORE = v_core.as<bf16>();
+            XH = v_xh.as<__half>();
+            const int to = cuda_of[1], from = cuda_of[0];
+            ck(cudaMemcpyPeerAsync(X, to, x0, from, size_t(n) * H * 2, stream));
+            ck(cudaMemcpyPeerAsync(v_px.p, to, px0, from, size_t(n) * ((H + 255) / 256) * 4, stream));
+            if (dfl.present && f0)
+                ck(cudaMemcpyPeerAsync(v_feat.p, to, f0, from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
+        }
         const auto & L = layer[l];
         capture_feature(l, X, v_feat.as<bf16>(), n);
         nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
@@ -420,7 +439,7 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     for (const auto & g : segs) kv_track(g.pos, g.n);
     uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-    ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+    launch_cached(kGraphBatch, key, stream, [&] { verify_body(col, int(context_)); });
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -586,24 +605,31 @@ bool Qwen35Engine::dflash_advance() {
         bool contiguous = true;
         for (int i = 0; i <= j; ++i) contiguous &= path[size_t(i)] == i;
         if (!contiguous) {  // accepted path -> columns 0 .. j: GDN stashes, drafter features, attention K/V
-            std::vector<tqllm_cuda::PathGather> g;
             const int nf = int(dfl.target_ids.size()), H = int(cfg.hidden);
-            uint32_t lin_i = 0, attn_i = 0;
-            for (uint32_t l = 0; l < cfg.layers; ++l) {
-                if (cfg.full[l]) {
-                    g.push_back({key_cache[attn_i].p, kv_row_bytes(true), 1});
-                    g.push_back({value_cache[attn_i].p, kv_row_bytes(false), 1});
-                    ++attn_i;
-                } else {
-                    g.push_back({v_stash2[sp][lin_i].p, int64_t(mix_rows(layer[l])) * 2, 0});
-                    ++lin_i;
+            // layer split (fork addition): one gather per device over the layers it holds; the features on device 1
+            for (int d = split_at ? 0 : home_dev; d <= home_dev; ++d) {
+                use_dev(d);
+                std::vector<tqllm_cuda::PathGather> g;
+                uint32_t lin_i = 0, attn_i = 0;
+                for (uint32_t l = 0; l < cfg.layers; ++l) {
+                    const bool here = !split_at || dev_of(l) == d;
+                    if (cfg.full[l]) {
+                        if (here) {
+                            g.push_back({key_cache[attn_i].p, kv_row_bytes(true), 1});
+                            g.push_back({value_cache[attn_i].p, kv_row_bytes(false), 1});
+                        }
+                        ++attn_i;
+                    } else {
+                        if (here) g.push_back({v_stash2[sp][lin_i].p, int64_t(mix_rows(layer[l])) * 2, 0});
+                        ++lin_i;
+                    }
                 }
+                if (d == home_dev) g.push_back({v_feat.p, int64_t(nf) * H * 2, 0});
+                ck(cudaMemcpyAsync(d_gdesc.p, g.data(), g.size() * sizeof(g[0]), cudaMemcpyHostToDevice, stream));
+                ck(cudaMemcpyAsync(d_tcols.p, path.data(), path.size() * 4, cudaMemcpyHostToDevice, stream));
+                tqllm_cuda::gather_path(d_gdesc.as<tqllm_cuda::PathGather>(), int(g.size()), d_tcols.as<int>(), j + 1,
+                                        int(pos), stream);
             }
-            g.push_back({v_feat.p, int64_t(nf) * H * 2, 0});
-            ck(cudaMemcpyAsync(d_gdesc.p, g.data(), g.size() * sizeof(g[0]), cudaMemcpyHostToDevice, stream));
-            ck(cudaMemcpyAsync(d_tcols.p, path.data(), path.size() * 4, cudaMemcpyHostToDevice, stream));
-            tqllm_cuda::gather_path(d_gdesc.as<tqllm_cuda::PathGather>(), int(g.size()), d_tcols.as<int>(), j + 1,
-                                    int(pos), stream);
         }
         if (defer) {  // deferred commit: the next verify replays this path in its GDN / conv kernels
             if (pend_k) cur = (cur + 1) % NSLOT;  // this verify wrote the previous path's state into slot cur + 1
@@ -619,10 +645,10 @@ bool Qwen35Engine::dflash_advance() {
             set_dpos(pos);
             const uint64_t key = uint64_t(k) | (uint64_t(k < last_n) << 8) | (uint64_t(cur) << 16) |
                                  (uint64_t(sp) << 24) | (uint64_t(active) << 32);
-            ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, [&] {
+            launch_cached(kGraphCommit, key, stream, [&] {
                 if (k < last_n) commit_body(k);
                 dflash_inject_body(v_feat.as<bf16>(), k);
-            }), stream));
+            });
             cur = (cur + 1) % NSLOT;
             last_n = 0;
         } else {
@@ -926,12 +952,17 @@ int Qwen35Engine::drafter_features(const std::vector<uint32_t> & tokens, std::ve
 }
 
 void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens into the next state slot
+    if (split_at) {  // layer split (fork addition): each layer replays on its device; the chain table goes along
+        use_dev(0);
+        split_mirror_control();
+    }
     {
         const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
         const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
         uint32_t lin_i = 0;
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             if (cfg.full[l]) continue;
+            use_dev(dev_of(l));
             const auto & L = layer[l];
             const int rows = mix_rows(L);
             const bf16 * T = v_stash2[sp][lin_i].as<bf16>() + size_t(stash_col0) * rows;
@@ -945,6 +976,7 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
             ++lin_i;
         }
     }
+    use_dev(home_dev);
 }
 
 }  // namespace qwen35_detail

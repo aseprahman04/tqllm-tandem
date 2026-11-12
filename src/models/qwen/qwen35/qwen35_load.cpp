@@ -1,4 +1,6 @@
 // qwen35 engine: loading and allocation. The class is declared in qwen35_engine.hpp.
+// Modified in the multi-GPU fork: per-layer device placement, a KV pool per GPU, portable host embeddings for the
+// layer split (TQLLM_SPLIT; see qwen35_split.cpp).
 #include "qwen35_engine.hpp"
 #include <cstdio>
 #include <cstring>
@@ -85,12 +87,14 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             embed = {put(b.data(), b.size()), GGML_BF16, int(cfg.vocab), H};
         }
     }
+    use_dev(home_dev);  // layer split: the output norm and head live on the last device
     out_norm = g_f32(f, "output_norm.weight", H);
     if (cfg.tied) lm_head = embed;  // tied embeddings (Qwen3.5 4B and smaller): no output.weight in the file
     else {
         const auto ht = gt(f, "output.weight").type;  // Q6_K / Q5_K heads stay raw (read through the int8 copy)
         lm_head = g_mat(f, "output.weight", int(cfg.vocab), H, ht != GGML_Q6_K && ht != GGML_Q5_K);
     }
+    use_dev(0);
     if (cfg.tied && embed.type == GGML_TQ3_4S) throw std::runtime_error("tied TQ3_4S LM head not supported yet");
     // routed + shared experts of one MoE block (the trunk's layers and the MTP block): router, VRAM / host / split
     // expert matrices, the shared expert fused into the routed launches where its type and shape allow
@@ -184,6 +188,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     layer.resize(cfg.layers);
     const auto cold_of = cfg.moe ? moe_placement(f) : std::vector<std::vector<char>>();
     for (uint32_t l = 0; l < cfg.layers; ++l) {
+        use_dev(dev_of(l));  // layer split: each layer's weights on its own device
         const auto p = "blk." + std::to_string(l) + ".";
         auto & L = layer[l];
         L = {};
@@ -235,15 +240,25 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             L.gnorm_w = g_f32(f, p + "ssm_norm.weight", cfg.lin_dv);
         }
     }
+    use_dev(home_dev);  // layer split: buffers, head and drafter are set up on the last device
 }
 
 void Qwen35Engine::alloc_seq_state() {
     const size_t lk = size_t(cfg.lin_kheads) * cfg.lin_dk, lv = size_t(cfg.lin_vheads) * cfg.lin_dv;
     const KvStorePolicy * kvs = kv_store_policy(opt.kv_store);
+    // layer split: device 0's attention layers keep their KV in a pool of their own on device 0
+    const int attn0 = split_at ? int(std::count(cfg.full.begin(), cfg.full.begin() + split_at, true)) : 0;
     if (!kv_pool) {  // first slot: one pool for every slot
         if (std::string(kvs->name()) != "flat")
             throw std::runtime_error(std::string("--kv-store ") + kvs->name() + ": the attention kernels read flat KV only so far");
-        const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true));
+        const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true)) - attn0;
+        if (split_at) {  // all KV on the GPUs (split_setup refuses --kv-host): whole pages, nothing staged
+            use_dev(0);
+            kv_mem0 = make_cuda_kv_memory(stream);
+            const KvGeometry g0{attn0, size_t(kv_row_bytes(true)), size_t(kv_row_bytes(false)), kvs->page(context_), -1, false};
+            kv_pool0 = std::make_unique<KvPool>(*kv_mem0, g0, nslots, 0);
+            use_dev(home_dev);
+        }
         kv_mem = make_cuda_kv_memory(stream);
         const int64_t host = std::min<int64_t>(std::max(0L, opt.kv_host), context_);
         // staged: the newest positions stay in a device window (>= 2048: a prefill chunk plus a verify block always
@@ -313,18 +328,31 @@ void Qwen35Engine::alloc_seq_state() {
     }
     kv_seq = kvs->make(*kv_pool, context_);
     if (!kv_seq->reserve(context_)) throw std::runtime_error("out of memory");
+    if (split_at) {
+        use_dev(0);
+        kv_seq0 = kvs->make(*kv_pool0, context_);
+        if (!kv_seq0->reserve(context_)) throw std::runtime_error("out of memory (GPU 0 KV)");
+    }
+    lin_dev.clear();
     for (uint32_t l = 0, a = 0; l < cfg.layers; ++l) {
         if (cfg.full[l]) {
-            key_cache.push_back({kv_seq->base(int(a), true)});
-            value_cache.push_back({kv_seq->base(int(a), false)});
+            // layer split: device 0's attention layers index its own store from 0
+            const bool d0 = split_at && int(l) < split_at;
+            const KvStore & s = d0 ? *kv_seq0 : *kv_seq;
+            const int ia = d0 ? int(a) : int(a) - attn0;
+            key_cache.push_back({s.base(ia, true)});
+            value_cache.push_back({s.base(ia, false)});
             ++a;
         } else {
+            use_dev(dev_of(l));  // layer split: the recurrent state on the layer's device
+            lin_dev.push_back(dev_of(l));
             for (int sl = 0; sl < NSLOT; ++sl) {
                 conv_state.emplace_back(size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2);
                 rec_state.emplace_back(size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4);
             }
         }
     }
+    use_dev(home_dev);
 }
 
 void Qwen35Engine::allocate() {
@@ -451,8 +479,11 @@ void Qwen35Engine::allocate() {
     }
     v_part = Buf(part_floats * 4);
     for (uint32_t l = 0; l < cfg.layers; ++l)
-        if (!cfg.full[l])
+        if (!cfg.full[l]) {
+            use_dev(dev_of(l));  // layer split: a layer's verify stash on its device
             for (auto & st : v_stash2) st.emplace_back(size_t(NB) * mix_rows * 2);
+        }
+    use_dev(home_dev);
     v_hid = Buf(NBUF * H * 2);
     v_cat = Buf(NVER * 2 * H * 2);
     mtp_h = Buf(H * 2);
@@ -542,7 +573,9 @@ void Qwen35Engine::allocate() {
         mtp.draft_head = {put(mtp_draft_q6k_host.data(), mtp_draft_q6k_host.size()), GGML_Q6_K, int(mtp.draft_ids.size()),
                           int(cfg.hidden)};
     std::vector<char>().swap(mtp_draft_q6k_host);
-    if (fmt_target && !cfg.tied && opt.embed_host) {
+    // layer split (fork addition): the table goes to mapped host memory (portable) as well, so that both GPUs read it:
+    // device 1's first layer and device 0's drafter look tokens up (one row per token)
+    if (fmt_target && !cfg.tied && (opt.embed_host || split_at)) {
         size_t bytes = 0;  // raw GGUF rows: one token's row is read per lookup
         const size_t n = size_t(embed.rows) * embed.cols;
         if (embed.type == GGML_Q4_K) bytes = n / 256 * 144;
@@ -593,7 +626,9 @@ void Qwen35Engine::allocate() {
             }
             gemm_w = Buf(mx * 2);
             // opt-in (--prefill-fp8 on, sm_89+): faster prefill but KLD ~0.01 vs FP16 prefill, so off by default
-            if ((opt.prefill_fp8 == 1 || (opt.prefill_fp8 < 0 && !opt.exact && tqllm_cuda::Fp8Gemm::default_on())) && !gemm_w_rows) {
+            // (not with a layer split: the FP8 / int8 GEMM objects hold one device's buffers)
+            if ((opt.prefill_fp8 == 1 || (opt.prefill_fp8 < 0 && !opt.exact && tqllm_cuda::Fp8Gemm::default_on())) && !gemm_w_rows &&
+                !split_at) {
                 if (tqllm_cuda::Fp8Gemm::supported()) {
                     size_t mk = 0;
                     for (const auto & L : layer)
@@ -619,7 +654,7 @@ void Qwen35Engine::allocate() {
             }
             // int8 path (Ampere): int32 results live in gemm_c ([NBUF][mr] x 4 bytes); the FP16 copy the fused SwiGLU
             // reads goes through gemm_w, which must hold NBUF x mr halves
-            if (!fp8 && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && !opt.exact && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
+            if (!fp8 && !split_at && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && !opt.exact && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
                 tqllm_cuda::Int8Gemm::supported() &&
                 size_t(NBUF) * mr <= mx) {  // gemm_c below is [NBUF][mr] x 4 bytes: room for int32
                 size_t mk = 0;
