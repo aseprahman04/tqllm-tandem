@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Tandem logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1222"/>
+      <stop offset="1" stop-color="#1a1036"/>
+    </linearGradient>
+    <linearGradient id="c" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="v" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d8b4fe"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="bridge" gradientUnits="userSpaceOnUse" x1="171" y1="235" x2="341" y2="277">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- two dies, offset like riders on a tandem -->
+  <rect x="86" y="150" width="170" height="170" rx="34" fill="none" stroke="url(#c)" stroke-width="22"/>
+  <rect x="256" y="192" width="170" height="170" rx="34" fill="none" stroke="url(#v)" stroke-width="22"/>
+  <!-- the link that carries the rows -->
+  <path d="M171 235 H341" stroke="url(#bridge)" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="171" cy="235" r="20" fill="#e0f2fe"/>
+  <circle cx="341" cy="277" r="20" fill="#f5f3ff"/>
+  <path d="M341 235 V277" stroke="url(#bridge)" stroke-width="18" stroke-linecap="round"/>
+</svg>

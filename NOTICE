@@ -45,3 +45,16 @@ Credits - work this project builds on or learned from (ideas and formats, no cod
   double-buffered threadgroup stage, one matmul2d per simdgroup per step), reimplemented for the NAX 4-bit layout.
 
 The full credits table, including methods and comparison baselines, is in README.md (Credits).
+
+--------------------------------------------------------------------------------------------------------------------
+Tandem - multi-GPU fork of tqLLM (https://github.com/aseprahman04/tqllm-tandem)
+
+The layer split across two GPUs (src/models/qwen/qwen35/qwen35_split.cpp, src/core/per_device_once.cuh and the
+changes marked "Modified in the multi-GPU fork" in other files), tools/tandem_golden.py,
+scripts/windows/tandem-serve.bat, docs/guides/multi-gpu.md, the Tandem README and its artwork:
+Copyright 2026 aseprahman04 and the Tandem contributors, licensed under the Apache License, Version 2.0.
+
+The split's design follows the layer split of PolyStrata (simplexai-labs, MIT) and Strata (Niko1221, MIT); no code from
+either project is included.
+
+In this fork, tqLLM's own README, with the credits table referred to above, is docs/tqllm-README.md.
