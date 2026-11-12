@@ -217,7 +217,12 @@ private:
     std::vector<int> lin_dev;  // device of each Gated DeltaNet layer (by linear-layer index)
     int dev_of(uint32_t l) const { return split_at && int(l) >= split_at ? 1 : 0; }
     std::vector<Buf *> dev_bufs();
-    void use_dev(int d);
+    void use_dev(int d, bool wait = true);  // wait: the new device's work follows everything queued so far
+    // Prefill chunk across the split, pipelined: stage 0 takes its tokens and positions straight from the caller's
+    // staged host memory and waits only until the previous chunk's rows have left it (pf_hop_done), so it runs chunk
+    // i + 1 while the home stage runs chunk i.
+    void split_prefill(const uint32_t * tokens, const int * pos_host, int n, int bucket);
+    cudaEvent_t pf_hop_done{};  // home stage: recorded after a prefill chunk's hop
     void split_setup(int slots);  // reads TQLLM_SPLIT, refuses what the split does not run yet
     void split_alloc_dev0();      // stage 0's copies of the scratch buffers allocate() and the drafter made on stage 1
     void split_mirror_control();  // stage 1's control buffers (tokens, positions, tree / chain tables) -> stage 0
@@ -735,7 +740,8 @@ public:
         } else if (n > NVER || mm_chunk) {
             // prefill chunks run eagerly: their sizes and positions vary per prompt, so cached graphs would grow without
             // bound (~12 MB each; a 2-slot server OOMed after ~800 requests), and launch cost is negligible at this size
-            verify_body(n, int(bucket));
+            if (split_at && !mm_chunk && tokens && gen.rdelta == 0) split_prefill(tokens, pos_host, n, int(bucket));
+            else verify_body(n, int(bucket));
         } else if (split_at) {
             // layer split: one captured graph per GPU, the hand-off between them outside the graphs
             use_dev(0);

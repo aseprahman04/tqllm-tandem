@@ -53,11 +53,11 @@ std::vector<Buf *> Qwen35Engine::dev_bufs() {
             &blas_ws, &fp8_sw, &v_feat};
 }
 
-void Qwen35Engine::use_dev(int d) {
+void Qwen35Engine::use_dev(int d, bool wait) {
     if (!split_at || d == cur_dev) return;
     // everything queued on the old device runs before what the new one queues from here on
     if (!hop_ev) ck(cudaEventCreateWithFlags(&hop_ev, cudaEventDisableTiming));
-    ck(cudaEventRecord(hop_ev, stream));
+    if (wait) ck(cudaEventRecord(hop_ev, stream));
     const cudaEvent_t after = hop_ev;
     // the verify path keeps pointers into the tree / chain tables: carried across the swap by name
     const int par = !vpar ? 0 : vpar == d_tpar.as<int>() ? 1 : vpar == d_chain.as<int>() ? 2 : 3;
@@ -84,7 +84,7 @@ void Qwen35Engine::use_dev(int d) {
         cb(cublasSetStream(blas, stream));
         cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
     }
-    ck(cudaStreamWaitEvent(stream, after, 0));
+    if (wait) ck(cudaStreamWaitEvent(stream, after, 0));
     vpar = par == 1 ? d_tpar.as<int>() : par == 2 ? d_chain.as<int>() : nullptr;
     vdep = dep == 1 ? d_tdep.as<int>() : dep == 2 ? d_cdep.as<int>() : nullptr;
 }
@@ -128,6 +128,25 @@ void Qwen35Engine::split_hop(int n) {
     ck(cudaMemcpyPeerAsync(v_px.p, to, other_stage(v_px).p, from, size_t(n) * ((H + 255) / 256) * 4, stream));
     if (dfl.present && v_feat.p && other_stage(v_feat).p)
         ck(cudaMemcpyPeerAsync(v_feat.p, to, other_stage(v_feat).p, from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
+}
+
+// Prefill chunk (n > NVER, no images): stage 0 needs only the chunk's tokens and positions, which it copies from the
+// caller's staged host memory itself, and its own state and KV, which its stream already orders. So it does not wait for
+// the home stage, only until the previous chunk's rows, norm partials and drafter features have been copied off it.
+// The home stage then waits for this chunk's stage 0 (use_dev(1)) as before. Every kernel and its inputs are those of
+// verify_body(n, bucket): only the cross-device ordering is relaxed, so results are unchanged.
+void Qwen35Engine::split_prefill(const uint32_t * tokens, const int * pos_host, int n, int bucket) {
+    if (!pf_hop_done) ck(cudaEventCreateWithFlags(&pf_hop_done, cudaEventDisableTiming));  // on the home device
+    use_dev(0, false);
+    ck(cudaStreamWaitEvent(stream, pf_hop_done, 0));
+    ck(cudaMemcpyAsync(v_tokens.p, tokens, size_t(n) * 4, cudaMemcpyHostToDevice, stream));
+    ck(cudaMemcpyAsync(v_pos.p, pos_host, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    ck(cudaMemcpyAsync(v_rpos.p, pos_host, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    verify_body(n, bucket, 0);
+    use_dev(1);
+    split_hop(n);
+    ck(cudaEventRecord(pf_hop_done, stream));
+    verify_body(n, bucket, 1);
 }
 
 // Called on stage 0 right after use_dev(0): stage 1 holds the tables as the host last wrote them (tokens, positions,

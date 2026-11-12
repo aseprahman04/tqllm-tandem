@@ -44,7 +44,8 @@ tqserve.exe --model Qwen3.8-27B-TQ_L.gguf ^
 | Prompt reuse | `--prompt-cache on` |
 | Not yet | `--mtp`, `--kv-host` (a host KV tail), `--kv-compact`, `--np > 1`, MoE models, images |
 
-A verify block runs as two captured CUDA graphs, one per card, with the hand-off between them; prefill chunks, commits
+A verify block runs as two captured CUDA graphs, one per card, with the hand-off between them. Prefill chunks run eagerly
+and overlap across the cards: device 1 starts the next chunk while device 0 finishes this one (`split_prefill`). Commits
 and tree gathers run eagerly.
 
 ## Measured
@@ -56,7 +57,9 @@ the long prompt is a 26.9K-token source file with a question.
 |---|---|---:|---:|---|
 | TQ_XS, 8K, one card | none | 205 | 81 | — |
 | TQ_XS, 8K | `K=32` | 196-200 | 80-85 | — |
-| TQ_L, 512K (YaRN x2) | `K=44` | 127-140 | 81 | prefill 826 tok/s, decode 63 tok/s |
+| TQ_L, 512K (YaRN x2) | `K=44` | 127-140 | 81 | prefill 1,231 tok/s (26.9K tokens), decode 69-72 tok/s |
+| TQ_L, 131K | `K=40` | 127-140 | 81 | prefill 1,650 tok/s (36.7K tokens) |
+| UD-Q6_K, 131K | `K=36` | 86-96 | 57 | prefill 1,576 tok/s (36.7K tokens) |
 
 TQ_L (14.7 GB) does not load on one 16 GB card at any context. On two it serves the trained 262,144 tokens with room
 to spare and 524,288 with YaRN x2 (VRAM 12.7 GB on device 0 with the display, 14.9 GB on device 1).
@@ -80,7 +83,8 @@ cards with TQ_L.
 
 ## Notes
 
-- During a long prefill the first card does most of the work: it holds 11 of the 16 attention layers at `K=44`.
+- During a long prefill both cards work at once on consecutive chunks; the first card has more to do (11 of the 16
+  attention layers at `K=44`), so it sets the pace.
 - Kernels that need more than 48 KB of shared memory have their limit set on each card (`PerDeviceLimit`,
   `src/core/per_device_once.cuh`); the limit is a per-device attribute.
 - With a split the token embeddings live in portable host memory, so both cards read them (one row per token).

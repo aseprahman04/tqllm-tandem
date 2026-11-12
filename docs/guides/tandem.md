@@ -154,7 +154,6 @@ More detail for agents (thinking control, tool calls, long sessions) is in upstr
 | `model does not fit in device memory` | lower `TANDEM_CONTEXT`, or move layers between the cards with `TQLLM_SPLIT`; close GPU-heavy apps on device 0. |
 | `cublas64_13.dll was not found` (or cuBLASLt / cuSOLVER / cuSPARSE) | unzip `cudart-tandem-cuda13-win-x64.zip` next to `tqserve.exe`, or put the CUDA 13 toolkit's `bin\x64` on `PATH`. |
 | The program exits at once with a CUDA driver error | update the NVIDIA driver to R580 or newer. |
-| Device 1 at 100 %, device 0 nearly idle while reading a long prompt | expected: device 1 holds most attention layers and the cards take turns; decoding uses both. |
 | Answers differ from a one-card run | that should never happen: run `tools/tandem_golden.py` on a model that fits one card and open an issue with the result. |
 
 ## 9. FAQ
