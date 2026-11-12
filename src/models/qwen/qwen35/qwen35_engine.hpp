@@ -209,8 +209,10 @@ private:
         cudaEvent_t ev_fork{}, ev_join{}, hop{};
         cublasHandle_t blas{};
         std::vector<Buf> bufs;  // dev_bufs() order
+        std::unique_ptr<tqllm_cuda::Int8Gemm> i8;  // --prefill-int8 on: each GPU's own cuBLASLt handle and buffers
     };
     DevStash dstash[2];
+    size_t i8_init[4] = {};  // the Int8Gemm::init arguments, for the other GPU's copy
     std::unique_ptr<KvMemory> kv_mem0;  // device 0's KV memory / pool / store (attention layers below the split)
     std::unique_ptr<KvPool> kv_pool0;
     std::unique_ptr<KvStore> kv_seq0;

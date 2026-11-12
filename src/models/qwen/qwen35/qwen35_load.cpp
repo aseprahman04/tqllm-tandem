@@ -656,7 +656,7 @@ void Qwen35Engine::allocate() {
             }
             // int8 path (Ampere): int32 results live in gemm_c ([NBUF][mr] x 4 bytes); the FP16 copy the fused SwiGLU
             // reads goes through gemm_w, which must hold NBUF x mr halves
-            if (!fp8 && !split_at && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && !opt.exact && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
+            if (!fp8 && (opt.prefill_int8 == 1 || (opt.prefill_int8 < 0 && !opt.exact && tqllm_cuda::Int8Gemm::default_on())) && !gemm_w_rows &&
                 tqllm_cuda::Int8Gemm::supported() &&
                 size_t(NBUF) * mr <= mx) {  // gemm_c below is [NBUF][mr] x 4 bytes: room for int32
                 size_t mk = 0;
@@ -666,6 +666,7 @@ void Qwen35Engine::allocate() {
                         if (m->p && m->fmt) mk = std::max(mk, size_t(m->cols));
                 i8 = std::make_unique<tqllm_cuda::Int8Gemm>();
                 i8->init(mx, size_t(NBUF) * mk, int(mr), NBUF);
+                i8_init[0] = mx, i8_init[1] = size_t(NBUF) * mk, i8_init[2] = mr, i8_init[3] = size_t(NBUF);  // split: stage 0's copy
                 if (!fp8_sw.p) fp8_sw = Buf(size_t(mr) * 4);
                 std::fprintf(stderr, "tqllm: prefill GEMMs in int8 (per-row x per-token scales; --prefill-int8 off for FP16)\n");
             }

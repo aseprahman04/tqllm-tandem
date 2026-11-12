@@ -77,6 +77,8 @@ void Qwen35Engine::use_dev(int d, bool wait) {
         from.bufs[i] = std::move(*list[i]);
         *list[i] = std::move(to.bufs[i]);
     }
+    from.i8 = std::move(i8);
+    i8 = std::move(to.i8);
     stream = to.stream, side = to.side, ev_fork = to.ev_fork, ev_join = to.ev_join, hop_ev = to.hop, blas = to.blas;
     to.stream = to.side = nullptr, to.ev_fork = to.ev_join = to.hop = nullptr, to.blas = nullptr;  // the members own them now
     ck(cudaSetDevice(cuda_of[d]));
@@ -111,6 +113,10 @@ void Qwen35Engine::split_alloc_dev0() {
     for (size_t i = 0; i < list.size(); ++i)
         if (bytes[i] && !list[i]->p) *list[i] = Buf(bytes[i]);
     if (blas_ws.p) cb(cublasSetWorkspace(blas, blas_ws.p, size_t(32) << 20));
+    if (dstash[1].i8) {  // --prefill-int8 on: stage 0's own int8 GEMM (cuBLASLt handle, weight and token buffers)
+        i8 = std::make_unique<tqllm_cuda::Int8Gemm>();
+        i8->init(i8_init[0], i8_init[1], int(i8_init[2]), int(i8_init[3]));
+    }
     // the verify tables start as allocate() wrote them; d_pend starts at 0
     split_mirror_control();
     sync_ck();
