@@ -172,5 +172,115 @@ void Qwen35Engine::split_mirror_control() {
     peer(d_pend, sizeof(int));
 }
 
+// ---- tensor parallel: shards cut from the raw GGUF bytes (docs/design/tensor-parallel.md) ----
+
+namespace {
+int total(const std::vector<std::pair<int, int>> & r) {
+    int n = 0;
+    for (const auto & [a, b] : r) n += b - a;
+    return n;
+}
+}  // namespace
+
+// GGUF block formats store a matrix row by row, each row a run of fixed-size blocks: a row range is a byte range and a
+// column range on a block boundary is a per-row block range, whatever the format.
+std::vector<char> Qwen35Engine::tp_slice(const std::vector<char> & raw, uint32_t type, int rows, int cols, const Ranges & rr,
+                                         const Ranges & cr) {
+    uint64_t be = 0, bb = 0;
+    if (!gguf_block_layout(type, be, bb)) throw std::runtime_error("tp: no block layout for GGUF type " + std::to_string(type));
+    if (uint64_t(cols) % be) throw std::runtime_error("tp: a row is not a whole number of blocks");
+    const size_t row_bytes = size_t(uint64_t(cols) / be * bb);
+    if (raw.size() != row_bytes * size_t(rows)) throw std::runtime_error("tp: tensor size does not match its shape");
+    size_t out_row = 0;
+    for (const auto & [c0, c1] : cr) {
+        if (c0 < 0 || c1 > cols || c0 >= c1 || uint64_t(c0) % be || uint64_t(c1) % be)
+            throw std::runtime_error("tp: column range off a block boundary");
+        out_row += size_t(uint64_t(c1 - c0) / be * bb);
+    }
+    std::vector<char> out(out_row * size_t(total(rr)));
+    char * o = out.data();
+    for (const auto & [r0, r1] : rr) {
+        if (r0 < 0 || r1 > rows || r0 >= r1) throw std::runtime_error("tp: bad row range");
+        for (int r = r0; r < r1; ++r)
+            for (const auto & [c0, c1] : cr) {
+                const size_t off = size_t(r) * row_bytes + size_t(uint64_t(c0) / be * bb), len = size_t(uint64_t(c1 - c0) / be * bb);
+                std::memcpy(o, raw.data() + off, len);
+                o += len;
+            }
+    }
+    return out;
+}
+
+Mat Qwen35Engine::g_mat_cut(const GgufFile & f, const std::string & name, int rows, int cols, const Ranges & rr, const Ranges & cr) {
+    const auto & t = gt(f, name);
+    if (t.ne.size() != 2 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(rows))
+        throw std::runtime_error("unexpected shape for " + name);
+    const int nr = total(rr), nc = total(cr);
+    const auto host = tp_slice(f.read(t), t.type, rows, cols, rr, cr);
+    if (t.type == GGML_F32) {
+        const auto b = f32_to_bf16_host(host);
+        return {put(b.data(), b.size()), GGML_BF16, nr, nc};
+    }
+    if (t.type == GGML_F16) {
+        const auto b = f16_to_bf16_host(host);
+        return {put(b.data(), b.size()), GGML_BF16, nr, nc};
+    }
+    if (t.type != GGML_BF16)
+        if (const auto * wf = weight_format(t.type)) return adopt(wf->load(host, nr, nc, uploader(), stream));
+    if (t.type != GGML_BF16) throw std::runtime_error("tp: unsupported matrix type " + std::to_string(t.type) + " for " + name);
+    return {put(host.data(), host.size()), t.type, nr, nc};
+}
+
+Mat Qwen35Engine::g_cat_cut(const GgufFile & f, const std::vector<CutPart> & parts, int cols) {
+    uint32_t type = 0;
+    bool mixed = false;
+    for (const auto & p : parts) {
+        const auto & t = gt(f, p.name);
+        if (t.ne.size() != 2 || t.ne[0] != uint64_t(cols) || t.ne[1] != uint64_t(p.rows))
+            throw std::runtime_error("unexpected shape for " + p.name);
+        mixed |= type && t.type != type;
+        type = t.type;
+    }
+    const Ranges all_cols{{0, cols}};
+    if (mixed) {  // per-part formats as one composite matrix (the same rule as g_cat)
+        std::vector<Mat> ms;
+        for (const auto & p : parts) ms.push_back(g_mat_cut(f, p.name, p.rows, cols, p.rr, all_cols));
+        auto c = composite_format(std::move(ms));
+        if (!c) return {};
+        composites.push_back(std::move(c));
+        return composite_mat(*composites.back());
+    }
+    int rows = 0;
+    std::vector<char> host;
+    for (const auto & p : parts) {
+        const auto d = tp_slice(f.read(gt(f, p.name)), type, p.rows, cols, p.rr, all_cols);
+        host.insert(host.end(), d.begin(), d.end());
+        rows += total(p.rr);
+    }
+    if (type == GGML_BF16) return {put(host.data(), host.size()), type, rows, cols};
+    if (type == GGML_F32) {
+        const auto b = f32_to_bf16_host(host);
+        return {put(b.data(), b.size()), GGML_BF16, rows, cols};
+    }
+    if (type == GGML_F16) {
+        const auto b = f16_to_bf16_host(host);
+        return {put(b.data(), b.size()), GGML_BF16, rows, cols};
+    }
+    if (const auto * wf = weight_format(type)) return adopt(wf->load(host, rows, cols, uploader(), stream));
+    return {};
+}
+
+const float * Qwen35Engine::g_f32_cut(const GgufFile & f, const std::string & name, int rows, int row_len, const Ranges & rr) {
+    const auto & t = gt(f, name);
+    const uint64_t n = uint64_t(rows) * uint64_t(row_len);
+    if (t.type != GGML_F32 || t.bytes != n * 4) throw std::runtime_error("tp: expected F32[" + std::to_string(n) + "] " + name);
+    const auto host = f.read(t);
+    std::vector<float> out;
+    out.reserve(size_t(total(rr)) * size_t(row_len));
+    const auto * v = reinterpret_cast<const float *>(host.data());
+    for (const auto & [r0, r1] : rr) out.insert(out.end(), v + size_t(r0) * row_len, v + size_t(r1) * row_len);
+    return static_cast<const float *>(put(out.data(), out.size() * 4));
+}
+
 }  // namespace qwen35_detail
 }  // namespace tqllm

@@ -420,6 +420,19 @@ private:
     // of per-part formats ({} when the types cannot be combined: the caller falls back to separate matrices).
     std::vector<std::unique_ptr<WeightFormat>> composites;
     Mat g_cat(const GgufFile & f, const std::vector<std::pair<std::string, int>> & parts, int cols);
+    // Tensor parallel (fork addition, docs/design/tensor-parallel.md): a shard of a tensor, cut from the raw GGUF bytes
+    // before the format loads it. Ranges are [begin, end) in rows / columns; column bounds sit on block boundaries.
+    using Ranges = std::vector<std::pair<int, int>>;
+    static std::vector<char> tp_slice(const std::vector<char> & raw, uint32_t type, int rows, int cols, const Ranges & rr,
+                                      const Ranges & cr);
+    Mat g_mat_cut(const GgufFile & f, const std::string & name, int rows, int cols, const Ranges & rr, const Ranges & cr);
+    struct CutPart {
+        std::string name;
+        int rows;
+        Ranges rr;  // the rows this rank keeps
+    };
+    Mat g_cat_cut(const GgufFile & f, const std::vector<CutPart> & parts, int cols);
+    const float * g_f32_cut(const GgufFile & f, const std::string & name, int rows, int row_len, const Ranges & rr);
 
     const float * g_f32(const GgufFile & f, const std::string & name, uint64_t n);
 
