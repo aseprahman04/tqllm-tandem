@@ -442,7 +442,7 @@ private:
     void reset_state();
 
     // RoPE scaling from the CLI, else the GGUF; the tables are global to the qwen35 kernels (one model per process).
-    void set_rope();
+    void set_rope(bool log = true);  // log false: load the table on the current device again (layer split)
 
     // Per-sequence KV and Gated DeltaNet state of the active slot.
     void alloc_seq_state();
