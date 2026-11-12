@@ -11,6 +11,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void ck(cudaError_t rc) {
@@ -71,6 +72,27 @@ static void route_test() {
         require(std::abs(gs[t] - tqllm::moe_sigmoid(got[t * (e + 1) + e])) < 3e-6, "shared gate differs");
     }
     std::puts("F32 router + softmax/top-k/normalization/shared sigmoid: PASS");
+}
+
+// Multi-GPU fork: the tiled router (n >= 8 tokens) must give bit-identical logits to router_k (one token at a time).
+static void router_tiled_test() {
+    const int h = 2048, e = 256, n = 21;  // 21: a partial tile of tokens; 257 rows: a partial tile of rows
+    std::vector<float> w(size_t(e) * h), shared(h);
+    std::vector<__half> x(size_t(n) * h);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, .03f);
+    for (auto & v : w) v = nd(rng);
+    for (auto & v : shared) v = nd(rng);
+    for (auto & v : x) v = __float2half(nd(rng) * 30.f);
+    Device<float> dw(w.size()), ds(h), batched(size_t(n) * (e + 1)), single(size_t(n) * (e + 1));
+    Device<__half> dx(x.size());
+    dw.put(w); ds.put(shared); dx.put(x);
+    tqllm_cuda::moe_router(dw.p, ds.p, dx.p, batched.p, h, e, n, nullptr);
+    for (int t = 0; t < n; ++t)
+        tqllm_cuda::moe_router(dw.p, ds.p, dx.p + size_t(t) * h, single.p + size_t(t) * (e + 1), h, e, 1, nullptr);
+    const auto a = batched.get(size_t(n) * (e + 1)), b = single.get(size_t(n) * (e + 1));
+    require(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0, "tiled router logits differ from router_k");
+    std::puts("tiled router == router_k, bit for bit: PASS");
 }
 
 // Every GGUF type whose runtime format now has grouped-expert support, so the identity suite
@@ -673,6 +695,7 @@ int main() {
     try {
         fused_shared_test();
         route_test();
+        router_tiled_test();
         // Decode (grouped matvec) and prefill (grouped GEMM) for every format with grouped-expert
         // support -- not just the three that were wired first.
         for (const auto & sp : kSpecs) {

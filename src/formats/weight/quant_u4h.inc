@@ -609,7 +609,6 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
     if constexpr (GROUPED) {
         const int expert = blockIdx.z;
         ncols = counts[expert];
-        if (int(blockIdx.y) * 64 >= ncols) return;
         groups += int64_t(expert) * capacity;
         source_row = expert * rows;
     }
@@ -630,9 +629,14 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
             grid = ud_grid_src<FMT>();
         }
     }
+    // Modified in the multi-GPU fork: a grouped launch has gridDim.y CTAs per (row tile, expert), each taking every
+    // gridDim.y-th 64-column tile of its expert. The grid used to cover n / 64 tiles per expert, while a prefill chunk
+    // routes ~n * topk / experts columns to an expert (one tile for most), so nearly every CTA exited at once. A tile's
+    // arithmetic is unchanged. Ungrouped launches run their one tile, blockIdx.y.
+    for (int tile = blockIdx.y; GROUPED ? tile * 64 < ncols : tile == int(blockIdx.y); tile += gridDim.y) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
     const int rt = warp & 3, ks = warp >> 2;
-    const int row0 = blockIdx.x * 64 + rt * 16, col0 = blockIdx.y * 64, nb = k / 32;
+    const int row0 = blockIdx.x * 64 + rt * 16, col0 = tile * 64, nb = k / 32;
     const int ra = source_row + min(row0 + g, rows - 1), rb = source_row + min(row0 + g + 8, rows - 1);
     const uint32_t NEG1024 = 0xE400E400u;
     auto deq = [&](uint32_t w, uint32_t sel, uint32_t su, uint32_t mu) {
@@ -763,6 +767,7 @@ __global__ void __launch_bounds__(256) u4h_gemm_k(const uint8_t * w4, const __ha
             }
         }
     }
+    }  // tile loop
 }
 template <int FMT, typename OUT = __nv_bfloat16>
 static void u4h_gemm_launch(const uint8_t * w4, const void * sm, const __half * xh, OUT * y, int rows, int k,

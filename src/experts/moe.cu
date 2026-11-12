@@ -32,6 +32,64 @@ template<class Input> __global__ void router_k(const float * w, const float * sh
     }
 }
 
+// Multi-GPU fork: router_k for many tokens. One block takes T tokens x G router rows; every logit is summed exactly as
+// router_k sums it (thread tid adds j = tid, tid + 256, ... in order, then the same warp-shuffle and 8-partial
+// reductions), so the logits are bit-identical; the token rows load once per block and each router row once per T
+// tokens instead of one 256-thread block per (token, row). h = 256 * NJ.
+template<class Input, int T, int G, int NJ>
+__global__ void __launch_bounds__(256) router_tiled_k(const float * w, const float * shared, const Input * x,
+                                                      float * logits, int h, int e, int n) {
+    const int tok0 = blockIdx.y * T, row0 = blockIdx.x * G, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float xv[T][NJ];
+#pragma unroll
+    for (int t = 0; t < T; ++t)
+#pragma unroll
+        for (int i = 0; i < NJ; ++i)
+            xv[t][i] = tok0 + t < n ? router_value(x[int64_t(tok0 + t) * h + tid + 256 * i]) : 0.f;
+    __shared__ float partial[8][T];
+    for (int g = 0; g < G; ++g) {
+        const int row = row0 + g;
+        if (row > e) break;  // uniform across the block
+        const float * wr = row == e ? shared : w + int64_t(row) * h;
+        float acc[T];
+#pragma unroll
+        for (int t = 0; t < T; ++t) acc[t] = 0.f;
+#pragma unroll
+        for (int i = 0; i < NJ; ++i) {
+            const float wv = wr[tid + 256 * i];
+#pragma unroll
+            for (int t = 0; t < T; ++t) acc[t] += wv * xv[t][i];
+        }
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+            for (int d = 16; d; d >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], d);
+        if (lane == 0)
+#pragma unroll
+            for (int t = 0; t < T; ++t) partial[warp][t] = acc[t];
+        __syncthreads();
+        if (warp == 0)
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                float s = lane < 8 ? partial[lane][t] : 0.f;
+                for (int d = 16; d; d >>= 1) s += __shfl_down_sync(0xffffffffu, s, d);
+                if (lane == 0 && tok0 + t < n) logits[int64_t(tok0 + t) * (e + 1) + row] = s;
+            }
+        __syncthreads();
+    }
+}
+template<class Input> bool router_tiled(const float * w, const float * shared, const Input * x, float * logits, int h,
+                                        int e, int n, cudaStream_t s) {
+    constexpr int T = 8, G = 32;
+    if (n < T || h % 256) return false;
+    const dim3 grid(unsigned((e + 1 + G - 1) / G), unsigned((n + T - 1) / T));
+    switch (h / 256) {
+    case 4: router_tiled_k<Input, T, G, 4><<<grid, 256, 0, s>>>(w, shared, x, logits, h, e, n); return true;
+    case 8: router_tiled_k<Input, T, G, 8><<<grid, 256, 0, s>>>(w, shared, x, logits, h, e, n); return true;
+    case 16: router_tiled_k<Input, T, G, 16><<<grid, 256, 0, s>>>(w, shared, x, logits, h, e, n); return true;
+    default: return false;
+    }
+}
+
 __global__ void topk_k(const float * logits, int * ids, float * weights, float * shared_weights,
                        int e, int k, float scale) {
     // 256 threads. Reductions use warp shuffles; the softmax sum keeps the same pairing order as a 256-wide tree
@@ -237,12 +295,14 @@ __global__ void sum_k(const __nv_bfloat16 * routed, const __nv_bfloat16 * shared
 void moe_router(const float * router, const float * shared, const __half * x, float * logits,
                 int h, int e, int n, cudaStream_t stream) {
     if (h <= 0 || e <= 0 || n <= 0) throw std::invalid_argument("moe_router: invalid shape");
+    if (router_tiled(router, shared, x, logits, h, e, n, stream)) return;  // fork: prefill-sized n, same logits
     router_k<<<dim3(unsigned(e + 1), unsigned(n)), 256, 0, stream>>>(router, shared, x, logits, h, e);
 }
 void moe_router_f32(const float * router, const float * shared, const float * x, float * logits,
                     int h, int e, int n, cudaStream_t stream) {
     if (h <= 0 || e <= 0 || n <= 0 || !router || !shared || !x || !logits)
         throw std::invalid_argument("moe_router_f32: invalid shape or pointer");
+    if (router_tiled(router, shared, x, logits, h, e, n, stream)) return;  // fork: prefill-sized n, same logits
     router_k<<<dim3(unsigned(e + 1), unsigned(n)), 256, 0, stream>>>(router, shared, x, logits, h, e);
 }
 void moe_topk(const float * logits, int * ids, float * weights, float * shared_weights,

@@ -80,15 +80,15 @@ greedy, thinking off, 512 tokens; prefill = prompt tokens / wall time, median of
 
 | Engine, 2x RTX 5060 Ti unless noted | Draft | Code | Code 2 | Prose | Prefill 9.7K / 36.7K |
 |---|---|--:|--:|--:|--:|
-| **Tandem, `--mtp`, `K=24`** | the model's MTP head | **212** | **199** | **150** | 2,909 / 3,379 |
+| **Tandem, `--mtp`, `K=24`** | the model's MTP head | **213** | **206** | **158** | **4,726 / 4,860** |
 | PolyStrata `strata-poly` | the model's MTP head | 178 | 165 | 149 | 3,731 / 4,523 |
-| Tandem, `K=24` | none | 134 | 133 | 130 | 3,277 / 3,416 |
+| Tandem, `K=24` | none | 134 | 133 | 130 | **4,827 / 4,881** |
 | PolyStrata `strata-poly --no-draft` | none | 124 | 122 | 118 | 3,953 / 4,596 |
-| llama.cpp b12167, `-ngl 99 --split-mode layer` | none | 112 | 117 | 120 | **4,492 / 4,442** |
+| llama.cpp b12167, `-ngl 99 --split-mode layer` | none | 112 | 117 | 120 | 4,492 / 4,442 |
 | tqLLM upstream, 1 card, 9 GB of experts in RAM (`--moe-host-mb`) | none | 33 | 37 | 39 | 504 / 517 |
 | llama.cpp b12223, 1 card, `--n-cpu-moe 27` ([published run](https://niklaslenz.com/v2/qwen38-35b-a3b-distill-5060ti-q4km-llamacpp/), its own method) | none | 64 | — | 63 | 988 (8K) |
 
-Tandem decodes fastest; its MoE prompt reading trails PolyStrata and llama.cpp (on the roadmap). Split at `K=20` and
+Tandem is fastest on every column. Prompt reading went from 3,416 to 4,881 tok/s with two changes, both bit-identical: a tiled router (the per-(token, expert) router kernel took 16 % of prefill) and grouped expert GEMMs that launch two CTAs per expert instead of one per possible 64-token tile (nearly all of which exited at once). Split at `K=20` and
 `K=24` the greedy answers are identical, and `--mtp` gives the same answers as no drafter (short and 6.9K-42.7K-token
 prompts); `K=24` balances VRAM best (11.6 / 13.4 GB at 131K).
 
@@ -273,7 +273,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 - **A million tokens.** A host KV tail with TqCache compaction (lossy) per card, or the trellis tcq3 / tcq2 KV codecs
   (~640K on the GPUs).
-- **More of tqLLM under the split:** `--np > 1`, experts in host memory, Flash-Next, images; faster MoE prompt reading.
+- **More of tqLLM under the split:** `--np > 1`, experts in host memory, Flash-Next, images.
 - **Borrowed system RAM for bigger weights** (Q8_0, BF16): a share of the layers' weights streamed from host memory
   per verify window. (UD-Q6_K already fits two 16 GB cards.)
 - **More than two cards**, and Linux numbers.
@@ -284,7 +284,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 | Version | What changed | TQ_L prefill, 36.7K-token prompt |
 |---|---|--:|
-| main (unreleased) | **`--mtp` under the split** (the model's own MTP head on the home GPU): Qwen3.8-35B-A3B at 212 / 199 / 150 tok/s, faster than PolyStrata's MTP (178 / 165 / 149) on the same file. The MTP block reads each prompt chunk in one pass without a host sync, so prefill keeps overlapping across the cards | 1,650 tok/s |
+| main (unreleased) | **MoE prefill 3,416 -> 4,881 tok/s** (tiled router, grouped expert GEMMs without empty CTAs; both bit-identical). **`--mtp` under the split** (the model's own MTP head on the home GPU): Qwen3.8-35B-A3B at 212 / 199 / 150 tok/s, faster than PolyStrata's MTP (178 / 165 / 149) on the same file. The MTP block reads each prompt chunk in one pass without a host sync, so prefill keeps overlapping across the cards | 1,650 tok/s |
 | [v0.1.3](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.3) | **Mixture-of-experts models** under the split (`qwen35moe`, every expert on the GPUs): Qwen3.8-35B-A3B-Distill Q4_K_M at 135-137 tok/s decode and 3,965 tok/s prefill. Decoding without a drafter now runs under the split (one graph per GPU). Thinking on / off measured | 1,650 tok/s |
 | [v0.1.2](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.2) | **Prefill on both cards at once** (`split_prefill`): consecutive chunks overlap across the cards, 1.5x faster prompt reading, identical outputs. Tried and left off: `--lookup` prompt-lookup drafts (+2-3 % on code, -20-30 % on file edits, where DFlash2 already drafts the copies) and a 12-column draft tree (verify costs 15 % more) | **1,650 tok/s** |
 | [v0.1.1](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.1) | Plain llama.cpp GGUFs (K-quants, IQ) under the split: composite matrices keep one stream / event pool per GPU. Unsloth UD-Q6_K (22 GB) runs at 86-96 / 57 tok/s, 131K context | 1,044 tok/s |
