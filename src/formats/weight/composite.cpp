@@ -48,8 +48,13 @@ struct Composite final : WeightFormat {
         std::vector<cudaStream_t> side;
         std::vector<cudaEvent_t> joins;
     };
+    // Modified in the multi-GPU fork: one pool per device (an event or stream works only on the device it was made on)
     static Pool & pool(size_t n) {
-        static Pool p;
+        static Pool pools[32];
+        int dev = 0;
+        ck(cudaGetDevice(&dev), "device");
+        if (dev < 0 || dev >= 32) throw std::runtime_error("composite: device ordinal out of range");
+        Pool & p = pools[dev];
         if (!p.fork) ck(cudaEventCreateWithFlags(&p.fork, cudaEventDisableTiming), "fork event");
         while (p.side.size() < n) {
             cudaStream_t st;
