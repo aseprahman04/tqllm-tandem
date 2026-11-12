@@ -985,10 +985,9 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
         use_dev(0);
         split_mirror_control();
     }
-    for (int d = tp ? 0 : 1; d <= 1; ++d) {  // tensor parallel: each GPU replays every layer (its half of the heads)
-        if (tp) use_dev(d, false);
-        const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
-        const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
+    const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    auto replay = [&] {
         uint32_t lin_i = 0;
         for (uint32_t l = 0; l < cfg.layers; ++l) {
             if (cfg.full[l]) continue;
@@ -1004,6 +1003,19 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
                                   rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
                                   chain);
             ++lin_i;
+        }
+    };
+    if (!tp) {
+        replay();
+    } else {  // tensor parallel: each GPU replays every layer (its half of the heads) as one captured graph
+        for (int d = 0; d < 2; ++d) {
+            use_dev(d, false);
+            const uint64_t key = (uint64_t(d) << 40) | (uint64_t(k) << 32) | (uint64_t(cur % NSLOT) << 24) |
+                                 (uint64_t(sp) << 16) | (uint64_t(tree_mode) << 15) | uint64_t(uint32_t(stash_col0) & 0x7fff);
+            auto it = tp_commit_graphs.find(key);
+            if (it == tp_commit_graphs.end())
+                it = tp_commit_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, replay))).first;
+            ck(cudaGraphLaunch(it->second, stream));
         }
     }
     use_dev(1);
