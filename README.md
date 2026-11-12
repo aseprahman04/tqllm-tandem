@@ -30,7 +30,7 @@ TqCache, prompt reuse and the OpenAI-compatible `tqserve`. Tandem adds the secon
 ## Contents
 
 - [Results](#results)
-- [Quick start (Windows)](#quick-start-windows)
+- [Quick start (Windows)](#quick-start-windows) · full guide: [install, run, agents, troubleshooting](docs/guides/tandem.md)
 - [How it works](#how-it-works)
 - [Choosing the split](#choosing-the-split)
 - [What runs](#what-runs)
@@ -159,7 +159,7 @@ flowchart LR
 - **Captured graphs per card.** A verify block runs as two CUDA graphs, one per card, with the hand-off between them.
   Prefill chunks, commits and tree gathers run eagerly.
 - **Per-device kernel limits.** Kernels needing more than 48 KB of shared memory set that limit per device
-  (`PerDeviceOnce` / `PerDeviceMax`); a process-wide "set once" guard leaves the second card at the default.
+  (`PerDeviceLimit`); a process-wide "set once" guard leaves the second card at the default.
 
 The engine changes are in [`src/models/qwen/qwen35/qwen35_split.cpp`](src/models/qwen/qwen35/qwen35_split.cpp) and the
 hooks marked "layer split" in the qwen35 engine; the full guide is [docs/guides/multi-gpu.md](docs/guides/multi-gpu.md).

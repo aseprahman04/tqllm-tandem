@@ -80,10 +80,12 @@
     <circle r="5" fill="#e0f2fe">
       <animateMotion dur="2.4s" repeatCount="indefinite"><mpath href="#wire"/></animateMotion>
     </circle>
-    <circle r="5" fill="#e0f2fe">
+    <circle r="5" fill="#e0f2fe" visibility="hidden">
+      <set attributeName="visibility" to="visible" begin="0.8s"/>
       <animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite"><mpath href="#wire"/></animateMotion>
     </circle>
-    <circle r="5" fill="#e0f2fe">
+    <circle r="5" fill="#e0f2fe" visibility="hidden">
+      <set attributeName="visibility" to="visible" begin="1.6s"/>
       <animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite"><mpath href="#wire"/></animateMotion>
     </circle>
   </g>

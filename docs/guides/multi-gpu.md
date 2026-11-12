@@ -81,7 +81,7 @@ cards with TQ_L.
 ## Notes
 
 - During a long prefill the first card does most of the work: it holds 11 of the 16 attention layers at `K=44`.
-- Kernels that need more than 48 KB of shared memory have their limit set on each card (`PerDeviceOnce` /
-  `PerDeviceMax`, `src/core/per_device_once.cuh`); the limit is a per-device attribute.
+- Kernels that need more than 48 KB of shared memory have their limit set on each card (`PerDeviceLimit`,
+  `src/core/per_device_once.cuh`); the limit is a per-device attribute.
 - With a split the token embeddings live in portable host memory, so both cards read them (one row per token).
 - Code: `src/models/qwen/qwen35/qwen35_split.cpp` and the hooks marked "layer split" in the qwen35 engine.
