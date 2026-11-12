@@ -57,6 +57,17 @@ stream, norms and embeddings are replicated; each card holds half the heads, hal
   column slice at a block boundary (row-parallel: `wo`, GDN `w_out`, `w_down`), then calls the format's `load()`.
   Per-head vectors (q / k norms are per head-dim and replicated; GDN `conv_w`, `neg_a`, `dt_bias`, `gnorm_w` follow the
   head slice).
+- **Slices for rank r (Qwen3.8-27B; checked against the kernels).**
+  - Attention: `attn_q` holds `[q(256) | gate(256)]` per head (`o[h*dim+d] *= sigmoid(qg[h*2*dim+dim+d])`): rows
+    `[r*12*512, (r+1)*12*512)`; `attn_k` / `attn_v`: rows `[r*2*256, (r+1)*2*256)` (GQA: q-heads 0-11 use KV heads 0-1);
+    `attn_output`: columns `[r*12*256, (r+1)*12*256)`; `q_norm` / `k_norm` (per head-dim) replicated.
+  - Gated DeltaNet: GGUF keeps the value heads **tiled** (`cfg.tiled`, `kh = h % kheads` in `gdn_multi_k`), so rank r
+    owns k-heads `[8r, 8r+8)` and v-heads `{16g + 8r .. 16g + 8r + 7 : g = 0, 1, 2}` - three runs of 8 heads, which keep
+    `h % kheads` right locally (local h' = 8g + i <-> global 16g + 8r + i). `attn_qkv` rows: q `[8r*128, +1024)`, k
+    `2048 + [8r*128, +1024)`, v `4096 + run(g)*128`; `attn_gate` (z) rows, `ssm_out` columns: the v runs x 128;
+    `ssm_beta` / `ssm_alpha` rows, `ssm_a`, `ssm_dt.bias`: the v runs; `ssm_conv1d` (per channel, conv_k taps): the
+    q / k / v channels as `attn_qkv`; `ssm_norm` (per dv) replicated.
+  - FFN: `ffn_gate` / `ffn_up` rows `[r*8704, (r+1)*8704)`; `ffn_down` columns the same.
 - **Hooks** (all-reduce of a bf16 partial, `n x hidden`):
   1. mixer output `M` (attention `wo` in `attn_mixer`, GDN `mm_h(L.w_out, M, n)`), before `ffn_block`'s first
      `add_sumsq(M, resid)`;
