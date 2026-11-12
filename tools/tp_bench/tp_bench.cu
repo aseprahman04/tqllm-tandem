@@ -46,6 +46,26 @@ __global__ void add_flag_k(__nv_bfloat16 * x, const volatile __nv_bfloat16 * oth
         x[i] = __float2bfloat16(__bfloat162float(x[i]) + __bfloat162float(((const __nv_bfloat16 *)other)[i]));
 }
 
+__global__ void produce_g_k(__nv_bfloat16 * dst, float v, volatile unsigned * flag, const volatile unsigned * epoch, int k) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x) dst[i] = __float2bfloat16(v);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) flag[blockIdx.x] = *epoch * 1024u + unsigned(k) + 1u;
+}
+__global__ void add_g_k(__nv_bfloat16 * x, const __nv_bfloat16 * other, const volatile unsigned * flag,
+                        const volatile unsigned * epoch, int k, int producer_blocks) {
+    if (threadIdx.x == 0) {
+        const unsigned want = *epoch * 1024u + unsigned(k) + 1u;
+        for (int b = 0; b < producer_blocks; ++b)
+            while (flag[b] < want) {}
+    }
+    __syncthreads();
+    __threadfence_system();
+    const unsigned short * o = reinterpret_cast<const unsigned short *>(other);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x)
+        x[i] = __float2bfloat16(__bfloat162float(x[i]) + __bfloat162float(__ushort_as_bfloat16(__ldcv(o + i))));
+}
+
 struct Dev {
     cudaStream_t s;
     cudaEvent_t done;
@@ -138,6 +158,34 @@ int main(int argc, char ** argv) {
         }
     });
     report("C zero-copy + flags", c);
+    // D: one captured graph per GPU for the whole step (both submitted up front), synchronised by flags in mapped host
+    // memory: flag value = epoch * 1024 + k + 1, the epoch bumped by the host before each pair of launches
+    unsigned * epoch = nullptr;
+    CK(cudaHostAlloc(&epoch, sizeof(unsigned), cudaHostAllocMapped | cudaHostAllocPortable));
+    *epoch = 1;
+    __nv_bfloat16 * h2[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int s = 0; s < 2; ++s) CK(cudaHostAlloc(&h2[i][s], N * 2, cudaHostAllocMapped | cudaHostAllocPortable));
+    for (int i = 0; i < 2; ++i) for (int b = 0; b < 64; ++b) flags[i][b] = 0;
+    cudaGraphExec_t ge[2];
+    for (int i = 0; i < 2; ++i) {
+        CK(cudaSetDevice(i));
+        cudaGraph_t g;
+        CK(cudaStreamBeginCapture(d[i].s, cudaStreamCaptureModeThreadLocal));
+        for (int k = 0; k < ITERS; ++k) {
+            work_k<<<1, 32, 0, d[i].s>>>(work_us);
+            produce_g_k<<<PB, 256, 0, d[i].s>>>(h2[i][k & 1], 1.f, flags[i], epoch, k);
+            add_g_k<<<40, 256, 0, d[i].s>>>(d[i].p, h2[1 - i][k & 1], flags[1 - i], epoch, k, PB);
+        }
+        CK(cudaStreamEndCapture(d[i].s, &g));
+        CK(cudaGraphInstantiate(&ge[i], g, 0));
+    }
+    const double dd = timed("D graphs + flags", [&](unsigned it) {
+        if (it % ITERS != 1) return;  // one pair of graph launches per timed step
+        *epoch += 1;
+        for (int i = 0; i < 2; ++i) { CK(cudaSetDevice(i)); CK(cudaGraphLaunch(ge[i], d[i].s)); }
+    });
+    report("D graphs + flags", dd);
     std::printf("work-only step: %.2f ms (%d x %d us = %.2f ms asked)\n", base, ITERS, work_us, ITERS * work_us / 1000.0);
     return 0;
 }

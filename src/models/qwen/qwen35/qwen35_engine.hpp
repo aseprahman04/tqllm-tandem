@@ -55,6 +55,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <unordered_map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -227,11 +228,10 @@ private:
     void tp_setup(int slots);
     void load_layer_tp(const GgufFile & f, Layer & L, uint32_t l, int rank);
     void verify_body_tp(int n, int max_seq);
-    void tp_allreduce(bool m_buf, int n);  // v_m (true) or v_x [n][hidden]: a partial on each GPU -> the sum on both
+    std::unordered_map<uint64_t, cudaGraphExec_t> tp_graphs;  // verify segments per (GPU, layer, part, shape, slots)
     bool tp_hold = false;                // ffn_block stops before its closing residual add (the caller reduces first)
     __nv_bfloat16 * tp_host[2][2] = {};  // [rank][parity] mapped host buffers, NBUF x hidden
     cudaEvent_t tp_made[2][2] = {}, tp_used[2][2] = {};
-    unsigned tp_k = 0;
     std::unique_ptr<KvMemory> kv_mem0;  // device 0's KV memory / pool / store (attention layers below the split)
     std::unique_ptr<KvPool> kv_pool0;
     std::unique_ptr<KvStore> kv_seq0;
