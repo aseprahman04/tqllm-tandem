@@ -76,6 +76,26 @@ stream, norms and embeddings are replicated; each card holds half the heads, hal
 - **Order of work per layer (eager, M1):** rank 0 mixer, rank 1 mixer, exchange, rank 0 FFN, rank 1 FFN, exchange. The
   layer loop in `verify_body` becomes per-segment calls so both ranks' segments interleave on the host.
 
+## Results so far (2x RTX 5060 Ti, Windows 11, branch `tp`)
+
+| Qwen3.8-27B, 8K context | Code tok/s | Prose tok/s | Prefill 9.7K | Coding check |
+|---|--:|--:|--:|--:|
+| TQ_XS, layer split + DFlash2 | 196-200 | 80-85 | - | 17/20 |
+| TQ_XS, **TP** + DFlash2 (segment graphs) | **206-216** | **122** | - | - |
+| TQ_S, layer split + DFlash2 | 153-160 | 86 | 1,643 | 18/20 |
+| TQ_S, **TP** + DFlash2 (segment graphs, commit graphs) | **202-212** | **113** | 1,212 (eager) | 18/20 |
+| TQ_XS without a drafter: one GPU / layer split / TP | 33.6 / 31.6 / 37.7 | | | |
+
+- Correctness: TP answers are coherent; 2 of 4 golden answers identical to one GPU, the others diverge late (two
+  partial sums per row-parallel projection). Graph vs eager TP: identical.
+- Where a TQ_S verify step (27.8 ms + 1.3 ms commit) goes: ~15.7 ms weights (6.3 GB per GPU), ~5 ms the 128
+  cross-GPU exchanges (~40 us each: WDDM event latency), ~2 ms drafter and tree, ~1.6 ms LM head (home only), the
+  rest launch overhead. GPU0 86 % / GPU1 76 % busy.
+- Tried: eager TP (host-bound: 167-171 / 98 on TQ_XS); one graph per GPU per step synchronised by flags in mapped
+  host memory: ~1.6 ms an exchange under WDDM (`tools/tp_bench` mode D) - unusable.
+- 250 tok/s needs the exchange latency well under 40 us (Linux without WDDM, or peer access / NVLink) or fewer
+  exchanges. Next ideas: vocabulary-split head (~0.7 ms), prefill pipelined like the layer split, Linux numbers.
+
 ## Milestones
 
 | | Scope | Done when |
