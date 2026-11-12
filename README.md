@@ -69,8 +69,32 @@ Prefill (prompt reading, unique prompts, median of three), with both cards worki
 
 Plain llama.cpp GGUFs (K-quants, IQ) split the same way as the TQ formats.
 
-The last row is the price of the split itself: the same model on one card runs at 205 / 81 tok/s, so the hand-off
-between the cards costs almost nothing once each card replays its own captured graph.
+The TQ_XS split row is the price of the split itself: the same model on one card runs at 205 / 81 tok/s, so the
+hand-off between the cards costs almost nothing once each card replays its own captured graph.
+
+### Mixture of experts
+
+[Qwen3.8-35B-A3B-Distill](https://huggingface.co/empero-ai/Qwen3.8-35B-A3B-Distill-GGUF) Q4_K_M (21.7 GB, 256
+experts, 8 active): too big for one 16 GB card, so llama.cpp keeps 27 layers' experts in system RAM. Split across two
+cards every expert stays in VRAM:
+
+| Setup | Decode, code | Decode, prose | Prefill |
+|---|--:|--:|--:|
+| **Tandem, 2 cards, every expert in VRAM, no drafter** | **135–137 tok/s** | **135 tok/s** | **3,515 tok/s** (9.7K), **3,965** (36.7K) |
+| llama.cpp b12223, 1 card, `--n-cpu-moe 27` ([published run](https://niklaslenz.com/v2/qwen38-35b-a3b-distill-5060ti-q4km-llamacpp/)) | 63.8 | 63.0 | 988 (8K) |
+
+Split at `K=20` and at `K=24` the greedy answers are identical; `K=24` balances VRAM best (11.6 / 13.4 GB at 131K).
+
+### Thinking on and off
+
+TQ_L + DFlash2, greedy, up to 4,096 tokens. Thinking costs time to the answer, not decode speed:
+
+| Prompt | Thinking off: tok/s, answer | Thinking on: tok/s, answer |
+|---|--:|--:|
+| TypeScript LRU cache + tests | 140, 10.7 s | 135, 26.3 s |
+| CSV parser | 133, 4.6 s | 78, 52.6 s (hit 4,096 tokens) |
+| Why the sky is blue (prose) | 82, 5.3 s | 135, 17.7 s |
+| Train arrival time (arithmetic) | 137, 6.0 s | 135, 2.0 s |
 
 ### Context
 
@@ -205,12 +229,12 @@ KV per token with `--kv tq3`: 224 bytes per KV head in each attention layer, **1
 
 | | Tandem split |
 |---|---|
-| Models | dense Qwen3.5 / 3.6 / 3.8 (`qwen35`), TQ formats and llama.cpp K-quants |
+| Models | dense Qwen3.5 / 3.6 / 3.8 (`qwen35`) and their MoE models (`qwen35moe`, every expert on the GPUs), TQ formats and llama.cpp K-quants |
 | Drafter | DFlash2 (`-md`), or none |
 | Slots | one (`--np 1`) |
 | KV | all on the GPUs (`--kv-host 0`), any KV format |
 | Prompt reuse | `--prompt-cache on` |
-| Not yet | `--mtp`, `--kv-host`, `--kv-compact`, `--np > 1`, MoE models, images |
+| Not yet | `--mtp`, `--kv-host`, `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`), images |
 
 Without `TQLLM_SPLIT` the engine is upstream tqLLM: every other model and option works as documented in
 [docs/tqllm-README.md](docs/tqllm-README.md).
@@ -242,7 +266,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 - **A million tokens.** A host KV tail with TqCache compaction (lossy) per card, or the trellis tcq3 / tcq2 KV codecs
   (~640K on the GPUs).
-- **More of tqLLM under the split:** `--np > 1`, `--mtp`, MoE models, images.
+- **More of tqLLM under the split:** `--np > 1`, `--mtp`, experts in host memory, Flash-Next, images.
 - **Borrowed system RAM for bigger weights** (Q8_0, BF16): a share of the layers' weights streamed from host memory
   per verify window. (UD-Q6_K already fits two 16 GB cards.)
 - **More than two cards**, and Linux numbers.
@@ -253,7 +277,8 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 | Version | What changed | TQ_L prefill, 36.7K-token prompt |
 |---|---|--:|
-| main (unreleased) | **Prefill on both cards at once** (`split_prefill`): consecutive chunks overlap across the cards, 1.5x faster prompt reading, identical outputs. Tried and left off: `--lookup` prompt-lookup drafts (+2-3 % on code, -20-30 % on file edits, where DFlash2 already drafts the copies) | **1,650 tok/s** |
+| main (unreleased) | **Mixture-of-experts models** under the split (`qwen35moe`, every expert on the GPUs): Qwen3.8-35B-A3B-Distill Q4_K_M at 135-137 tok/s decode and 3,965 tok/s prefill. Decoding without a drafter now runs under the split (one graph per GPU). Thinking on / off measured | 1,650 tok/s |
+| [v0.1.2](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.2) | **Prefill on both cards at once** (`split_prefill`): consecutive chunks overlap across the cards, 1.5x faster prompt reading, identical outputs. Tried and left off: `--lookup` prompt-lookup drafts (+2-3 % on code, -20-30 % on file edits, where DFlash2 already drafts the copies) and a 12-column draft tree (verify costs 15 % more) | **1,650 tok/s** |
 | [v0.1.1](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.1) | Plain llama.cpp GGUFs (K-quants, IQ) under the split: composite matrices keep one stream / event pool per GPU. Unsloth UD-Q6_K (22 GB) runs at 86-96 / 57 tok/s, 131K context | 1,044 tok/s |
 | [v0.1.0](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.0) | First release: layer split across two GPUs (`TQLLM_SPLIT`), bit-exact against one card, 524,288-token context with YaRN, Windows build, `tandem-serve.bat` and `tandem-agent.bat` (Claude Code, Codex, opencode, pi) | 1,044 tok/s |
 

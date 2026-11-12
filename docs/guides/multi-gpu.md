@@ -37,12 +37,12 @@ tqserve.exe --model Qwen3.8-27B-TQ_L.gguf ^
 
 | | |
 |---|---|
-| Models | dense Qwen3.5 / 3.6 / 3.8 GGUFs (`qwen35`), TQ formats and llama.cpp K-quants |
+| Models | dense Qwen3.5 / 3.6 / 3.8 GGUFs (`qwen35`) and their MoE models (`qwen35moe`, every expert on the GPUs), TQ formats and llama.cpp K-quants |
 | Drafter | DFlash2 (`-md`), or none |
 | Slots | one (`--np 1`) |
 | KV | on the GPUs (`--kv-host 0`); any KV format |
 | Prompt reuse | `--prompt-cache on` |
-| Not yet | `--mtp`, `--kv-host` (a host KV tail), `--kv-compact`, `--np > 1`, MoE models, images |
+| Not yet | `--mtp`, `--kv-host` (a host KV tail), `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`), images |
 
 A verify block runs as two captured CUDA graphs, one per card, with the hand-off between them. Prefill chunks run eagerly
 and overlap across the cards: device 1 starts the next chunk while device 0 finishes this one (`split_prefill`). Commits

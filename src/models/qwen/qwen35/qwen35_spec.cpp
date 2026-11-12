@@ -439,7 +439,14 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     for (const auto & g : segs) kv_track(g.pos, g.n);
     uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-    ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+    if (split_at) {  // layer split (fork addition): one captured graph per GPU, the hand-off between them outside
+        use_dev(0);
+        split_mirror_control();
+        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key ^ 1, [&] { verify_body(col, int(context_), 0); }), stream));
+        use_dev(1);
+        split_hop(col);
+        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key ^ 2, [&] { verify_body(col, int(context_), 1); }), stream));
+    } else ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));

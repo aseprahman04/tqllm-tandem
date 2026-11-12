@@ -5,7 +5,7 @@
 // handle and scratch buffers; use_dev() swaps them. The design follows PolyStrata's strata-poly layer split (one stage
 // per card, rows handed on through host memory, no peer access needed); the code is new.
 //
-// What the split runs so far: one slot, dense models, all KV on the GPUs (--kv-host 0), --prompt-cache, DFlash2 or no
+// What the split runs so far: one slot, dense and MoE models (every expert on the GPUs), all KV on the GPUs (--kv-host 0), --prompt-cache, DFlash2 or no
 // drafter. A verify block runs as two captured graphs, one per GPU, with the hand-off between them (split_hop); prefill
 // chunks, commits and tree gathers run eagerly. Greedy output equals the one-device run token for token (checked on
 // Qwen3.8-27B TQ_XS); TQ_L, which no 16 GB card holds alone, serves 524,288 tokens (YaRN x2) on two.
@@ -28,7 +28,8 @@ void Qwen35Engine::split_setup(int slots) {
     need(n >= 2, "needs two CUDA devices; this process sees " + std::to_string(n));
     need(slots == 1, "one slot so far: pass --np 1");
     need(k > 0 && k < int(cfg.layers), "K must be a layer in 1.." + std::to_string(cfg.layers - 1));
-    need(!cfg.moe, "dense models only so far (not qwen35moe)");
+    need(!cfg.moe || (opt.moe_host_mb <= 0 && opt.moe_cache_mb <= 0 && opt.n_cpu_moe <= 0),
+         "MoE models with every expert on the GPUs only so far (no --moe-host-mb / --moe-cache-mb / -ncmoe)");
     need(!cfg.tied, "models with an untied LM head only (the head lives on the second GPU)");
     need(opt.kv_host <= 0, "all KV on the GPUs so far: pass --kv-host 0");
     need(opt.kv_compact <= 0, "no --kv-compact yet");
@@ -50,7 +51,10 @@ std::vector<Buf *> Qwen35Engine::dev_bufs() {
             &v_pm,   &v_logits, &v_tok, &v_amax, &v_q,      &v_qkvc, &v_part,   &s_id,       &s_lg,    &s_scr,
             &v_xb,   &v_mixa, &v_mixb, &v_xu,   &v_hid,     &v_cat,  &mtp_h,    &v_tokens,   &v_pos,   &v_rpos,
             &d_tpar, &d_tdep, &d_tcols, &d_chain, &d_cdep,  &d_gdesc, &d_pend,  &d_rep_qkvc, &gemm_w,  &gemm_c,
-            &blas_ws, &fp8_sw, &v_feat};
+            &blas_ws, &fp8_sw, &v_feat,
+            // MoE routing and expert scratch (every expert of a layer lives on that layer's GPU)
+            &moe_logits, &moe_ids, &moe_counts, &moe_groups, &moe_xids, &moe_weights, &moe_shared_weights, &moe_gate,
+            &moe_up, &moe_act, &moe_out, &moe_shared};
 }
 
 void Qwen35Engine::use_dev(int d, bool wait) {
