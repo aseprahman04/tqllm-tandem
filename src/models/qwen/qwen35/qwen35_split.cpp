@@ -109,6 +109,9 @@ void Qwen35Engine::split_alloc_dev0() {
         bytes.push_back(sz);
     }
     use_dev(0);
+    // the RoPE scaling table (YaRN, linear) is __constant__ memory, per device: the constructor loaded it on device 0
+    // only, so the first GPU's attention layers ran unscaled RoPE under --rope-scaling until this line
+    set_rope(false);
     const auto list = dev_bufs();
     for (size_t i = 0; i < list.size(); ++i)
         if (bytes[i] && !list[i]->p) *list[i] = Buf(bytes[i]);

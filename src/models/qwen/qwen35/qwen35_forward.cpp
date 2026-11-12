@@ -472,14 +472,15 @@ void Qwen35Engine::reset_state() {
     use_dev(1);
 }
 
-void Qwen35Engine::set_rope() {
+void Qwen35Engine::set_rope(bool log) {
     RopeScaling rs = opt.rope;
     if (rs.type == "none" && opt.rope.factor == 1.f && cfg.rope_type != "none") rs.type = cfg.rope_type, rs.factor = cfg.rope_factor;
     const long orig = rs.orig_ctx ? rs.orig_ctx : cfg.rope_orig_ctx ? long(cfg.rope_orig_ctx) : long(cfg.ctx_train);
     if (rs.on() && rs.type != "linear" && rs.type != "yarn") throw std::invalid_argument("unknown --rope-scaling " + rs.type);
     if (rs.on() && rs.type == "yarn" && orig <= 0) throw std::invalid_argument("YaRN needs --yarn-orig-ctx (no context_length in the model)");
     const RopeTable t = rope_scaling_table(rs, int(cfg.rot_dim), cfg.theta, orig);
-    tqllm_cuda::set_rope_scaling(t.mul.data(), int(t.mul.size()), t.mscale);
+    tqllm_cuda::set_rope_scaling(t.mul.data(), int(t.mul.size()), t.mscale);  // __constant__: the current device only
+    if (!log) return;
     if (rs.on())
         std::fprintf(stderr, "tqllm: RoPE %s x%.2f from %ld positions (cos/sin scale %.4f)\n", rs.type.c_str(), rs.factor, orig, t.mscale);
     else if (cfg.ctx_train && context_ > cfg.ctx_train)
