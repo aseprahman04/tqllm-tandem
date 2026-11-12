@@ -238,7 +238,7 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
         ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
                            rb, cudaMemcpyDefault, stream));
     }
-    use_dev(home_dev);
+    use_dev(1);
 }
 
 uint32_t Qwen35Engine::pc_match(const std::vector<uint32_t> & prompt) {
@@ -469,7 +469,7 @@ void Qwen35Engine::reset_state() {
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
         ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
     }
-    use_dev(home_dev);
+    use_dev(1);
 }
 
 void Qwen35Engine::set_rope() {
@@ -1443,7 +1443,7 @@ void Qwen35Engine::flush_pending() {
                               d_chain.as<int>());
         ++lin_i;
     }
-    use_dev(home_dev);
+    use_dev(1);
     cur = (cur + 1) % NSLOT;
     set_pending(0);
 }

@@ -87,7 +87,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             embed = {put(b.data(), b.size()), GGML_BF16, int(cfg.vocab), H};
         }
     }
-    use_dev(home_dev);  // layer split: the output norm and head live on the last device
+    use_dev(1);  // layer split: the output norm and head live on the last device
     out_norm = g_f32(f, "output_norm.weight", H);
     if (cfg.tied) lm_head = embed;  // tied embeddings (Qwen3.5 4B and smaller): no output.weight in the file
     else {
@@ -240,7 +240,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             L.gnorm_w = g_f32(f, p + "ssm_norm.weight", cfg.lin_dv);
         }
     }
-    use_dev(home_dev);  // layer split: buffers, head and drafter are set up on the last device
+    use_dev(1);  // layer split: buffers, head and drafter are set up on the last device
 }
 
 void Qwen35Engine::alloc_seq_state() {
@@ -257,7 +257,7 @@ void Qwen35Engine::alloc_seq_state() {
             kv_mem0 = make_cuda_kv_memory(stream);
             const KvGeometry g0{attn0, size_t(kv_row_bytes(true)), size_t(kv_row_bytes(false)), kvs->page(context_), -1, false};
             kv_pool0 = std::make_unique<KvPool>(*kv_mem0, g0, nslots, 0);
-            use_dev(home_dev);
+            use_dev(1);
         }
         kv_mem = make_cuda_kv_memory(stream);
         const int64_t host = std::min<int64_t>(std::max(0L, opt.kv_host), context_);
@@ -352,7 +352,7 @@ void Qwen35Engine::alloc_seq_state() {
             }
         }
     }
-    use_dev(home_dev);
+    use_dev(1);
 }
 
 void Qwen35Engine::allocate() {
@@ -483,7 +483,7 @@ void Qwen35Engine::allocate() {
             use_dev(dev_of(l));  // layer split: a layer's verify stash on its device
             for (auto & st : v_stash2) st.emplace_back(size_t(NB) * mix_rows * 2);
         }
-    use_dev(home_dev);
+    use_dev(1);
     v_hid = Buf(NBUF * H * 2);
     v_cat = Buf(NVER * 2 * H * 2);
     mtp_h = Buf(H * 2);

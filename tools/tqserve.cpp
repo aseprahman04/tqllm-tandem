@@ -466,10 +466,8 @@ int main(int argc, char ** argv) {
             status = 200;
             if (request.method == "GET" && request.path == "/props") {
                 // multi-GPU fork addition: llama.cpp's /props subset that clients read for the loaded context (n_ctx)
-                body = "{\"default_generation_settings\":{\"n_ctx\":" + std::to_string(model.context()) +
-                       "},\"total_slots\":1,\"model_path\":";
-                tqserve::jstr(body, name);
-                body += "}";
+                // (per slot, as llama.cpp reports it: the model was made with --context / --np)
+                body = "{\"default_generation_settings\":{\"n_ctx\":" + std::to_string(model.context()) + "}}";
             } else if (request.method == "GET" && request.path == "/health") {
                 std::string fit;  // what the memory fit chose (KV, context, buffers); quotes cannot occur in it
                 for (char ch : model.fit_note()) if (ch != '"' && ch != '\\') fit += ch;

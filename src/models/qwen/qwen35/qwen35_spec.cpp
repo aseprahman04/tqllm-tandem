@@ -439,7 +439,7 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     for (const auto & g : segs) kv_track(g.pos, g.n);
     uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-    launch_cached(kGraphBatch, key, stream, [&] { verify_body(col, int(context_)); });
+    ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
     std::vector<uint32_t> res(size_t(col) + 1);
     ck(cudaMemcpyAsync(res.data(), v_tok.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
     if (on_dev) ck(cudaMemcpyAsync(h_tok, v_tokens.p, size_t(col) * 4, cudaMemcpyDeviceToHost, stream));
@@ -607,7 +607,7 @@ bool Qwen35Engine::dflash_advance() {
         if (!contiguous) {  // accepted path -> columns 0 .. j: GDN stashes, drafter features, attention K/V
             const int nf = int(dfl.target_ids.size()), H = int(cfg.hidden);
             // layer split (fork addition): one gather per device over the layers it holds; the features on device 1
-            for (int d = split_at ? 0 : home_dev; d <= home_dev; ++d) {
+            for (int d = split_at ? 0 : 1; d <= 1; ++d) {
                 use_dev(d);
                 std::vector<tqllm_cuda::PathGather> g;
                 uint32_t lin_i = 0, attn_i = 0;
@@ -624,7 +624,7 @@ bool Qwen35Engine::dflash_advance() {
                         ++lin_i;
                     }
                 }
-                if (d == home_dev) g.push_back({v_feat.p, int64_t(nf) * H * 2, 0});
+                if (d == 1) g.push_back({v_feat.p, int64_t(nf) * H * 2, 0});
                 ck(cudaMemcpyAsync(d_gdesc.p, g.data(), g.size() * sizeof(g[0]), cudaMemcpyHostToDevice, stream));
                 ck(cudaMemcpyAsync(d_tcols.p, path.data(), path.size() * 4, cudaMemcpyHostToDevice, stream));
                 tqllm_cuda::gather_path(d_gdesc.as<tqllm_cuda::PathGather>(), int(g.size()), d_tcols.as<int>(), j + 1,
@@ -645,10 +645,12 @@ bool Qwen35Engine::dflash_advance() {
             set_dpos(pos);
             const uint64_t key = uint64_t(k) | (uint64_t(k < last_n) << 8) | (uint64_t(cur) << 16) |
                                  (uint64_t(sp) << 24) | (uint64_t(active) << 32);
-            launch_cached(kGraphCommit, key, stream, [&] {
+            const auto body = [&] {
                 if (k < last_n) commit_body(k);
                 dflash_inject_body(v_feat.as<bf16>(), k);
-            });
+            };
+            if (split_at) body();  // layer split: the commit visits both GPUs, so it cannot be one graph
+            else ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, body), stream));
             cur = (cur + 1) % NSLOT;
             last_n = 0;
         } else {
@@ -976,7 +978,7 @@ void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens i
             ++lin_i;
         }
     }
-    use_dev(home_dev);
+    use_dev(1);
 }
 
 }  // namespace qwen35_detail

@@ -1,5 +1,5 @@
 #pragma once
-// Modified in the multi-GPU fork: the shared-memory attributes are set per device (PerDeviceOnce / PerDeviceMax).
+// Modified in the multi-GPU fork: the shared-memory attributes are set per device (PerDeviceLimit).
 // moe_window.cuh: routed-expert matvec on X3 banks with the window GEMV. One part per (token, slot): the build
 // kernel reads the routing ids on the device and writes one XwMoeList per codec of the bank (an EXL3 pack mixes K
 // per expert), then each codec runs the three window launches over its list read from device memory. The k split
@@ -270,7 +270,7 @@ void xw_moe_gemv_launch(const XwMoeList* L, int items, size_t smem, cudaStream_t
         cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0);
         return max(1, v);
     }();
-    static tqllm_cuda::PerDeviceMax attr_for;  // multi-GPU fork: the limit is per device
+    static tqllm_cuda::PerDeviceLimit attr_for;  // multi-GPU fork: the limit is per device
     if (attr_for.raise((long long) smem))      // the launch's own stage: the 192-slice item is above the 48 KB default
         cudaFuncSetAttribute(xw_moe_gemv<Codec, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
     static size_t last_smem = 0;
@@ -471,11 +471,11 @@ __global__ __launch_bounds__(XwGeom::THREADS) void xw_pmoe_gemv(const XwMoeList*
 template <class Codec>
 void xw_pmoe_gemv_launch(const XwMoeList* L, int items, size_t smem, cudaStream_t s) {
     // the resident grid for this launch's shared memory (49 KB at MiniMax's 96-slice items: two blocks per SM)
-    static tqllm_cuda::PerDeviceOnce attr;  // multi-GPU fork: the limit is per device
-    attr([] {
+    static tqllm_cuda::PerDeviceLimit attr;  // multi-GPU fork: the limit is per device
+    if (attr.raise(1)) {
         const size_t most = size_t(XW_MAX_N) * xw_a_stride(XW_MAX_ITEM_SLICES) * 4;
         cudaFuncSetAttribute(xw_pmoe_gemv<Codec>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(most));
-    });
+    }
     static const int sms = [] {
         int v = 1;
         cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0);

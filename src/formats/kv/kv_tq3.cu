@@ -1,5 +1,5 @@
 // TQ3_0 KV-cache format kernels: writer + FA-style attention (see src/formats/kv/kv_tq3.cpp).
-// Modified in the multi-GPU fork: the shared-memory attribute is set on every device (PerDeviceOnce).
+// Modified in the multi-GPU fork: the shared-memory attribute is set on every device (PerDeviceLimit).
 #include "common.cuh"
 #include "per_device_once.cuh"
 #include "qwen2_kernels.cuh"
@@ -627,10 +627,9 @@ static void tq3_launch(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_
                        float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit, cudaStream_t s,
                        const int * dep = nullptr, int pstride = 0, int zoff = 0, const int * dstart = nullptr,
                        int cstride = 0, const float * kbias = nullptr, int flat = 0, int poff = 0) {
-    static tqllm_cuda::PerDeviceOnce configured;  // multi-GPU fork: the limit is per device
-    configured([] {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1))
         cudaFuncSetAttribute(attn_tq3kv_k<NW, KC, VC, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tq3a::smem<NW, NB>()));
-    });
     const int blocks = ((h / kh) * nq + NW * 16 - 1) / (NW * 16);
     attn_tq3kv_k<NW, KC, VC, NB><<<dim3(kh, blocks, nsplit), NW * 32, tq3a::smem<NW, NB>(), s>>>(
         q, kc, vc, y, part, dseq0, nq, h, kh, scale, nsplit, dep, pstride, zoff, dstart, cstride, kbias, flat, poff);

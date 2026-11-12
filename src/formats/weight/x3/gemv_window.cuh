@@ -1,5 +1,5 @@
 #pragma once
-// Modified in the multi-GPU fork: the shared-memory attribute is set per device (PerDeviceOnce).
+// Modified in the multi-GPU fork: the shared-memory attribute is set per device (PerDeviceLimit).
 #include "per_device_once.cuh"
 // gemv_window.cu: X3 decode GEMV for n = 1..16 columns, built the TRUSS way (~/trellis-kernel
 // src/kernels/moe/moe_window.cu gemv_item: decode in registers, one mma per tile with the weights as the A
@@ -312,11 +312,11 @@ __global__ __launch_bounds__(XwGeom::THREADS, xw_gemv_min_blocks<Codec>()) void 
 // One gemv launch with NB batch halves; the resident grid is sized from the shared memory this launch asks for.
 template <class Codec, int NB>
 void xw_gemv_launch(const XwList& L, size_t smem, cudaStream_t s) {
-    static tqllm_cuda::PerDeviceOnce attr;  // multi-GPU fork: the limit is per device
-    attr([] {
+    static tqllm_cuda::PerDeviceLimit attr;  // multi-GPU fork: the limit is per device
+    if (attr.raise(1)) {
         const size_t most = xw_gemv_smem(8 * NB, XW_MAX_ITEM_SLICES, NB);   // NB = 2: above the 48 KB default
         cudaFuncSetAttribute(xw_gemv<Codec, NB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(most));
-    });
+    }
     static const int sms = [] {
         int v = 1;
         cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, 0);

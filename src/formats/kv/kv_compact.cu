@@ -2,7 +2,7 @@
 // TQ3 rotated basis, one log-weight bias per row and KV head) fitted to the layer's recent queries so attention to the
 // block keeps its output and its mass. Runs on the GPU while the server is idle (cuBLAS + cuSOLVER, FP32).
 // Idea: Fast KV Compaction via Attention Matching (arXiv 2602.16284); this code is written from the published description.
-// Modified in the multi-GPU fork: the shared-memory attribute is raised per device (PerDeviceMax).
+// Modified in the multi-GPU fork: the shared-memory attribute is raised per device (PerDeviceLimit).
 #include "qwen35_kernels.cuh"
 #include "per_device_once.cuh"
 
@@ -306,7 +306,7 @@ void kv_topm_select(const float * mass, int nb, int m, int succ, int * sel, cuda
     int P = 1;
     while (P < nb) P <<= 1;
     const int bytes = P * 8;
-    static tqllm_cuda::PerDeviceMax configured;  // multi-GPU fork: the limit is per device
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
     if (configured.raise(bytes)) cudaFuncSetAttribute(topm_select_k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     topm_select_k<<<1, 1024, bytes, s>>>(mass, nb, m, succ, sel);
 }

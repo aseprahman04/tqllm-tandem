@@ -2,7 +2,7 @@
 // tqLLM's expert banks in place: the tile loaders take our bank layout (codes + records, tiled or not), the columns are
 // the layer-major pass's slot groups (counts / groups / cap), the activations are quantised once per input row (token or
 // assignment) and gathered per tile, and the output is bf16 in the pass's [assignment][rows] buffers.
-// Modified in the multi-GPU fork: the shared-memory attribute is set per device (PerDeviceOnce).
+// Modified in the multi-GPU fork: the shared-memory attribute is set per device (PerDeviceLimit).
 #define TQ_MMQ 1
 #include "per_device_once.cuh"
 #include "quant_kernels.cuh"
@@ -113,8 +113,8 @@ void launch(const mmq_args & a, cudaStream_t s) {
     const DevInfo & di = dev_info();
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, di.cc);
     const int nbytes_shared = int(mmq_get_nbytes_shared(config, di.cc));
-    static tqllm_cuda::PerDeviceOnce raised;  // multi-GPU fork: the limit is per device
-    raised([&] { cudaFuncSetAttribute(mul_mat_q<type, J, fallback>, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared); });
+    static tqllm_cuda::PerDeviceLimit raised;  // multi-GPU fork: the limit is per device
+    if (raised.raise(1)) cudaFuncSetAttribute(mul_mat_q<type, J, fallback>, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
     const dim3 block_dims(32, config.nthreads / 32, 1);
     const int nty = int((a.nrows_x + config.I - 1) / config.I);
     const uint3 bpr = init_fastdiv_values(uint32_t(a.ncols_x / ggml_cuda_type_traits<type>::qk));

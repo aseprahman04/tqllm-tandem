@@ -16,7 +16,7 @@
 namespace tqllm {
 namespace qwen35_detail {
 
-void Qwen35Engine::split_setup() {
+void Qwen35Engine::split_setup(int slots) {
     const char * e = std::getenv("TQLLM_SPLIT");
     if (!e || !*e) return;
     const int k = std::atoi(e);
@@ -26,6 +26,7 @@ void Qwen35Engine::split_setup() {
         if (!ok) throw std::runtime_error("TQLLM_SPLIT: " + what);
     };
     need(n >= 2, "needs two CUDA devices; this process sees " + std::to_string(n));
+    need(slots == 1, "one slot so far: pass --np 1");
     need(k > 0 && k < int(cfg.layers), "K must be a layer in 1.." + std::to_string(cfg.layers - 1));
     need(!cfg.moe, "dense models only so far (not qwen35moe)");
     need(!cfg.tied, "models with an untied LM head only (the head lives on the second GPU)");
@@ -33,10 +34,9 @@ void Qwen35Engine::split_setup() {
     need(opt.kv_compact <= 0, "no --kv-compact yet");
     need(!opt.native_mtp, "no --mtp yet (use -md with a DFlash2 drafter)");
     split_at = k;
-    home_dev = 1;
     cuda_of[0] = 1;  // the first layers on CUDA device 1
     cuda_of[1] = 0;  // the rest, the head and the drafter on CUDA device 0, where the constructor already is
-    cur_dev = home_dev;  // the stream and cuBLAS handle made so far are device 0's: the home stage's
+    cur_dev = 1;  // the stream and cuBLAS handle made so far are device 0's: the home stage's
     std::fprintf(stderr, "tqllm: layer split: layers 0-%d on GPU 1, %d-%u, the head and the drafter on GPU 0\n", k - 1,
                  k, cfg.layers - 1);
 }
@@ -89,7 +89,8 @@ void Qwen35Engine::use_dev(int d) {
     vdep = dep == 1 ? d_tdep.as<int>() : dep == 2 ? d_cdep.as<int>() : nullptr;
 }
 
-// Device 0's scratch: the same buffers allocate() made on device 1, of the same sizes, and the constant tables copied.
+// Stage 0's scratch: the same buffers allocate() and the drafter made on stage 1, of the same sizes, and the constant
+// tables copied.
 void Qwen35Engine::split_alloc_dev0() {
     if (!split_at) return;
     std::vector<size_t> bytes;
@@ -110,31 +111,30 @@ void Qwen35Engine::split_alloc_dev0() {
     // the verify tables start as allocate() wrote them; d_pend starts at 0
     split_mirror_control();
     sync_ck();
-    use_dev(home_dev);
+    use_dev(1);
 }
 
-// Called on device 1 right after use_dev(1): device 0's residual rows, their norm partials and the drafter features of
-// its layers, for the first n columns, into device 1's buffers.
-void Qwen35Engine::split_hop(int n) {
+Buf & Qwen35Engine::other_stage(Buf & b) {
     const auto list = dev_bufs();
-    auto dev0 = [&](Buf & b) -> const void * {
-        return dstash[0].bufs[size_t(std::find(list.begin(), list.end(), &b) - list.begin())].p;
-    };
+    return dstash[1 - cur_dev].bufs[size_t(std::find(list.begin(), list.end(), &b) - list.begin())];
+}
+
+// Called on stage 1 right after use_dev(1): stage 0's residual rows, their norm partials and the drafter features of
+// its layers, for the first n columns, into stage 1's buffers.
+void Qwen35Engine::split_hop(int n) {
     const size_t H = cfg.hidden;
     const int to = cuda_of[1], from = cuda_of[0];
-    ck(cudaMemcpyPeerAsync(v_x.p, to, dev0(v_x), from, size_t(n) * H * 2, stream));
-    ck(cudaMemcpyPeerAsync(v_px.p, to, dev0(v_px), from, size_t(n) * ((H + 255) / 256) * 4, stream));
-    if (dfl.present && v_feat.p && dev0(v_feat))
-        ck(cudaMemcpyPeerAsync(v_feat.p, to, dev0(v_feat), from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
+    ck(cudaMemcpyPeerAsync(v_x.p, to, other_stage(v_x).p, from, size_t(n) * H * 2, stream));
+    ck(cudaMemcpyPeerAsync(v_px.p, to, other_stage(v_px).p, from, size_t(n) * ((H + 255) / 256) * 4, stream));
+    if (dfl.present && v_feat.p && other_stage(v_feat).p)
+        ck(cudaMemcpyPeerAsync(v_feat.p, to, other_stage(v_feat).p, from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
 }
 
-// Called on device 0 right after use_dev(0): device 1 holds the tables as the host last wrote them (tokens, positions,
+// Called on stage 0 right after use_dev(0): stage 1 holds the tables as the host last wrote them (tokens, positions,
 // tree / chain parents and depths, the pending commit length).
 void Qwen35Engine::split_mirror_control() {
-    const auto list = dev_bufs();
     auto peer = [&](Buf & b, size_t n) {
-        const size_t i = size_t(std::find(list.begin(), list.end(), &b) - list.begin());
-        const Buf & src = dstash[1].bufs[i];
+        const Buf & src = other_stage(b);
         if (b.p && src.p && n) ck(cudaMemcpyPeerAsync(b.p, cuda_of[0], src.p, cuda_of[1], n, stream));
     };
     peer(v_tokens, size_t(NBUF) * 4);

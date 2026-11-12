@@ -2,8 +2,8 @@
 #include "hf_folder.hpp"
 // The qwen35 engine class (declarations; small and template methods inline). Definitions: qwen35.cpp (factory),
 // qwen35_load.cpp, qwen35_forward.cpp, qwen35_spec.cpp. Internal to src/models/qwen/qwen35/.
-// Modified in the multi-GPU fork: the layer-split members and hooks (qwen35_split.cpp), graph launches that run
-// eagerly with a split (launch_cached).
+// Modified in the multi-GPU fork: the layer-split members and hooks (qwen35_split.cpp), one captured verify graph
+// per GPU with a split.
 #include "prefill_observer_cuda.hpp"
 // Qwen3.5 dense hybrid decode engine (text path): Gated DeltaNet + gated full attention, BF16 weights.
 #include "dev_alloc.cuh"
@@ -100,7 +100,7 @@ public:
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
-            split_setup();
+            split_setup(slots);
             auto memlog = [](const char * stage) {  // TQLLM_DEBUG=memlog: device memory in use after each load stage, seconds since the first load began
                 static const bool on = tqllm::debug_on("memlog");
                 static const auto t0 = std::chrono::steady_clock::now();
@@ -115,14 +115,9 @@ public:
             memlog("weights");
             nslots = slots;
             allocate();
-            split_alloc_dev0();
             memlog("buffers");
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
-            if (split_at && dfl.present) {  // device 0's layers write their DFlash2 features here first
-                use_dev(0);
-                v_feat = Buf(size_t(NBUF) * dfl.target_ids.size() * cfg.hidden * 2);
-                use_dev(home_dev);
-            }
+            split_alloc_dev0();  // after the drafter: device 0 gets its own copy of the drafter features too
             memlog("drafter");
             calibrate_prefill();
             memlog("calibrate");
@@ -196,16 +191,15 @@ private:
     cudaStream_t side{};                // parallel branch for small independent matvecs (GDN b / a), graph-captured
     cudaEvent_t ev_fork{}, ev_join{};
     // ---- Layer split across two GPUs (multi-GPU fork addition; TQLLM_SPLIT=K) ----
-    // Layers [0, K) run on CUDA device 0 and [K, layers) on device 1, the "home" device: it also holds the head, the
-    // sampling buffers and the DFlash2 drafter, and every public call starts and ends there. The members above and the
-    // scratch buffers of dev_bufs() always hold the current device's objects; use_dev() parks them and brings the other
-    // device's in, after making the new device's stream wait for everything queued on the old one. Each layer's weights,
-    // KV rows and recurrent state live on the layer's device. A verify hands the residual rows, their norm partials and
-    // the DFlash2 features of the first device's layers to the second one (cudaMemcpyPeerAsync; staged through host
-    // memory when the cards have no peer access).
-    int split_at = 0;      // 0: one device
-    int cur_dev = 0;       // the stage whose objects the members hold (0: layers below the split, 1: the rest)
-    int home_dev = 0;      // 1 with a split
+    // Two stages: stage 0 runs layers [0, K) on CUDA device 1; stage 1, the "home" stage, runs [K, layers), the head,
+    // the sampling buffers and the DFlash2 drafter on CUDA device 0, and every public call starts and ends there. The
+    // members above and the scratch buffers of dev_bufs() always hold the current stage's objects; use_dev() parks them
+    // and brings the other stage's in, after making the new stage's stream wait for everything queued on the old one.
+    // Each layer's weights, KV rows and recurrent state live on its stage's device. A verify hands the residual rows,
+    // their norm partials and stage 0's DFlash2 features to stage 1 (cudaMemcpyPeerAsync; staged through host memory
+    // when the cards have no peer access). Without a split use_dev() does nothing.
+    int split_at = 0;  // 0: one device
+    int cur_dev = 0;   // the stage whose objects the members hold
     // CUDA ordinal of each stage. The home stage runs on CUDA device 0: a thread that has never called cudaSetDevice
     // (the server's request threads) is already there when it enters the engine, and use_dev() returns there.
     int cuda_of[2] = {0, 0};
@@ -224,18 +218,10 @@ private:
     int dev_of(uint32_t l) const { return split_at && int(l) >= split_at ? 1 : 0; }
     std::vector<Buf *> dev_bufs();
     void use_dev(int d);
-    void split_setup();           // reads TQLLM_SPLIT, checks what the split supports
-    void split_alloc_dev0();      // device 0's copies of the scratch buffers allocate() made on device 1
-    void split_mirror_control();  // device 1's control buffers (tokens, positions, tree / chain tables) -> device 0
-    // a captured graph, or the body run eagerly with a split (graphs are per device; phase 1 runs split layers eagerly)
-    template <class Body>
-    void launch_cached(int family, uint64_t key, cudaStream_t s, Body && body) {
-        if (split_at) {
-            body();
-            return;
-        }
-        ck(cudaGraphLaunch(cached_graph(family, key, std::forward<Body>(body)), s));
-    }
+    void split_setup(int slots);  // reads TQLLM_SPLIT, refuses what the split does not run yet
+    void split_alloc_dev0();      // stage 0's copies of the scratch buffers allocate() and the drafter made on stage 1
+    void split_mirror_control();  // stage 1's control buffers (tokens, positions, tree / chain tables) -> stage 0
+    Buf & other_stage(Buf & b);  // the other stage's copy of a dev_bufs() member
     cudaStream_t moe_side{};             // --moe-host-mb decode: cold (host) experts overlap the hot ones, graph-captured
     cudaEvent_t moe_fork{}, moe_join{};
     std::vector<cudaStream_t> seg_side;  // batched verify: one branch per extra segment (per-slot GDN / attention)
@@ -761,7 +747,7 @@ public:
             ck(cudaGraphLaunch(cached_graph(kGraphVerify, key | (uint64_t(2) << 58), [&] { verify_body(n, int(bucket), 1); }),
                                stream));
         } else {
-            launch_cached(kGraphVerify, key, stream, [&] { verify_body(n, int(bucket)); });
+            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
         }
         if (next) {
             const auto * src = v_tok.as<uint32_t>() + (copy_all || n > NVER ? 0 : n - 1);
@@ -1308,7 +1294,7 @@ public:
         for (const auto & g : segs) kv_track(g.pos, g.n);
         uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40);
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-        launch_cached(kGraphBatch, key, stream, [&] { verify_body(col, int(context_)); });
+        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         const size_t ncol = static_cast<size_t>(col);
         std::vector<uint32_t> res(ncol, 0u), in(ncol, 0u);
         std::vector<int> tpar(ncol, 0);
@@ -1548,7 +1534,7 @@ private:
                 stream = commit_side;  // cached_graph captures on `stream`
                 const uint64_t key = (uint64_t(1) << 40) | uint64_t(k) | (uint64_t(cur) << 16) | (uint64_t(sp) << 24) |
                                      (uint64_t(active) << 32) | (uint64_t(stash_col0) << 44);
-                launch_cached(kGraphCommit, key, commit_side, [&] { commit_body(k); });
+                ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, [&] { commit_body(k); }), commit_side));
                 stream = main_stream;
                 ck(cudaEventRecord(commit_done, commit_side));
                 commit_inflight = true;
