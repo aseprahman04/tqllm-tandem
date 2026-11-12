@@ -21,8 +21,8 @@ void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t
     sync_ck();
 }
 
-void Qwen35Engine::verify_body(int n, int max_seq) {
-    if (split_at) {  // layer split (fork addition): the embedding and the first layers run on device 0
+void Qwen35Engine::verify_body(int n, int max_seq, int part) {
+    if (split_at && part < 0) {  // layer split (fork addition): the embedding and the first layers run on device 0
         use_dev(0);
         split_mirror_control();
     }
@@ -33,10 +33,12 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
     auto *O = v_o.as<bf16>(), *CORE = v_core.as<bf16>();
     auto * XH = v_xh.as<__half>();
     const auto * dtok = v_tokens.as<uint32_t>();
-    embed_multi(dtok, n, X);
-    if (mm_chunk) tqllm_cuda::mm_scatter(X, mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image tokens
-    tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
-    st("embed");
+    if (part != 1) {  // (the second GPU's part starts from the rows split_hop() brought)
+        embed_multi(dtok, n, X);
+        if (mm_chunk) tqllm_cuda::mm_scatter(X, mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image tokens
+        tqllm_cuda::sumsq(X, v_px.as<float>(), n * H, stream);
+        st("embed");
+    }
     const uint32_t n_attn = uint32_t(key_cache.size());
     if (kv_staged) {  // the first two attention layers' old positions, one per staging buffer, behind earlier work
         ck(cudaEventRecord(kv_fork, stream));
@@ -44,20 +46,17 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         kv_prefetch(0);
         if (n_attn > 1) kv_prefetch(1);
     }
+    // layer split: part 0 runs the layers below the split, part 1 the rest (the layer counters start past part 0's)
+    const uint32_t lo = part == 1 ? uint32_t(split_at) : 0, hi = part == 0 ? uint32_t(split_at) : cfg.layers;
     uint32_t attn_i = 0, lin_i = 0;
-    for (uint32_t l = 0; l < cfg.layers; ++l) {
-        if (split_at && int(l) == split_at) {
-            // layer split: device 0's residual rows, their norm partials and the drafter features of its layers go on
-            // to device 1, whose own scratch takes over from here
-            const void *x0 = X, *px0 = v_px.p, *f0 = v_feat.p;
+    for (uint32_t l = 0; l < lo; ++l) cfg.full[l] ? ++attn_i : ++lin_i;
+    for (uint32_t l = lo; l < hi; ++l) {
+        if (split_at && part < 0 && int(l) == split_at) {
+            // layer split, whole pass: device 0's rows go on to device 1, whose own scratch takes over from here
             use_dev(1);
+            split_hop(n);
             X = v_x.as<bf16>(), M = v_m.as<bf16>(), T = v_in.as<bf16>(), O = v_o.as<bf16>(), CORE = v_core.as<bf16>();
             XH = v_xh.as<__half>();
-            const int to = cuda_of[1], from = cuda_of[0];
-            ck(cudaMemcpyPeerAsync(X, to, x0, from, size_t(n) * H * 2, stream));
-            ck(cudaMemcpyPeerAsync(v_px.p, to, px0, from, size_t(n) * ((H + 255) / 256) * 4, stream));
-            if (dfl.present && f0)
-                ck(cudaMemcpyPeerAsync(v_feat.p, to, f0, from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
         }
         const auto & L = layer[l];
         capture_feature(l, X, v_feat.as<bf16>(), n);
@@ -132,6 +131,7 @@ void Qwen35Engine::verify_body(int n, int max_seq) {
         }
         ffn_block(L, n, X);
     }
+    if (part == 0) return;  // layer split: the head runs in part 1 on the second GPU
     // final hidden states (pre-norm) feed the MTP drafter
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {  // batched verify: one head pass over every slot's columns (per-column results unchanged)

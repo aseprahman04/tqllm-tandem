@@ -750,6 +750,16 @@ public:
             // prefill chunks run eagerly: their sizes and positions vary per prompt, so cached graphs would grow without
             // bound (~12 MB each; a 2-slot server OOMed after ~800 requests), and launch cost is negligible at this size
             verify_body(n, int(bucket));
+        } else if (split_at) {
+            // layer split: one captured graph per GPU, the hand-off between them outside the graphs
+            use_dev(0);
+            split_mirror_control();
+            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key | (uint64_t(1) << 58), [&] { verify_body(n, int(bucket), 0); }),
+                               stream));
+            use_dev(1);
+            split_hop(n);
+            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key | (uint64_t(2) << 58), [&] { verify_body(n, int(bucket), 1); }),
+                               stream));
         } else {
             launch_cached(kGraphVerify, key, stream, [&] { verify_body(n, int(bucket)); });
         }
@@ -862,7 +872,11 @@ public:
     // token embeddings of n device-resident ids -> Y [n][hidden] (BF16)
     void embed_multi(const uint32_t * dtok, int n, bf16 * Y);
 
-    void verify_body(int n, int max_seq);
+    // part (layer split, multi-GPU fork): -1 the whole pass (eager, it hops between the GPUs itself); 0 the first
+    // GPU's share (embedding, layers below the split) and 1 the second's (from the split to the head), each captured
+    // on its own GPU, with split_hop() between them
+    void verify_body(int n, int max_seq, int part = -1);
+    void split_hop(int n);  // device 0's rows, norm partials and drafter features -> device 1 (called on device 1)
 
 
     // Copies the input of target layer l (if it is a DFlash feature layer) into feats [n][n_feat * H].

@@ -6,8 +6,9 @@
 // per card, rows handed on through host memory, no peer access needed); the code is new.
 //
 // What the split runs so far: one slot, dense models, all KV on the GPUs (--kv-host 0), --prompt-cache, DFlash2 or no
-// drafter; split layers run eagerly (no captured graphs). Greedy output equals the one-device run token for token
-// (checked on Qwen3.8-27B TQ_XS); TQ_L, which no 16 GB card holds alone, serves 262,144 tokens on two.
+// drafter. A verify block runs as two captured graphs, one per GPU, with the hand-off between them (split_hop); prefill
+// chunks, commits and tree gathers run eagerly. Greedy output equals the one-device run token for token (checked on
+// Qwen3.8-27B TQ_XS); TQ_L, which no 16 GB card holds alone, serves 524,288 tokens (YaRN x2) on two.
 #include "qwen35_engine.hpp"
 
 #include <cuda.h>
@@ -110,6 +111,21 @@ void Qwen35Engine::split_alloc_dev0() {
     split_mirror_control();
     sync_ck();
     use_dev(home_dev);
+}
+
+// Called on device 1 right after use_dev(1): device 0's residual rows, their norm partials and the drafter features of
+// its layers, for the first n columns, into device 1's buffers.
+void Qwen35Engine::split_hop(int n) {
+    const auto list = dev_bufs();
+    auto dev0 = [&](Buf & b) -> const void * {
+        return dstash[0].bufs[size_t(std::find(list.begin(), list.end(), &b) - list.begin())].p;
+    };
+    const size_t H = cfg.hidden;
+    const int to = cuda_of[1], from = cuda_of[0];
+    ck(cudaMemcpyPeerAsync(v_x.p, to, dev0(v_x), from, size_t(n) * H * 2, stream));
+    ck(cudaMemcpyPeerAsync(v_px.p, to, dev0(v_px), from, size_t(n) * ((H + 255) / 256) * 4, stream));
+    if (dfl.present && v_feat.p && dev0(v_feat))
+        ck(cudaMemcpyPeerAsync(v_feat.p, to, dev0(v_feat), from, size_t(n) * dfl.target_ids.size() * H * 2, stream));
 }
 
 // Called on device 0 right after use_dev(0): device 1 holds the tables as the host last wrote them (tokens, positions,
