@@ -53,7 +53,11 @@ TqCache, prompt reuse and the OpenAI-compatible `tqserve`. Tandem adds the secon
 | llama.cpp (DSpine fork), Unsloth UD-Q6_K + DSpine drafter | 2 | 65,536 | 82–104 | 32 | — |
 | tqLLM, TQ_XS (3-bit) + DFlash2 | 1 | 65,536 | 170–172 | 97 | prefill 1,120 tok/s, decode 88 |
 | **Tandem, TQ_L (4-bit class) + DFlash2** | **2** | **524,288** | **127–140** | **81** | **prefill 826 tok/s, decode 63** |
+| Tandem, Unsloth UD-Q6_K (22 GB, llama.cpp GGUF) + DFlash2 | 2 | 131,072 | 86–96 | 57 | — |
 | Tandem, TQ_XS split (overhead check) | 2 | 8,192 | 196–200 | 80–85 | — |
+
+Prefill (prompt reading, unique prompts, median of three): TQ_L at 131K context 1,099 tok/s for a 9.7K-token prompt
+and 1,044 for 36.7K; UD-Q6_K 957 and 895. Plain llama.cpp GGUFs (K-quants, IQ) split the same way as the TQ formats.
 
 The last row is the price of the split itself: the same model on one card runs at 205 / 81 tok/s, so the hand-off
 between the cards costs almost nothing once each card replays its own captured graph.
