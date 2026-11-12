@@ -56,7 +56,7 @@ void Qwen35Engine::tp_setup(int slots) {
     need(!cfg.tied, "models with an untied LM head only");
     need(cfg.heads % 2 == 0 && cfg.kvheads % 2 == 0 && cfg.lin_kheads % 2 == 0 && cfg.lin_vheads % 2 == 0 && cfg.ffn % 2 == 0,
          "head and FFN counts must split evenly");
-    need(opt.draft_model.empty() && !opt.native_mtp, "no drafter yet (milestone 1: plain decoding)");
+    need(!opt.native_mtp, "no --mtp yet (DFlash2 drafters run)");
     need(opt.kv_host <= 0 && opt.kv_compact <= 0, "all KV on the GPUs, no --kv-compact");
     need(!opt.prompt_cache, "no --prompt-cache yet");
     tp = 2;
@@ -381,6 +381,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             const auto & L = layer[l];
             auto *X = v_x.as<bf16>(), *M = v_m.as<bf16>(), *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *CORE = v_core.as<bf16>();
             auto * XH = v_xh.as<__half>();
+            if (r == 1) capture_feature(l, X, v_feat.as<bf16>(), n);  // the drafter (home) reads the replicated stream
             nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
             if (cfg.full[l]) {
                 attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);

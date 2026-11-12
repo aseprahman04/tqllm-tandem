@@ -374,7 +374,7 @@ void Qwen35Engine::alloc_seq_state() {
 }
 
 void Qwen35Engine::allocate() {
-    const size_t H = cfg.hidden, F = cfg.ffn, hd = cfg.head_dim;
+    const size_t H = cfg.hidden, F = size_t(cfg.ffn) * (tp ? 2 : 1), hd = cfg.head_dim;  // fork: whole FFN width (drafter)
     const size_t lk = size_t(cfg.lin_kheads) * cfg.lin_dk, lv = size_t(cfg.lin_vheads) * cfg.lin_dv;
     const size_t widest = std::max({H, F, lv, size_t(cfg.heads) * hd, 2 * H, 8 * H});  // 8H: DFlash fc input
     {
@@ -540,7 +540,7 @@ void Qwen35Engine::allocate() {
             int dev = 0, major = 0;
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-            defer = major >= 10;
+            defer = major >= 10 && !tp;  // tensor parallel (fork addition): commits replay on both GPUs instead
         }
     }
     v_pos = Buf(2 * size_t(nslots) * sizeof(int));
@@ -828,7 +828,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     for (double v : f.kv.at(A + "target_layers").arr) dfl.target_ids.push_back(int(v));
     const int nl = int(f.num(A + "block_count"));
     if (dfl.dspark ? dfl.hd != 256 || dfl.rank != 256 || dfl.heads / dfl.kvheads > 8
-                   : dfl.hd != 128 || dfl.topk != 16 || (!dfl.dspine && int(f.num(A + "conv_kernel_size")) != 2) || F != int(cfg.ffn))
+                   : dfl.hd != 128 || dfl.topk != 16 || (!dfl.dspine && int(f.num(A + "conv_kernel_size")) != 2) || F != int(cfg.ffn) * (tp ? 2 : 1))  // fork: cfg.ffn is per GPU under TP
         throw std::runtime_error(dfl.dspark ? "unsupported DSpark drafter shape" : "unsupported DFlash2 drafter shape");
     const int nf = int(dfl.target_ids.size()), qd = dfl.heads * dfl.hd, kd = dfl.kvheads * dfl.hd;
     dfl.fc = to_tq3(f, {"fc.weight"}, nf * H);

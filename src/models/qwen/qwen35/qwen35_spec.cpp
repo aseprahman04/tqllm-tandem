@@ -624,7 +624,7 @@ bool Qwen35Engine::dflash_advance() {
         if (!contiguous) {  // accepted path -> columns 0 .. j: GDN stashes, drafter features, attention K/V
             const int nf = int(dfl.target_ids.size()), H = int(cfg.hidden);
             // layer split (fork addition): one gather per device over the layers it holds; the features on device 1
-            for (int d = split_at ? 0 : 1; d <= 1; ++d) {
+            for (int d = split_at || tp ? 0 : 1; d <= 1; ++d) {  // tensor parallel: every layer on both GPUs
                 use_dev(d);
                 std::vector<tqllm_cuda::PathGather> g;
                 uint32_t lin_i = 0, attn_i = 0;
@@ -666,7 +666,7 @@ bool Qwen35Engine::dflash_advance() {
                 if (k < last_n) commit_body(k);
                 dflash_inject_body(v_feat.as<bf16>(), k);
             };
-            if (split_at) body();  // layer split: the commit visits both GPUs, so it cannot be one graph
+            if (split_at || tp) body();  // layer split / tensor parallel: the commit visits both GPUs, so it cannot be one graph
             else ck(cudaGraphLaunch(cached_graph(kGraphCommit, key, body), stream));
             cur = (cur + 1) % NSLOT;
             last_n = 0;
@@ -981,11 +981,12 @@ int Qwen35Engine::drafter_features(const std::vector<uint32_t> & tokens, std::ve
 }
 
 void Qwen35Engine::commit_body(int k) {  // replay the first k verified tokens into the next state slot
-    if (split_at) {  // layer split (fork addition): each layer replays on its device; the chain table goes along
+    if (split_at || tp) {  // layer split / tensor parallel (fork addition): replays on both devices; the chain table goes along
         use_dev(0);
         split_mirror_control();
     }
-    {
+    for (int d = tp ? 0 : 1; d <= 1; ++d) {  // tensor parallel: each GPU replays every layer (its half of the heads)
+        if (tp) use_dev(d, false);
         const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
         const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
         uint32_t lin_i = 0;

@@ -1046,7 +1046,7 @@ public:
                 if (!dfl.dspine) mmx(L.conv_ffn, A, DYNF, DB);
                 conv(A, DYNF, L.ffn_conv_base, 0, X);
                 mmx(L.w_gu, X, T, DB);
-                tqllm_cuda::swiglu_multi(T, DB, int(cfg.ffn), ACT, stream);
+                tqllm_cuda::swiglu_multi(T, DB, dfl.ffn, ACT, stream);  // fork: the drafter's own width (cfg.ffn is per GPU under TP)
                 mmx(L.down, ACT, A, DB);
                 conv(A, DYNF, L.ffn_conv_base, 1, X);
                 tqllm_cuda::residual(X, Bb, DB * H, stream);
@@ -1201,7 +1201,7 @@ public:
             if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
             else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 0, X, B, H, dfl.group, stream);
             mmx(L.w_gu, X, T, B);
-            tqllm_cuda::swiglu_multi(T, B, int(cfg.ffn), ACT, stream);
+            tqllm_cuda::swiglu_multi(T, B, dfl.ffn, ACT, stream);  // fork: the drafter's own width
             mmx(L.down, ACT, A, B);
             if (dfl.dspine) ck(cudaMemcpyAsync(X, A, size_t(B) * H * 2, cudaMemcpyDeviceToDevice, stream));
             else tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 1, X, B, H, dfl.group, stream);
