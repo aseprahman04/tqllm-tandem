@@ -41,6 +41,32 @@ void Qwen35Engine::split_setup(int slots) {
                  k, cfg.layers - 1);
 }
 
+void Qwen35Engine::tp_setup(int slots) {
+    const char * e = std::getenv("TQLLM_TP");
+    if (!e || std::atoi(e) != 1) return;
+    int n = 0;
+    ck(cudaGetDeviceCount(&n));
+    auto need = [](bool ok, const std::string & what) {
+        if (!ok) throw std::runtime_error("TQLLM_TP: " + what);
+    };
+    need(!split_at, "TQLLM_SPLIT and TQLLM_TP are two ways to use two GPUs; set one");
+    need(n >= 2, "needs two CUDA devices; this process sees " + std::to_string(n));
+    need(slots == 1, "one slot so far: pass --np 1");
+    need(!cfg.moe, "dense models only so far");
+    need(!cfg.tied, "models with an untied LM head only");
+    need(cfg.heads % 2 == 0 && cfg.kvheads % 2 == 0 && cfg.lin_kheads % 2 == 0 && cfg.lin_vheads % 2 == 0 && cfg.ffn % 2 == 0,
+         "head and FFN counts must split evenly");
+    need(opt.draft_model.empty() && !opt.native_mtp, "no drafter yet (milestone 1: plain decoding)");
+    need(opt.kv_host <= 0 && opt.kv_compact <= 0, "all KV on the GPUs, no --kv-compact");
+    need(!opt.prompt_cache, "no --prompt-cache yet");
+    tp = 2;
+    cuda_of[0] = 1;  // rank 0 on CUDA device 1
+    cuda_of[1] = 0;  // rank 1 (home: head, sampling) on CUDA device 0, where the constructor already is
+    cur_dev = 1;
+    std::fprintf(stderr, "tqllm: tensor parallel over two GPUs (each: %u of %u attention heads, %u of %u FFN rows)\n",
+                 cfg.heads / 2, cfg.heads, cfg.ffn / 2, cfg.ffn);
+}
+
 // Every scratch buffer the layers, the head or the drafter's inputs use: one copy per device.
 std::vector<Buf *> Qwen35Engine::dev_bufs() {
     return {&x,      &norm,   &resid,  &mix,    &gate,      &up,     &act,      &logits_buf, &token,   &part,
@@ -57,7 +83,7 @@ std::vector<Buf *> Qwen35Engine::dev_bufs() {
 }
 
 void Qwen35Engine::use_dev(int d, bool wait) {
-    if (!split_at || d == cur_dev) return;
+    if ((!split_at && !tp) || d == cur_dev) return;
     // everything queued on the old device runs before what the new one queues from here on
     if (!hop_ev) ck(cudaEventCreateWithFlags(&hop_ev, cudaEventDisableTiming));
     if (wait) ck(cudaEventRecord(hop_ev, stream));
@@ -79,6 +105,17 @@ void Qwen35Engine::use_dev(int d, bool wait) {
     }
     from.i8 = std::move(i8);
     i8 = std::move(to.i8);
+    if (tp) {  // tensor parallel: the weights, KV and recurrent state are each GPU's own shard
+        std::swap(layer, from.layer), std::swap(layer, to.layer);
+        std::swap(kv_mem, from.kv_mem), std::swap(kv_mem, to.kv_mem);
+        std::swap(kv_pool, from.kv_pool), std::swap(kv_pool, to.kv_pool);
+        std::swap(kv_seq, from.kv_seq), std::swap(kv_seq, to.kv_seq);
+        std::swap(key_cache, from.key_cache), std::swap(key_cache, to.key_cache);
+        std::swap(value_cache, from.value_cache), std::swap(value_cache, to.value_cache);
+        std::swap(conv_state, from.conv_state), std::swap(conv_state, to.conv_state);
+        std::swap(rec_state, from.rec_state), std::swap(rec_state, to.rec_state);
+        for (int s = 0; s < 2; ++s) std::swap(v_stash2[s], from.stash[s]), std::swap(v_stash2[s], to.stash[s]);
+    }
     stream = to.stream, side = to.side, ev_fork = to.ev_fork, ev_join = to.ev_join, hop_ev = to.hop, blas = to.blas;
     to.stream = to.side = nullptr, to.ev_fork = to.ev_join = to.hop = nullptr, to.blas = nullptr;  // the members own them now
     ck(cudaSetDevice(cuda_of[d]));
@@ -97,7 +134,7 @@ void Qwen35Engine::use_dev(int d, bool wait) {
 // Stage 0's scratch: the same buffers allocate() and the drafter made on stage 1, of the same sizes, and the constant
 // tables copied.
 void Qwen35Engine::split_alloc_dev0() {
-    if (!split_at) return;
+    if (!split_at && !tp) return;
     std::vector<size_t> bytes;
     for (Buf * b : dev_bufs()) {
         size_t sz = 0;
@@ -119,6 +156,28 @@ void Qwen35Engine::split_alloc_dev0() {
     if (dstash[1].i8) {  // --prefill-int8 on: stage 0's own int8 GEMM (cuBLASLt handle, weight and token buffers)
         i8 = std::make_unique<tqllm_cuda::Int8Gemm>();
         i8->init(i8_init[0], i8_init[1], int(i8_init[2]), int(i8_init[3]));
+    }
+    if (tp) {  // rank 0's own verify stash (home's sizes), KV pool and views, recurrent state, all-reduce buffers
+        for (int s = 0; s < 2; ++s)
+            for (const Buf & b : dstash[1].stash[s]) {
+                CUdeviceptr base = 0;
+                size_t sz = 0;
+                if (b.p && cuMemGetAddressRange(&base, &sz, CUdeviceptr(b.p)) != CUDA_SUCCESS)
+                    throw std::runtime_error("tp: cannot read a stash buffer's size");
+                v_stash2[s].emplace_back(sz);
+            }
+        alloc_seq_state();  // ends on device 1
+        use_dev(0);
+        const size_t xb = size_t(NBUF) * cfg.hidden * sizeof(bf16);
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r);
+            for (int s = 0; s < 2; ++s) {
+                ck(cudaHostAlloc(reinterpret_cast<void **>(&tp_host[r][s]), xb, cudaHostAllocMapped | cudaHostAllocPortable));
+                ck(cudaEventCreateWithFlags(&tp_made[r][s], cudaEventDisableTiming));
+                ck(cudaEventCreateWithFlags(&tp_used[r][s], cudaEventDisableTiming));
+            }
+        }
+        use_dev(0);
     }
     // the verify tables start as allocate() wrote them; d_pend starts at 0
     split_mirror_control();
@@ -245,6 +304,10 @@ Mat Qwen35Engine::g_cat_cut(const GgufFile & f, const std::vector<CutPart> & par
         type = t.type;
     }
     const Ranges all_cols{{0, cols}};
+    static const std::set<uint32_t> ok = {GGML_Q8_0, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_IQ3_XXS, GGML_IQ3_S,
+                                          GGML_IQ4_XS, GGML_IQ4_NL, GGML_Q2_K, GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ1_S};
+    if (mixed && !std::all_of(parts.begin(), parts.end(), [&](const CutPart & p) { return ok.count(gt(f, p.name).type) > 0; }))
+        return {};  // not combinable: the caller loads the parts some other way (as g_cat)
     if (mixed) {  // per-part formats as one composite matrix (the same rule as g_cat)
         std::vector<Mat> ms;
         for (const auto & p : parts) ms.push_back(g_mat_cut(f, p.name, p.rows, cols, p.rr, all_cols));
@@ -271,6 +334,151 @@ Mat Qwen35Engine::g_cat_cut(const GgufFile & f, const std::vector<CutPart> & par
     }
     if (const auto * wf = weight_format(type)) return adopt(wf->load(host, rows, cols, uploader(), stream));
     return {};
+}
+
+// All-reduce of v_m or v_x ([n][hidden] bf16) across the two GPUs through mapped host memory: each GPU stores its
+// partial (zero-copy), then adds the other's. Two buffers per GPU alternate; a GPU overwrites one only after the other
+// GPU has read what it held two all-reduces ago (tp_used). ~45 us for an 8-column block on 2x RTX 5060 Ti.
+void Qwen35Engine::tp_allreduce(bool m_buf, int n) {
+    const size_t cnt = size_t(n) * cfg.hidden;
+    const int s = int(tp_k & 1u);
+    for (int r = 0; r < 2; ++r) {
+        use_dev(r, false);
+        ck(cudaStreamWaitEvent(stream, tp_used[1 - r][s], 0));
+        tqllm_cuda::tp_store((m_buf ? v_m : v_x).as<bf16>(), tp_host[r][s], cnt, stream);
+        ck(cudaEventRecord(tp_made[r][s], stream));
+    }
+    for (int r = 0; r < 2; ++r) {
+        use_dev(r, false);
+        ck(cudaStreamWaitEvent(stream, tp_made[1 - r][s], 0));
+        tqllm_cuda::tp_add((m_buf ? v_m : v_x).as<bf16>(), tp_host[1 - r][s], cnt, stream);
+        ck(cudaEventRecord(tp_used[r][s], stream));
+    }
+    ++tp_k;
+}
+
+// verify_body under tensor parallelism (one slot, no drafter features, no images, no KV staging): both GPUs run every
+// layer on their half of the heads / FFN rows; the host interleaves them segment by segment, the residual stream is
+// the same on both after each all-reduce. The head runs on the home GPU.
+void Qwen35Engine::verify_body_tp(int n, int max_seq) {
+    const int H = int(cfg.hidden), lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads);
+    const int dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
+    const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    use_dev(0);  // waits for the home GPU's token / position uploads
+    split_mirror_control();
+    for (int r = 0; r < 2; ++r) {
+        use_dev(r, false);
+        embed_multi(v_tokens.as<uint32_t>(), n, v_x.as<bf16>());
+        tqllm_cuda::sumsq(v_x.as<bf16>(), v_px.as<float>(), n * H, stream);
+    }
+    uint32_t attn_i = 0, lin_i = 0;
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            const auto & L = layer[l];
+            auto *X = v_x.as<bf16>(), *M = v_m.as<bf16>(), *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *CORE = v_core.as<bf16>();
+            auto * XH = v_xh.as<__half>();
+            nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
+            if (cfg.full[l]) {
+                attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);
+            } else {
+                const int rows = mix_rows(L);
+                bf16 * TL = n <= NVER ? v_stash2[sp][lin_i].as<bf16>() : T;
+                mix_mm(L, TL, n);
+                bf16 * QKVC = v_qkvc.as<bf16>();
+                tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC,
+                                       qkv_dim, stream, vpar);
+                const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
+                tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
+                                      rec_slot(lin_i, cur + 1), CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar);
+                if (basis_ == Basis::Tq3Rot32) {
+                    tqllm_cuda::gated_rms_rot_h(CORE, TL + qkv_dim, rows, n, L.gnorm_w, XH, lvh, dv, cfg.eps, stream);
+                } else {
+                    tqllm_cuda::gated_rms_multi(CORE, TL + qkv_dim, rows, n, L.gnorm_w, O, lvh, dv, cfg.eps, stream);
+                    rot_h(O, XH, zdim, n);
+                }
+                mm_h(L.w_out, M, n);
+            }
+        }
+        cfg.full[l] ? ++attn_i : ++lin_i;
+        tp_allreduce(true, n);  // the mixer's partial (o / GDN out projection)
+        tp_hold = true;
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            ffn_block(layer[l], n, v_x.as<bf16>());  // residual + norm + gate / up + down (partial into v_x)
+        }
+        tp_hold = false;
+        tp_allreduce(false, n);  // the FFN's partial (down projection)
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
+        }
+    }
+    use_dev(1, false);
+    auto * X = v_x.as<bf16>();
+    ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
+    if (!segs.empty()) {
+        head_argmax(out_norm, n, 0);
+    } else if (n > NVER) {
+        if (prefill_final) {
+            ck(cudaMemcpyAsync(X, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+            head_argmax(out_norm, 1);
+        }
+    } else {
+        head_argmax(out_norm, n);
+    }
+}
+
+// Rank r's shard of one dense qwen35 layer (the slice map of docs/design/tensor-parallel.md), with cfg still whole.
+void Qwen35Engine::load_layer_tp(const GgufFile & f, Layer & L, uint32_t l, int r) {
+    const int H = int(cfg.hidden), F = int(cfg.ffn), hd = int(cfg.head_dim), nh = int(cfg.heads), nkv = int(cfg.kvheads);
+    const int kh = int(cfg.lin_kheads), vh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
+    const int lk = kh * dk, lv = vh * dv, qkvd = 2 * lk + lv;
+    const std::string p = "blk." + std::to_string(l) + ".";
+    const Ranges all_h{{0, H}};
+    auto half = [&](int count, int unit) { return Ranges{{r * (count / 2) * unit, (r + 1) * (count / 2) * unit}}; };
+    auto scaled = [](const Ranges & rr, int unit, int base) {
+        Ranges o;
+        for (const auto & [a, b] : rr) o.push_back({base + a * unit, base + b * unit});
+        return o;
+    };
+    // FFN: column-parallel gate / up (rows), row-parallel down (columns)
+    const Ranges fr = half(F, 1);
+    L.w_gu = g_cat_cut(f, {{p + "ffn_gate.weight", F, fr}, {p + "ffn_up.weight", F, fr}}, H);
+    if (!L.w_gu.p) throw std::runtime_error("TQLLM_TP: " + p + "ffn_gate / ffn_up cannot be fused");
+    L.w_down = g_mat_cut(f, p + "ffn_down.weight", H, F, all_h, fr);
+    if (cfg.full[l]) {
+        // attention: q (with its gate rows, [q | gate] per head), k, v by heads; o by its input columns
+        const int qrows = (cfg.gated_attention ? 2 : 1) * hd;
+        L.w_mix = g_cat_cut(f, {{p + "attn_q.weight", nh * qrows, half(nh, qrows)}, {p + "attn_k.weight", nkv * hd, half(nkv, hd)},
+                                {p + "attn_v.weight", nkv * hd, half(nkv, hd)}}, H);
+        if (!L.w_mix.p) throw std::runtime_error("TQLLM_TP: " + p + "attention q / k / v cannot be fused");
+        L.wo = g_mat_cut(f, p + "attn_output.weight", H, nh * hd, all_h, half(nh, hd));
+        L.q_norm = g_f32(f, p + "attn_q_norm.weight", hd);
+        L.k_norm = g_f32(f, p + "attn_k_norm.weight", hd);
+        return;
+    }
+    // Gated DeltaNet. GGUF keeps the value heads tiled (value head h reads key head h % kh), so rank r keeps key heads
+    // [r * kh / 2, (r + 1) * kh / 2) and, of every group of kh value heads, the same kh / 2: local value head
+    // g * kh / 2 + i is global g * kh + r * kh / 2 + i, and h % (kh / 2) still names its local key head.
+    const int kh2 = kh / 2;
+    Ranges vrun;  // value heads, in heads
+    for (int g = 0; g < vh / kh; ++g) vrun.push_back({g * kh + r * kh2, g * kh + r * kh2 + kh2});
+    Ranges qkv_rows{{r * kh2 * dk, (r + 1) * kh2 * dk}, {lk + r * kh2 * dk, lk + (r + 1) * kh2 * dk}};
+    for (const auto & x : scaled(vrun, dv, 2 * lk)) qkv_rows.push_back(x);
+    const Ranges z_rows = scaled(vrun, dv, 0);
+    L.w_mix = g_cat_cut(f, {{p + "attn_qkv.weight", qkvd, qkv_rows}, {p + "attn_gate.weight", lv, z_rows},
+                            {p + "ssm_beta.weight", vh, vrun}, {p + "ssm_alpha.weight", vh, vrun}}, H);
+    if (!L.w_mix.p) {  // beta / alpha in a dense type beside quantised qkv / gate: two matrices (as the one-GPU load)
+        L.w_mix = g_cat_cut(f, {{p + "attn_qkv.weight", qkvd, qkv_rows}, {p + "attn_gate.weight", lv, z_rows}}, H);
+        L.w_ba = g_cat_cut(f, {{p + "ssm_beta.weight", vh, vrun}, {p + "ssm_alpha.weight", vh, vrun}}, H);
+        if (!L.w_mix.p || L.w_ba.type != GGML_BF16) throw std::runtime_error("TQLLM_TP: " + p + "unexpected Gated DeltaNet types");
+    }
+    L.w_out = g_mat_cut(f, p + "ssm_out.weight", H, lv, all_h, z_rows);
+    L.conv_w = g_f32_cut(f, p + "ssm_conv1d.weight", qkvd, int(cfg.conv_k), qkv_rows);
+    L.neg_a = g_f32_cut(f, p + "ssm_a", vh, 1, vrun);
+    L.dt_bias = g_f32_cut(f, p + "ssm_dt.bias", vh, 1, vrun);
+    L.gnorm_w = g_f32(f, p + "ssm_norm.weight", cfg.lin_dv);
 }
 
 const float * Qwen35Engine::g_f32_cut(const GgufFile & f, const std::string & name, int rows, int row_len, const Ranges & rr) {

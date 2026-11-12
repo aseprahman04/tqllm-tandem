@@ -464,6 +464,14 @@ void Qwen35Engine::reset_state() {
     const size_t conv_bytes = this->conv_bytes(), rec_bytes = this->rec_bytes();
     cur = 0;
     if (pend_k) set_pending(0);
+    if (tp) {  // tensor parallel (fork addition): rank 0's state first; the loop below clears home's
+        use_dev(0);
+        for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
+            ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
+            ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
+        }
+        use_dev(1);
+    }
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
         if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): the state lives on its layer's device
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
@@ -1022,6 +1030,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
         gemm_rows(L.w_gu, nullptr, n, L.w_gu.rows);  // FP16 gate / up straight into the fused SwiGLU + rotation
         tqllm_cuda::tq4_swiglu_rot_from_h(gemm_c.as<__half>(), n, F, XH, stream);
         mm_h(L.w_down, X, n);
+        if (tp_hold) return;  // tensor parallel: the caller all-reduces X, then adds the residual
         tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
         return;
     }
@@ -1039,6 +1048,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
     st("ffn_swiglu_rot");
     mm_h(L.w_down, X, n);
     st("ffn_down_matvec");
+    if (tp_hold) return;  // tensor parallel: the caller all-reduces X, then adds the residual
     tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
     st("ffn_resid_out");
 }

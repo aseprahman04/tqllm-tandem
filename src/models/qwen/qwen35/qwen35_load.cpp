@@ -189,7 +189,23 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     }
     layer.resize(cfg.layers);
     const auto cold_of = cfg.moe ? moe_placement(f) : std::vector<std::vector<char>>();
-    for (uint32_t l = 0; l < cfg.layers; ++l) {
+    if (tp) {  // tensor parallel (fork addition): every layer on both GPUs, rank r's shard on device r
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r);
+            layer.resize(cfg.layers);
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                const auto p = "blk." + std::to_string(l) + ".";
+                auto & L = layer[l];
+                L = {};
+                L.in_norm = g_f32(f, p + "attn_norm.weight", H);
+                L.post_norm = g_f32(f, p + (cfg.gated_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), H);
+                load_layer_tp(f, L, l, r);
+            }
+        }
+        // per-GPU shapes from here on (both GPUs are alike); hidden, head_dim, lin_dk / lin_dv and vocab stay whole
+        cfg.heads /= 2, cfg.kvheads /= 2, cfg.ffn /= 2, cfg.lin_kheads /= 2, cfg.lin_vheads /= 2;
+    }
+    for (uint32_t l = 0; l < cfg.layers && !tp; ++l) {
         use_dev(dev_of(l));  // layer split: each layer's weights on its own device
         const auto p = "blk." + std::to_string(l) + ".";
         auto & L = layer[l];
@@ -577,7 +593,7 @@ void Qwen35Engine::allocate() {
     std::vector<char>().swap(mtp_draft_q6k_host);
     // layer split (fork addition): the table goes to mapped host memory (portable) as well, so that both GPUs read it:
     // device 1's first layer and device 0's drafter look tokens up (one row per token)
-    if (fmt_target && !cfg.tied && (opt.embed_host || split_at)) {
+    if (fmt_target && !cfg.tied && (opt.embed_host || split_at || tp)) {
         size_t bytes = 0;  // raw GGUF rows: one token's row is read per lookup
         const size_t n = size_t(embed.rows) * embed.cols;
         if (embed.type == GGML_Q4_K) bytes = n / 256 * 144;
@@ -630,7 +646,7 @@ void Qwen35Engine::allocate() {
             // opt-in (--prefill-fp8 on, sm_89+): faster prefill but KLD ~0.01 vs FP16 prefill, so off by default
             // (not with a layer split: the FP8 / int8 GEMM objects hold one device's buffers)
             if ((opt.prefill_fp8 == 1 || (opt.prefill_fp8 < 0 && !opt.exact && tqllm_cuda::Fp8Gemm::default_on())) && !gemm_w_rows &&
-                !split_at) {
+                !split_at && !tp) {
                 if (tqllm_cuda::Fp8Gemm::supported()) {
                     size_t mk = 0;
                     for (const auto & L : layer)

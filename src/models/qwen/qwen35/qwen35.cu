@@ -824,6 +824,27 @@ void set_rope_scaling(const float * mul, int pairs, float mscale) {
     cudaMemcpyToSymbol(c_rope_mscale, &mscale, sizeof(float));
 }
 
+// ---- tensor parallel all-reduce through mapped host memory (fork addition) ----
+__global__ void tp_store_k(const uint4 * src, uint4 * dst, size_t n16) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n16; i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
+}
+__global__ void tp_add_k(__nv_bfloat162 * x, const __nv_bfloat162 * other, size_t n2) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n2; i += size_t(gridDim.x) * blockDim.x) {
+        const float2 a = __bfloat1622float2(x[i]), b = __bfloat1622float2(other[i]);
+        x[i] = __floats2bfloat162_rn(a.x + b.x, a.y + b.y);
+    }
+}
+void tp_store(const __nv_bfloat16 * src, __nv_bfloat16 * host_dst, size_t n, cudaStream_t s) {
+    const size_t n16 = n / 8;
+    const unsigned blocks = unsigned(std::min<size_t>((n16 + 255) / 256, 512));
+    tp_store_k<<<blocks, 256, 0, s>>>(reinterpret_cast<const uint4 *>(src), reinterpret_cast<uint4 *>(host_dst), n16);
+}
+void tp_add(__nv_bfloat16 * x, const __nv_bfloat16 * host_other, size_t n, cudaStream_t s) {
+    const size_t n2 = n / 2;
+    const unsigned blocks = unsigned(std::min<size_t>((n2 + 255) / 256, 512));
+    tp_add_k<<<blocks, 256, 0, s>>>(reinterpret_cast<__nv_bfloat162 *>(x), reinterpret_cast<const __nv_bfloat162 *>(host_other), n2);
+}
+
 void rope_partial(__nv_bfloat16 * x, int heads, int dim, int rot, int pos, float theta, cudaStream_t s) {
     const int n = heads * rot / 2;
     rope_partial_k<<<(n + 127) / 128, 128, 0, s>>>(x, heads, dim, rot, pos, theta);

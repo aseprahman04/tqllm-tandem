@@ -101,6 +101,7 @@ public:
             cb(cublasSetStream(blas, stream));
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
             split_setup(slots);
+            tp_setup(slots);
             auto memlog = [](const char * stage) {  // TQLLM_DEBUG=memlog: device memory in use after each load stage, seconds since the first load began
                 static const bool on = tqllm::debug_on("memlog");
                 static const auto t0 = std::chrono::steady_clock::now();
@@ -210,14 +211,32 @@ private:
         cublasHandle_t blas{};
         std::vector<Buf> bufs;  // dev_bufs() order
         std::unique_ptr<tqllm_cuda::Int8Gemm> i8;  // --prefill-int8 on: each GPU's own cuBLASLt handle and buffers
+        // tensor parallel only: each GPU's weight shards, KV (half the KV heads) and recurrent state (half the GDN heads)
+        std::vector<Layer> layer;
+        std::unique_ptr<KvMemory> kv_mem;
+        std::unique_ptr<KvPool> kv_pool;
+        std::unique_ptr<KvStore> kv_seq;
+        std::vector<KvRef> key_cache, value_cache;
+        std::vector<Buf> conv_state, rec_state, stash[2];
     };
     DevStash dstash[2];
     size_t i8_init[4] = {};  // the Int8Gemm::init arguments, for the other GPU's copy
+    // Tensor parallel (TQLLM_TP=1, fork addition; docs/design/tensor-parallel.md): every layer on both GPUs, each GPU
+    // half its heads / FFN rows; two all-reduces per layer through mapped host memory. 2 under TP, else 0.
+    int tp = 0;
+    void tp_setup(int slots);
+    void load_layer_tp(const GgufFile & f, Layer & L, uint32_t l, int rank);
+    void verify_body_tp(int n, int max_seq);
+    void tp_allreduce(bool m_buf, int n);  // v_m (true) or v_x [n][hidden]: a partial on each GPU -> the sum on both
+    bool tp_hold = false;                // ffn_block stops before its closing residual add (the caller reduces first)
+    __nv_bfloat16 * tp_host[2][2] = {};  // [rank][parity] mapped host buffers, NBUF x hidden
+    cudaEvent_t tp_made[2][2] = {}, tp_used[2][2] = {};
+    unsigned tp_k = 0;
     std::unique_ptr<KvMemory> kv_mem0;  // device 0's KV memory / pool / store (attention layers below the split)
     std::unique_ptr<KvPool> kv_pool0;
     std::unique_ptr<KvStore> kv_seq0;
     std::vector<int> lin_dev;  // device of each Gated DeltaNet layer (by linear-layer index)
-    int dev_of(uint32_t l) const { return split_at && int(l) >= split_at ? 1 : 0; }
+    int dev_of(uint32_t l) const { return tp ? cur_dev : split_at && int(l) >= split_at ? 1 : 0; }
     std::vector<Buf *> dev_bufs();
     void use_dev(int d, bool wait = true);  // wait: the new device's work follows everything queued so far
     // Prefill chunk across the split, pipelined: stage 0 takes its tokens and positions straight from the caller's
@@ -744,7 +763,9 @@ public:
         const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > NVER && prefill_final) << 63) |
                              (uint64_t(sampling()) << 62) | (uint64_t(active) << 54) | (uint64_t(tree_step) << 53) |
                              (uint64_t(sp) << 52);
-        if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
+        if (tp) {  // tensor parallel (fork addition): eager, both GPUs interleaved
+            verify_body_tp(n, int(bucket));
+        } else if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
             ck(cudaStreamSynchronize(stream));
             stage_on = true;
             stage_t = std::chrono::steady_clock::now();

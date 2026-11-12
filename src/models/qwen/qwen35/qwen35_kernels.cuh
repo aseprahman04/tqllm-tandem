@@ -80,6 +80,10 @@ void rms_f(const __nv_bfloat16 * x, int x_stride, const float * w, __nv_bfloat16
 // RoPE on the first `rot` dims of each head (rotate-half within those dims), cos/sin rounded to BF16 as in HF.
 // RoPE scaling for every qwen35 rotation: frequency factor per rotary pair (pairs <= 256; null: 1) and cos / sin scale
 void set_rope_scaling(const float * mul, int pairs, float mscale);
+// Tensor parallel (fork addition): copy n bf16 values (n % 8 == 0) into mapped host memory; x[i] += other[i] (FP32 sum,
+// one bf16 rounding: the same bits whichever GPU adds, since the sum of two floats does not depend on their order).
+void tp_store(const __nv_bfloat16 * src, __nv_bfloat16 * host_dst, size_t n, cudaStream_t s);
+void tp_add(__nv_bfloat16 * x, const __nv_bfloat16 * host_other, size_t n, cudaStream_t s);
 // KV host tail staging: copies *nbytes (device, multiple of 16; read at run time so captured graphs stay valid)
 // off (device, bytes, multiple of 16; null = 0): bytes below it are not copied (a TqCache-compacted prefix)
 void kv_stage_copy(const void * src, void * dst, const int64_t * nbytes, int blocks, cudaStream_t, const int64_t * off = nullptr);

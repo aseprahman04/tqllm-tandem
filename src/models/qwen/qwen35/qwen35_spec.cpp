@@ -445,7 +445,11 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     for (const auto & g : segs) kv_track(g.pos, g.n);
     uint64_t key = batch_graph_seed(batch_topk, unsigned(sp));  // stash buffer baked in
     for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-    if (split_at) {  // layer split (fork addition): one captured graph per GPU, the hand-off between them outside
+    if (tp) {  // tensor parallel (fork addition): eager, both GPUs interleaved (one slot: the plain chain tables)
+        vpar = chain2 ? d_chain.as<int>() : nullptr;
+        vdep = vpar ? d_cdep.as<int>() : nullptr;
+        verify_body_tp(col, int(context_));
+    } else if (split_at) {  // layer split (fork addition): one captured graph per GPU, the hand-off between them outside
         use_dev(0);
         split_mirror_control();
         ck(cudaGraphLaunch(cached_graph(kGraphBatch, key ^ 1, [&] { verify_body(col, int(context_), 0); }), stream));
