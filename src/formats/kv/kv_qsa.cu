@@ -1,6 +1,8 @@
 // QSA selected attention (Flash-Next's sparse attention over the indexer's chosen positions) on BF16 K/V rows: the
 // decode / verify kernels (direct, split + merge) and the prefill kernels (grouped scalar, tensor-core). Moved from the
 // model folder so the KV formats own sparse attention (AGENTS.md rule 4); the arithmetic is unchanged.
+// Modified in the multi-GPU fork: the shared-memory attributes are set per device (PerDeviceOnce).
+#include "per_device_once.cuh"
 #include <string>
 #include <cstdlib>
 #include <stdexcept>
@@ -719,10 +721,10 @@ static int g_qsa_tc = 3;  // 3: 8 warps with the gathers overlapped (bit-identic
 void qsa_set_tc(int on) { g_qsa_tc = on; }
 static int qsa_tc_mode() { return g_qsa_tc; }
 static void qsa_tc_attr() {
-    static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(qsa_prefill_tc_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
-                 cudaFuncSetAttribute(qsa_prefill_tc_k<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
-                 cudaFuncSetAttribute(qsa_prefill_tc_pipe_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_pipe_bytes())); attr = true; }
+    static tqllm_cuda::PerDeviceOnce attr;  // multi-GPU fork: the limits are per device
+    attr([] { cudaFuncSetAttribute(qsa_prefill_tc_k<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
+              cudaFuncSetAttribute(qsa_prefill_tc_k<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_bytes()));
+              cudaFuncSetAttribute(qsa_prefill_tc_pipe_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(qsatc::smem_pipe_bytes())); });
 }
 bool qsa_attention_dense_tc(const float * query, const __nv_bfloat16 * keys, const __nv_bfloat16 * values, float * output,
                             int tokens, int first_cells, int heads, int kv_heads, int dim, cudaStream_t stream) {

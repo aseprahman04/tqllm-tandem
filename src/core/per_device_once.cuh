@@ -24,4 +24,18 @@ struct PerDeviceOnce {
     }
 };
 
+// The "raise the limit when a launch needs more than before" guard, per device: raise(need) is true (and records need)
+// when need is above what this device was last set to.
+struct PerDeviceMax {
+    long long most[32] = {};
+    bool raise(long long need) {
+        int d = 0;
+        cudaGetDevice(&d);
+        if (d < 0 || d >= 32) return true;
+        if (need <= most[d]) return false;
+        most[d] = need;
+        return true;
+    }
+};
+
 }  // namespace tqllm_cuda

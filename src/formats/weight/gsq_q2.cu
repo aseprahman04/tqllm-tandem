@@ -1,5 +1,7 @@
+// Modified in the multi-GPU fork: the shared-memory attribute is raised per device (PerDeviceMax).
 #include <algorithm>
 #include <cstdint>
+#include "per_device_once.cuh"
 #include "gsq_q2.cuh"
 #include "quant_kernels.cuh"
 #include "common.cuh"
@@ -331,8 +333,8 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     }
     constexpr int C = 16;
     const size_t smem = size_t(C) * k * sizeof(__half);
-    static int attr_for = 0;
-    if (smem > 48 * 1024 && attr_for < int(smem)) { cudaFuncSetAttribute(dot_grouped<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr_for = int(smem); }
+    static tqllm_cuda::PerDeviceMax attr_for;  // multi-GPU fork: the limit is per device
+    if (smem > 48 * 1024 && attr_for.raise((long long) smem)) cudaFuncSetAttribute(dot_grouped<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
     dot_grouped<C><<<dim3(unsigned((r + 63) / 64), unsigned(experts)), 256, smem, s>>>(
         static_cast<const unsigned char *>(w), x, y, r, k, counts, groups, capacity, topk, per_expert);
 }
