@@ -1406,7 +1406,8 @@ public:
     // x = eh_proj([enorm(embed(t)) ; hnorm(h)]), one full-attention decoder layer with its own KV cache, then the
     // shared LM head on shared_head_norm(x). Returns the greedy token after the last pair (the next draft) and keeps
     // the last pre-norm output as the hidden for chaining. `hidden`: device [n][H] (nullptr = chain from last MTP).
-    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample = true);
+    uint32_t mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample = true,
+                     const int * staged_pos = nullptr);
 
     int slots() const override { return nslots; }
     bool incremental() const override { return fmt_target; }

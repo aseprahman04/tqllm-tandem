@@ -237,9 +237,10 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         const int CH = tf_path ? NVER : std::clamp(NPF, 1, NBUF);
         const size_t chunks = (P - P0 + CH - 1) / CH + 1;  // + 1: the split at snap
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
-        HostBuf staged_pos(chunks * 2 * sizeof(int));
+        HostBuf staged_pos(chunks * 4 * sizeof(int));  // fork: the second half holds the --mtp prompt passes' positions
         std::memcpy(staged_tokens.p, prompt.data(), size_t(P) * sizeof(uint32_t));
         auto * positions = static_cast<int *>(staged_pos.p);
+        int * mtp_positions = positions + 2 * chunks;
         HostBuf tf_buf(tf_path ? size_t(P) * 4 : 4);
         uint32_t * tf_host = tf_path ? static_cast<uint32_t *>(tf_buf.p) : nullptr;
         const auto tp0 = std::chrono::steady_clock::now();
@@ -275,10 +276,15 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                         }
                     }
                     const int pairs = int(std::min<uint32_t>(uint32_t(m), P - t - 1));
-                    for (int off = 0; off < pairs; off += NVER) {
-                        const int n = std::min(NVER, pairs - off);
-                        mtp_run(prompt.data() + t + uint32_t(off) + 1,
-                                v_hid.as<bf16>() + size_t(off) * H, n, t + uint32_t(off) + 1, false);
+                    // multi-GPU fork: the MTP block reads the whole chunk in one pass (v_cat holds NBUF columns
+                    // with --mtp; past NVER queries its attention takes the one-part prefill path). Drafts only
+                    // steer speculation, so outputs are unchanged; NVER-sized passes made prefill ~2x slower.
+                    // A chunk (m <= NBUF) is one pass, fed from the staged tokens and positions without a sync.
+                    if (pairs > 0) {
+                        mtp_positions[2 * ci] = int(t) + 1;
+                        mtp_positions[2 * ci + 1] = int(t) + 2;
+                        mtp_run(static_cast<const uint32_t *>(staged_tokens.p) + t + 1, v_hid.as<bf16>(), pairs, t + 1,
+                                false, mtp_positions + 2 * ci);
                     }
                     if (final && count > 1 && next != eos_)
                         first_draft = mtp_run(&next, v_hid.as<bf16>() + size_t(m - 1) * H, 1, P);
@@ -757,8 +763,12 @@ std::vector<uint32_t> Qwen35Engine::dflash_finish(uint64_t * stats) {
     return out;
 }
 
-uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample) {
+uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int n, uint32_t pos, bool sample,
+                               const int * staged_pos) {
     if (!mtp.present) throw std::runtime_error("model has no MTP head");
+    // multi-GPU fork: a prefill pass (no sample) with the caller's staged, pinned tokens and positions (pos, pos + 1)
+    // queues without the host staging copies and the closing sync, so prefill chunks keep overlapping across the GPUs
+    const bool staged = staged_pos && !sample && gen.rdelta == 0;
     struct RestoreBasis {
         Basis & current;
         Basis saved;
@@ -769,12 +779,18 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
     const int H = int(cfg.hidden);
     auto *X = v_x.as<bf16>(), *R = v_r.as<bf16>(), *CAT = v_cat.as<bf16>(), *E = v_np.as<bf16>();
     auto * XH = v_xh.as<__half>();
-    for (int i = 0; i < n; ++i) h_tok[i] = tokens[i];
-    h_pos[0] = int(pos);
-    h_pos[1] = int(pos) + 1;
-    ck(cudaMemcpyAsync(v_tokens.p, h_tok, size_t(n) * 4, cudaMemcpyHostToDevice, stream));
-    ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
-    upload_rpos(1, [&](int) { return gen.rdelta; });
+    if (staged) {
+        ck(cudaMemcpyAsync(v_tokens.p, tokens, size_t(n) * 4, cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(v_pos.p, staged_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(v_rpos.p, staged_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    } else {
+        for (int i = 0; i < n; ++i) h_tok[i] = tokens[i];
+        h_pos[0] = int(pos);
+        h_pos[1] = int(pos) + 1;
+        ck(cudaMemcpyAsync(v_tokens.p, h_tok, size_t(n) * 4, cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        upload_rpos(1, [&](int) { return gen.rdelta; });
+    }
     uint32_t bucket = 256;
     while (bucket < pos + n) bucket *= 2;
     bucket = std::min(bucket, context_);
@@ -817,7 +833,7 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
     }
     layer_kernels();
     if (!sample) {
-        sync_main();
+        if (!staged) sync_main();
         return 0;
     }
     if (mtp_head4_sub) {  // draft vocabulary rows of the 4-bit head (dsub_ids), FP16 tensor-core matvec

@@ -5,7 +5,7 @@
 // handle and scratch buffers; use_dev() swaps them. The design follows PolyStrata's strata-poly layer split (one stage
 // per card, rows handed on through host memory, no peer access needed); the code is new.
 //
-// What the split runs so far: one slot, dense and MoE models (every expert on the GPUs), all KV on the GPUs (--kv-host 0), --prompt-cache, DFlash2 or no
+// What the split runs so far: one slot, dense and MoE models (every expert on the GPUs), all KV on the GPUs (--kv-host 0), --prompt-cache, DFlash2, --mtp or no
 // drafter. A verify block runs as two captured graphs, one per GPU, with the hand-off between them (split_hop); prefill
 // chunks, commits and tree gathers run eagerly. Greedy output equals the one-device run token for token (checked on
 // Qwen3.8-27B TQ_XS); TQ_L, which no 16 GB card holds alone, serves 524,288 tokens (YaRN x2) on two.
@@ -33,7 +33,6 @@ void Qwen35Engine::split_setup(int slots) {
     need(!cfg.tied, "models with an untied LM head only (the head lives on the second GPU)");
     need(opt.kv_host <= 0, "all KV on the GPUs so far: pass --kv-host 0");
     need(opt.kv_compact <= 0, "no --kv-compact yet");
-    need(!opt.native_mtp, "no --mtp yet (use -md with a DFlash2 drafter)");
     split_at = k;
     cuda_of[0] = 1;  // the first layers on CUDA device 1
     cuda_of[1] = 0;  // the rest, the head and the drafter on CUDA device 0, where the constructor already is

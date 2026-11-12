@@ -42,7 +42,7 @@ tqserve.exe --model Qwen3.8-27B-TQ_L.gguf ^
 | Slots | one (`--np 1`) |
 | KV | on the GPUs (`--kv-host 0`); any KV format |
 | Prompt reuse | `--prompt-cache on` |
-| Not yet | `--mtp`, `--kv-host` (a host KV tail), `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`), images |
+| Not yet | `--kv-host` (a host KV tail), `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`), images |
 
 A verify block runs as two captured CUDA graphs, one per card, with the hand-off between them. Prefill chunks run eagerly
 and overlap across the cards: device 1 starts the next chunk while device 0 finishes this one (`split_prefill`). Commits

@@ -143,6 +143,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     const auto mp = "blk." + std::to_string(cfg.layers) + ".";
     // the MTP head loads only for --mtp (tqllm::drafters: one drafter per run, never beside DFlash2)
     if (f.tensors.count(mp + "nextn.eh_proj.weight") && tqllm::drafters(opt).mtp) {
+        use_dev(1);  // layer split: the MTP block runs beside the head, on the last device
         mtp.present = true;
         mtp.eh_proj = g_mat(f, mp + "nextn.eh_proj.weight", H, 2 * H);
         mtp.enorm = g_f32(f, mp + "nextn.enorm.weight", H);
@@ -184,6 +185,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
             // for the KV cache and captured graphs when it can)
             mtp_draft_q6k_host = std::move(sub);
         }
+        use_dev(0);
     }
     layer.resize(cfg.layers);
     const auto cold_of = cfg.moe ? moe_placement(f) : std::vector<std::vector<char>>();
@@ -485,7 +487,7 @@ void Qwen35Engine::allocate() {
         }
     use_dev(1);
     v_hid = Buf(NBUF * H * 2);
-    v_cat = Buf(NVER * 2 * H * 2);
+    v_cat = Buf(size_t(mtp.present ? NBUF : NVER) * 2 * H * 2);  // fork: --mtp reads a prompt chunk in one pass
     mtp_h = Buf(H * 2);
     if (mtp.present) {
         mtp_kc = Buf(kvf->key_bytes(context_, int(cfg.kvheads), int(hd)));

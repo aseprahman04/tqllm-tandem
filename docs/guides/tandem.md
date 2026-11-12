@@ -150,7 +150,7 @@ More detail for agents (thinking control, tool calls, long sessions) is in upstr
 | `TQLLM_SPLIT: needs two CUDA devices; this process sees 1` | `CUDA_VISIBLE_DEVICES` lists one card, or the driver sees one. Set `CUDA_VISIBLE_DEVICES=0,1`. |
 | `TQLLM_SPLIT: all KV on the GPUs so far: pass --kv-host 0` | a host KV tail is not supported under the split yet. Add `--kv-host 0`. |
 | `TQLLM_SPLIT: one slot so far: pass --np 1` | the split serves one request at a time for now. |
-| `TQLLM_SPLIT: no --kv-compact yet` / `no --mtp yet` / `MoE models with every expert on the GPUs only` | not supported under the split yet; drop the option or run without `TQLLM_SPLIT`. |
+| `TQLLM_SPLIT: no --kv-compact yet` / `MoE models with every expert on the GPUs only` | not supported under the split yet; drop the option or run without `TQLLM_SPLIT`. |
 | `model does not fit in device memory` | lower `TANDEM_CONTEXT`, or move layers between the cards with `TQLLM_SPLIT`; close GPU-heavy apps on device 0. |
 | `cublas64_13.dll was not found` (or cuBLASLt / cuSOLVER / cuSPARSE) | unzip `cudart-tandem-cuda13-win-x64.zip` next to `tqserve.exe`, or put the CUDA 13 toolkit's `bin\x64` on `PATH`. |
 | The program exits at once with a CUDA driver error | update the NVIDIA driver to R580 or newer. |
