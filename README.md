@@ -126,7 +126,8 @@ tqserve: listening on 127.0.0.1:8086 (model=tqllm, context=524288)
 ```
 
 **4. Use it** like any OpenAI server at `http://127.0.0.1:8086/v1` (chat completions, Anthropic messages, streaming,
-tools). `GET /props` reports the loaded context as llama.cpp does, so agents that size their compaction window from it
+tools), or open a coding agent on it in one command: `scripts\windows\tandem-agent.bat claude` (or `codex`,
+`opencode`, `pi`). `GET /props` reports the loaded context as llama.cpp does, so agents that size their compaction window from it
 work unchanged. Drop `--rope-scaling ...` and use `--context 262144` for the trained length without YaRN.
 
 ---

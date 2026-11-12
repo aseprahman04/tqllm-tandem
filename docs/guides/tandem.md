@@ -103,8 +103,23 @@ Measured on 2x RTX 5060 Ti 16 GB with TQ_L:
 
 ## 6. Use it with apps and coding agents
 
-`tqserve` speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, streaming, tools) and the Anthropic
-Messages API (`/v1/messages`), so most clients only need a base URL:
+**One command for a terminal coding agent**: `tandem-agent.bat` starts the split server through tqLLM's launcher
+(`tools/launch/tqllm.py`) and opens the agent already pointed at it; when the agent exits, the server stops.
+
+```bat
+tandem-agent.bat claude     & rem Claude Code (Anthropic Messages API)
+tandem-agent.bat codex      & rem Codex (Responses API)
+tandem-agent.bat opencode   & rem or pi
+tandem-agent.bat serve      & rem only the server, until Ctrl+C
+```
+
+It needs Python 3 and the agent on `PATH`, and reads the same variables as `tandem-serve.bat`. The agent's own
+configuration files are never written: it gets the local server through its environment and command line. (Checked:
+the launcher brings up the split server and both the Messages and Responses APIs answer; the interactive agents
+themselves were not exercised in testing.)
+
+`tqserve` speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, streaming, tools) and the
+Anthropic Messages API (`/v1/messages`), so other clients only need a base URL:
 
 | Client | Setting |
 |---|---|

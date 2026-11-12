@@ -18,11 +18,16 @@ files are looked up in $TQLLM_MODELS, ./models, ~/models and ~/.cache/tqllm/mode
 The server comes from the Docker image (default) or a native build (--native PATH/tqserve). A server already answering
 on --port with the same model name is reused and left running; one this command started is stopped when the agent exits.
 The agents' own configuration files are never written: each gets its provider through environment / command line.
+
+Modified in the multi-GPU fork: the agent runs by the full path shutil.which() found (Windows npm shims). For a server
+split across two GPUs, see scripts/windows/tandem-agent.bat (TQLLM_SPLIT in the environment reaches tqserve).
 """
 import argparse, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 IMAGE = "ghcr.io/turbo-tan/tqllm:1.4.2"
 NAME = "tqllm"
+# multi-GPU fork: Windows has no SIGHUP
+STOP_SIGNALS = tuple(getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s))
 
 
 CATALOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")
@@ -252,7 +257,9 @@ def run_agent(a, base):
     cmd = agent_command(a, base, env)
     temp = getattr(a, "temp", None)
     try:
-        if not shutil.which(cmd[0]): sys.exit(f"tqllm: {cmd[0]} is not installed")
+        found = shutil.which(cmd[0])
+        if not found: sys.exit(f"tqllm: {cmd[0]} is not installed")
+        cmd[0] = found  # multi-GPU fork: Windows runs an npm agent (claude.cmd, codex.cmd) only by its full path
         if tool in ("codex", "claude") and not api_ok(base, "/v1/responses" if tool == "codex" else "/v1/messages"):
             sys.exit(f"tqllm: the server on {base} has no {'Responses' if tool == 'codex' else 'Messages'} API; start it from a native build (--native build/tqserve) or a newer image")
         return subprocess.call(cmd, env=env)
@@ -296,7 +303,7 @@ def main():
     resolve_model(a)
     if a.drafter and not a.draft_vocab: p.error("--drafter needs --draft-vocab")
     def interrupt(*_): raise KeyboardInterrupt
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # background jobs start with SIGINT ignored
+    for sig in STOP_SIGNALS:  # background jobs start with SIGINT ignored
         signal.signal(sig, interrupt)
     proc = cname = None
     if server_ok(a.port, NAME):
@@ -306,13 +313,14 @@ def main():
     base = f"http://127.0.0.1:{a.port}"
     try:
         if a.command == "serve":
-            print("tqllm: serving; Ctrl+C to stop", file=sys.stderr); signal.pause(); return 0
+            print("tqllm: serving; Ctrl+C to stop", file=sys.stderr)
+            while True: time.sleep(3600)  # multi-GPU fork: signal.pause() is POSIX-only
         return run_agent(a, base)
     except KeyboardInterrupt:
         return 130
     finally:
         if proc:
-            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # a second Ctrl+C must not cut the shutdown short
+            for sig in STOP_SIGNALS:  # a second Ctrl+C must not cut the shutdown short
                 signal.signal(sig, signal.SIG_IGN)
             stop_server(proc, cname)
 
