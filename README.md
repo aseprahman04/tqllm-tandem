@@ -57,7 +57,7 @@ TqCache, prompt reuse and the OpenAI-compatible `tqserve`. Tandem adds the secon
 | tqLLM, TQ_XS (3-bit) + DFlash2 | 1 | 65,536 | 170–172 | 97 | prefill 1,120 tok/s, decode 88 |
 | **Tandem, TQ_L (4-bit class) + DFlash2** | **2** | **524,288** | **127–140** | **81** | **prefill 1,231 tok/s, decode 69–72** |
 | Tandem, Unsloth UD-Q6_K (22 GB, llama.cpp GGUF) + DFlash2 | 2 | 131,072 | 86–96 | 57 | — |
-| **Tandem, TQ_L + DFlash2, tensor parallel** (`TQLLM_TP=1`, [guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1)) | **2** | **262,144** | **195–205** | **118** | **prefill 1,788 tok/s (36.7K)** |
+| **Tandem, TQ_L + DFlash2, tensor parallel** (`TQLLM_TP=1`, [guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1)) | **2** | **262,144** | **200–210** | **118–124** | **prefill 1,923 tok/s (36.7K)** |
 | Tandem, TQ_XS split (overhead check) | 2 | 8,192 | 196–200 | 80–85 | — |
 
 Prefill (prompt reading, unique prompts, median of three), with both cards working on consecutive chunks at once:
@@ -179,8 +179,8 @@ tools), or open a coding agent on it in one command: `scripts\windows\tandem-age
 work unchanged. Drop `--rope-scaling ...` and use `--context 262144` for the trained length without YaRN.
 
 **Faster decode and prefill:** `set TANDEM_TP=1` before `tandem-serve.bat` runs tensor parallel instead (every
-layer halved across both cards, 262,144 tokens, one slot, dense models): TQ_L decodes at 195–205 tok/s on code, reads
-prompts at ~1,800 tok/s. See [the guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1).
+layer halved across both cards, 262,144 tokens, one slot, dense models): TQ_L decodes at 200–210 tok/s on code, reads
+prompts at ~1,900 tok/s, and reads images with `--mmproj`. See [the guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1).
 
 ---
 
@@ -248,7 +248,8 @@ KV per token with `--kv tq3`: 224 bytes per KV head in each attention layer, **1
 | Slots | one (`--np 1`) |
 | KV | all on the GPUs (`--kv-host 0`), any KV format |
 | Prompt reuse | `--prompt-cache on` |
-| Not yet | `--kv-host`, `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`), images |
+| Images (`--mmproj`) | under tensor parallelism (`TQLLM_TP=1`); not yet under the layer split |
+| Not yet | `--kv-host`, `--kv-compact`, `--np > 1`, experts in host memory (`--moe-host-mb`) |
 
 Without `TQLLM_SPLIT` the engine is upstream tqLLM: every other model and option works as documented in
 [docs/tqllm-README.md](docs/tqllm-README.md).
@@ -292,6 +293,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 | Version | What changed | TQ_L prefill, 36.7K-token prompt |
 |---|---|--:|
+| [v0.1.8](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.8) | **Images under tensor parallelism** (`--mmproj`, e.g. Unsloth's `mmproj-F16.gguf`): the vision encoder on the home card, the image rows and M-RoPE positions on both; answers identical to one card. **Deferred commit under TP** (the accepted path's replay folded into the next verify, as on one card). TQ_L TP: 200-210 / 118-124 tok/s, prefill 1,996 / 1,923, coding check 20 / 20 | 1,650 tok/s (TP: 1,923) |
 | [v0.1.7](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.7) | **Tensor parallel prefill 1.8x**: two prompt chunks per pass, each chunk's exchanges crossing the bus (copy engine, side streams) while the cards compute the other; 2,048-token chunks under TP at any context. **LM head split by vocabulary** across both cards. TQ_L TP: prefill 1,810 / 1,788 tok/s at 9.7K / 36.7K (v0.1.6: 1,024 / 969; layer split 1,662 / 1,650), decode 195-205 / 118 tok/s, coding check 20 / 20, outputs identical with and without the pairing. Layer split unchanged (bit-identical to v0.1.5) | 1,650 tok/s (TP: 1,788) |
 | [v0.1.6](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.6) | **Tensor parallel** (`TQLLM_TP=1`, `TANDEM_TP=1`): every layer halved across both GPUs, partial sums exchanged through mapped host memory, each layer replayed as captured graph segments per GPU. TQ_L + DFlash2 at 190-197 / 111-113 tok/s (layer split 128-133 / 82-83), 262,144 tokens, `--prompt-cache on`, coding check 20 / 20, needle at 229,716 tokens. The layer split is unchanged (bit-identical to v0.1.5) | 1,650 tok/s (TP: 969) |
 | [v0.1.5](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.5) | **Fix: the YaRN table on both GPUs** (`__constant__` memory is per GPU; with `--rope-scaling` the first GPU ran plain RoPE, 524K setting affected). `--prefill-int8 on` under the split (each GPU its own int8 GEMM): TQ_L prefill 1,885 tok/s at 36.7K tokens | 1,650 tok/s (int8: 1,885) |

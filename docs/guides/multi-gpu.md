@@ -111,7 +111,7 @@ build\tqserve.exe --model models\Qwen3.8-27B-TQ_L.gguf ^
 | TQ_L + DFlash2 | Code tok/s | Prose tok/s | Prefill 9.7K / 36.7K | VRAM (device 0 / 1) |
 |---|--:|--:|--:|--:|
 | Layer split, `K=40`, 131,072 | 128-133 | 82-83 | 1,662 / 1,650 | |
-| **Tensor parallel, 262,144** | **195-205** | **118** | **1,810 / 1,788** | 13.2 / ~11.7 GB |
+| **Tensor parallel, 262,144** | **200-210** | **118-124** | **1,996 / 1,923** | 13.2 / ~11.7 GB (+0.9 GB with `--mmproj`) |
 
 Decode is ~50 % faster and prefill ~10 % faster than the layer split. Prefill runs two chunks per pass (mixer of
 chunk 0, mixer of chunk 1, FFN of chunk 0, FFN of chunk 1), so each chunk's exchanges cross the bus through the copy
@@ -120,6 +120,10 @@ wait on each other 128 times per chunk. The decode head's 4-bit pass is split by
 With `--prompt-cache on` a follow-up turn reads only its new tokens. A needle at 229,716 tokens was found. The answers are not
 bit-identical to one card (two partial sums per row-parallel projection), so `tandem_golden.py` does not apply; the
 20-task coding check passes 20 / 20.
+
+Images work under TP: add `--mmproj` (Qwen3.8-27B: Unsloth's `mmproj-F16.gguf` from `unsloth/Qwen3.8-27B-GGUF`). The
+vision encoder runs on CUDA device 0; the image rows and their M-RoPE positions are copied to the other card, and both
+scatter them into their embeddings. TQ_XS under TP answers image questions exactly as on one card.
 
 Limits so far: one slot (`--np 1`), dense models (no MoE), no `--mtp`, all KV on the GPUs (no `--kv-host`,
 `--kv-compact`), not together with `TQLLM_SPLIT`, 262,144 tokens tested. A decode exchange costs ~25 us plus the
