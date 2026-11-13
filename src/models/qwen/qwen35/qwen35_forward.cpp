@@ -1458,6 +1458,14 @@ void Qwen35Engine::set_prompt_images(const std::vector<PromptImage> & ims) {
         r0 += nt;
     }
     sync_ck();
+    if (tp) {  // tensor parallel (fork addition): the other GPU embeds the prompt too, from its own copy of the rows
+        use_dev(0, false);
+        if (rows > mm_img_rows) mm_img = Buf(rows * size_t(H) * 2), mm_img_rows = rows;
+        if (!mm_tab.p) mm_tab = Buf(size_t(NBUF) * 4 * sizeof(int));
+        ck(cudaMemcpyPeerAsync(mm_img.p, cuda_of[0], dstash[1].mm_img.p, cuda_of[1], r0 * size_t(H) * 2, stream));
+        ck(cudaStreamSynchronize(stream));
+        use_dev(1, false);
+    }
 }
 
 bool Qwen35Engine::prefill_state(const std::vector<uint32_t> & tokens, uint32_t pos0) {

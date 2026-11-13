@@ -114,6 +114,9 @@ void Qwen35Engine::use_dev(int d, bool wait) {
         std::swap(conv_state, from.conv_state), std::swap(conv_state, to.conv_state);
         std::swap(rec_state, from.rec_state), std::swap(rec_state, to.rec_state);
         for (int s = 0; s < 2; ++s) std::swap(v_stash2[s], from.stash[s]), std::swap(v_stash2[s], to.stash[s]);
+        std::swap(mm_tab, from.mm_tab), std::swap(mm_tab, to.mm_tab);
+        std::swap(mm_img, from.mm_img), std::swap(mm_img, to.mm_img);
+        std::swap(mm_img_rows, from.mm_img_rows), std::swap(mm_img_rows, to.mm_img_rows);
     }
     stream = to.stream, side = to.side, ev_fork = to.ev_fork, ev_join = to.ev_join, hop_ev = to.hop, blas = to.blas;
     to.stream = to.side = nullptr, to.ev_fork = to.ev_join = to.hop = nullptr, to.blas = nullptr;  // the members own them now
@@ -485,9 +488,12 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     tmark(0);
     use_dev(0);  // waits for the home GPU's token / position / tree uploads
     split_mirror_control();
+    if (mm_chunk)  // image prompt chunk (fork addition): the home GPU uploaded this chunk's position table
+        ck(cudaMemcpyPeerAsync(mm_tab.p, cuda_of[0], dstash[1].mm_tab.p, cuda_of[1], size_t(n) * 4 * sizeof(int), stream));
     for (int r = 0; r < 2; ++r) {
         use_dev(r, false);
         embed_multi(v_tokens.as<uint32_t>(), n, v_x.as<bf16>());
+        if (mm_chunk) tqllm_cuda::mm_scatter(v_x.as<bf16>(), mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image rows
         tqllm_cuda::sumsq(v_x.as<bf16>(), v_px.as<float>(), n * H, stream);
     }
     uint32_t attn_i = 0, lin_i = 0;

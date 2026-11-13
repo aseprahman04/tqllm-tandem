@@ -219,6 +219,8 @@ private:
         std::unique_ptr<KvStore> kv_seq;
         std::vector<KvRef> key_cache, value_cache;
         std::vector<Buf> conv_state, rec_state, stash[2];
+        Buf mm_tab, mm_img;  // image input: each GPU's copy of the position table and the image rows
+        size_t mm_img_rows = 0;
     };
     DevStash dstash[2];
     size_t i8_init[4] = {};  // the Int8Gemm::init arguments, for the other GPU's copy
