@@ -13,7 +13,10 @@
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { std::printf("%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); std::exit(1); } } while (0)
 
-constexpr int N = 8 * 5120, ITERS = 128;
+#ifndef NCOLS
+#define NCOLS 8
+#endif
+constexpr int N = NCOLS * 5120, ITERS = 128;  // NCOLS bf16 columns of the hidden size per all-reduce
 
 __global__ void work_k(int us) {  // stand-in for one half-layer of verify work
     if (threadIdx.x == 0 && blockIdx.x == 0) {

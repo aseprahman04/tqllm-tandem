@@ -233,6 +233,9 @@ private:
     std::unordered_map<uint64_t, cudaGraphExec_t> tp_commit_graphs;  // commit replays per (GPU, k, slots)
     bool tp_hold = false;                // ffn_block stops before its closing residual add (the caller reduces first)
     __nv_bfloat16 * tp_host[2][2] = {};  // [rank][parity] mapped host buffers, NBUF x hidden
+    __nv_bfloat16 * tp_recv[2] = {};     // [rank] device copy of the other GPU's partial (prefill: copy engines)
+    cudaStream_t tp_xout[2] = {};        // [rank] prefill: the copy out runs beside the main stream's copy in
+    cudaEvent_t tp_ready[2] = {};
     cudaEvent_t tp_made[2][2] = {}, tp_used[2][2] = {};
     std::unique_ptr<KvMemory> kv_mem0;  // device 0's KV memory / pool / store (attention layers below the split)
     std::unique_ptr<KvPool> kv_pool0;

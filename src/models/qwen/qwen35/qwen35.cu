@@ -828,10 +828,17 @@ void set_rope_scaling(const float * mul, int pairs, float mscale) {
 __global__ void tp_store_k(const uint4 * src, uint4 * dst, size_t n16) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n16; i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
 }
-__global__ void tp_add_k(__nv_bfloat162 * x, const __nv_bfloat162 * other, size_t n2) {
-    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n2; i += size_t(gridDim.x) * blockDim.x) {
-        const float2 a = __bfloat1622float2(x[i]), b = __bfloat1622float2(other[i]);
-        x[i] = __floats2bfloat162_rn(a.x + b.x, a.y + b.y);
+__global__ void tp_add_k(uint4 * x, const uint4 * other, size_t n8) {  // 8 bf16 a thread: 16-byte reads over PCIe
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n8; i += size_t(gridDim.x) * blockDim.x) {
+        uint4 a = x[i];
+        const uint4 b = other[i];
+        auto * pa = reinterpret_cast<__nv_bfloat162 *>(&a);
+        const auto * pb = reinterpret_cast<const __nv_bfloat162 *>(&b);
+        for (int k = 0; k < 4; ++k) {
+            const float2 fa = __bfloat1622float2(pa[k]), fb = __bfloat1622float2(pb[k]);
+            pa[k] = __floats2bfloat162_rn(fa.x + fb.x, fa.y + fb.y);
+        }
+        x[i] = a;
     }
 }
 void tp_store(const __nv_bfloat16 * src, __nv_bfloat16 * host_dst, size_t n, cudaStream_t s) {
@@ -840,9 +847,9 @@ void tp_store(const __nv_bfloat16 * src, __nv_bfloat16 * host_dst, size_t n, cud
     tp_store_k<<<blocks, 256, 0, s>>>(reinterpret_cast<const uint4 *>(src), reinterpret_cast<uint4 *>(host_dst), n16);
 }
 void tp_add(__nv_bfloat16 * x, const __nv_bfloat16 * host_other, size_t n, cudaStream_t s) {
-    const size_t n2 = n / 2;
-    const unsigned blocks = unsigned(std::min<size_t>((n2 + 255) / 256, 512));
-    tp_add_k<<<blocks, 256, 0, s>>>(reinterpret_cast<__nv_bfloat162 *>(x), reinterpret_cast<const __nv_bfloat162 *>(host_other), n2);
+    const size_t n8 = n / 8;  // n is a multiple of 8 (hidden 5120)
+    const unsigned blocks = unsigned(std::min<size_t>((n8 + 255) / 256, 512));
+    tp_add_k<<<blocks, 256, 0, s>>>(reinterpret_cast<uint4 *>(x), reinterpret_cast<const uint4 *>(host_other), n8);
 }
 
 void rope_partial(__nv_bfloat16 * x, int heads, int dim, int rot, int pos, float theta, cudaStream_t s) {

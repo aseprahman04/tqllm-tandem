@@ -173,6 +173,9 @@ void Qwen35Engine::split_alloc_dev0() {
         const size_t xb = size_t(NBUF) * cfg.hidden * sizeof(bf16);
         for (int r = 0; r < 2; ++r) {
             use_dev(r);
+            ck(cudaMalloc(reinterpret_cast<void **>(&tp_recv[r]), xb));
+            ck(cudaStreamCreateWithFlags(&tp_xout[r], cudaStreamNonBlocking));
+            ck(cudaEventCreateWithFlags(&tp_ready[r], cudaEventDisableTiming));
             for (int s = 0; s < 2; ++s) {
                 ck(cudaHostAlloc(reinterpret_cast<void **>(&tp_host[r][s]), xb, cudaHostAllocMapped | cudaHostAllocPortable));
                 ck(cudaEventCreateWithFlags(&tp_made[r][s], cudaEventDisableTiming));
@@ -366,8 +369,31 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         }
         ck(cudaGraphLaunch(it->second, stream));
     };
-    auto wait = [&](cudaEvent_t e) { ck(cudaStreamWaitEvent(stream, e, 0)); };
-    auto mark = [&](cudaEvent_t e) { ck(cudaEventRecord(e, stream)); };
+    static const bool noxchg = tqllm::debug_on("tp_noxchg");  // timing only: skip the exchanges (wrong answers)
+    auto wait = [&](cudaEvent_t e) { if (!noxchg) ck(cudaStreamWaitEvent(stream, e, 0)); };
+    auto mark = [&](cudaEvent_t e) { if (!noxchg) ck(cudaEventRecord(e, stream)); };
+    // Prefill chunks (dma): this GPU's partial goes out through the copy engine on a side stream (tp_xout) while a copy
+    // kernel on the main stream pulls the other GPU's in, so both directions of the link run at once (the second card
+    // here sits on PCIe 4.0 x4; WDDM gives each GPU one copy engine); the add then reads device memory. Smaller blocks
+    // use the zero-copy kernels, whose latency is lower.
+    const bool dma = !graphs && n >= 256;
+    auto xstore = [&](const bf16 * src, int r, int s) {
+        if (noxchg) return;
+        if (!dma) return tqllm_cuda::tp_store(src, tp_host[r][s], cnt, stream);
+        ck(cudaEventRecord(tp_ready[r], stream));
+        ck(cudaStreamWaitEvent(tp_xout[r], tp_ready[r], 0));
+        ck(cudaMemcpyAsync(tp_host[r][s], src, cnt * sizeof(bf16), cudaMemcpyDeviceToHost, tp_xout[r]));
+        ck(cudaEventRecord(tp_made[r][s], tp_xout[r]));  // the other GPU waits for this
+    };
+    auto made = [&](int r, int s) { if (!dma) mark(tp_made[r][s]); };  // dma: xstore records it on the side stream
+    auto xadd = [&](bf16 * dst, int r, int s) {  // dst += the other GPU's partial in slot s
+        if (noxchg) return;
+        if (!dma) return tqllm_cuda::tp_add(dst, tp_host[1 - r][s], cnt, stream);
+        // the SMs pull the other partial over PCIe while the copy engine (one per GPU under WDDM) sends this one
+        tqllm_cuda::tp_store(tp_host[1 - r][s], tp_recv[r], cnt, stream);
+        if (!noxchg) ck(cudaStreamWaitEvent(stream, tp_made[r][s], 0));  // dst was this GPU's slot-s partial: sent
+        tqllm_cuda::tp_add(dst, tp_recv[r], cnt, stream);
+    };
     if (graphs && max_seq != tp_graph_seq) {  // keep one KV bucket's segments (VRAM stays bounded); a new bucket recaptures
         if (!tp_graphs.empty()) {
             for (int d = 0; d < 2; ++d) use_dev(d, false), ck(cudaStreamSynchronize(stream));
@@ -396,7 +422,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
                 auto * CORE = v_core.as<bf16>();
                 auto * XH = v_xh.as<__half>();
                 if (l) {
-                    tqllm_cuda::tp_add(X, tp_host[1 - r][1], cnt, stream);
+                    xadd(X, r, 1);
                     tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
                 }
                 if (r == 1) capture_feature(l, X, v_feat.as<bf16>(), n);  // the drafter (home) reads the replicated stream
@@ -421,10 +447,10 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
                     }
                     mm_h(L.w_out, M, n);
                 }
-                tqllm_cuda::tp_store(M, tp_host[r][0], cnt, stream);
+                xstore(M, r, 0);
             });
             if (l) mark(tp_used[r][1]);
-            mark(tp_made[r][0]);
+            made(r, 0);
         }
         cfg.full[l] ? ++attn_i : ++lin_i;
         for (int r = 0; r < 2; ++r) {
@@ -432,20 +458,20 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             wait(tp_made[1 - r][0]);  // the other GPU's mixer partial is out
             wait(tp_used[1 - r][1]);  // ... and it has read this GPU's last FFN partial
             seg(r, l, 1, [&] {
-                tqllm_cuda::tp_add(v_m.as<bf16>(), tp_host[1 - r][0], cnt, stream);
+                xadd(v_m.as<bf16>(), r, 0);
                 tp_hold = true;
                 ffn_block(layer[l], n, v_x.as<bf16>());  // residual + norm + gate / up + down (partial into v_x)
                 tp_hold = false;
-                tqllm_cuda::tp_store(v_x.as<bf16>(), tp_host[r][1], cnt, stream);
+                xstore(v_x.as<bf16>(), r, 1);
             });
             mark(tp_used[r][0]);
-            mark(tp_made[r][1]);
+            made(r, 1);
         }
     }
     for (int r = 0; r < 2; ++r) {  // the last FFN partial
         use_dev(r, false);
         wait(tp_made[1 - r][1]);
-        tqllm_cuda::tp_add(v_x.as<bf16>(), tp_host[1 - r][1], cnt, stream);
+        xadd(v_x.as<bf16>(), r, 1);
         tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
         mark(tp_used[r][1]);
     }
