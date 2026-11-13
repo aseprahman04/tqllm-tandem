@@ -443,6 +443,37 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         }
         tp_graph_seq = max_seq;
     }
+    // TQLLM_DEBUG=tp_time: home-stream event times per decode step (layers incl. exchanges / head / the gap before the
+    // next verify: drafter, commit, inject, host), averaged every 256 steps. Syncs once a step: for attribution only.
+    static const bool tp_time = tqllm::debug_on("tp_time");
+    static cudaEvent_t tev[4] = {};  // start, head, end, next start
+    static double tacc[3] = {};
+    static int tsteps = 0;
+    auto tmark = [&](int k) {
+        if (!tp_time || !graphs) return;
+        if (!tev[0]) for (auto & e : tev) ck(cudaEventCreate(&e));
+        if (k == 0) {
+            ck(cudaEventRecord(tev[3], stream));
+            if (tsteps > 0) {
+                ck(cudaEventSynchronize(tev[3]));
+                float a = 0, b = 0, c = 0;
+                ck(cudaEventElapsedTime(&a, tev[0], tev[1]));
+                ck(cudaEventElapsedTime(&b, tev[1], tev[2]));
+                ck(cudaEventElapsedTime(&c, tev[2], tev[3]));
+                tacc[0] += a, tacc[1] += b, tacc[2] += c;
+                if (tsteps % 256 == 0) {
+                    std::fprintf(stderr, "tp_time: layers %.2f ms, head %.2f ms, gap %.2f ms (%d steps)\n", tacc[0] / 256,
+                                 tacc[1] / 256, tacc[2] / 256, tsteps);
+                    tacc[0] = tacc[1] = tacc[2] = 0;
+                }
+            }
+            std::swap(tev[0], tev[3]);
+            ++tsteps;
+        } else {
+            ck(cudaEventRecord(tev[k], stream));
+        }
+    };
+    tmark(0);
     use_dev(0);  // waits for the home GPU's token / position / tree uploads
     split_mirror_control();
     for (int r = 0; r < 2; ++r) {
@@ -486,6 +517,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         mark(tp_used[r][1]);
     }
     use_dev(1, false);
+    tmark(1);
     auto * X = v_x.as<bf16>();
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {
@@ -496,7 +528,9 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             head_argmax(out_norm, 1);
         }
     } else {
-        head_argmax(out_norm, n);
+        static const bool nohead = tqllm::debug_on("tp_nohead");  // the head on the home GPU alone
+        if (nohead || !tp_head(n)) head_argmax(out_norm, n);
+        tmark(2);
     }
 }
 

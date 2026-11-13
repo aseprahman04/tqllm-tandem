@@ -851,6 +851,24 @@ void tp_add(__nv_bfloat16 * x, const __nv_bfloat16 * host_other, size_t n, cudaS
     const unsigned blocks = unsigned(std::min<size_t>((n8 + 255) / 256, 512));
     tp_add_k<<<blocks, 256, 0, s>>>(reinterpret_cast<uint4 *>(x), reinterpret_cast<const uint4 *>(host_other), n8);
 }
+// The top 16 of two vocabulary halves' top-16 lists (one block of 32 threads a column): vals / ids in place from
+// [0, off) with the other half's (ids relative to off) read from `other` ([n][16] floats, then [n][16] ids).
+__global__ void tp_merge16_k(float * vals, uint32_t * ids, const float * ov, const uint32_t * oi, uint32_t off) {
+    const int c = blockIdx.x, t = threadIdx.x;
+    const float v = t < 16 ? vals[c * 16 + t] : ov[c * 16 + t - 16];
+    const uint32_t id = t < 16 ? ids[c * 16 + t] : oi[c * 16 + t - 16] + off;
+    __shared__ float sv[32];
+    __shared__ uint32_t si[32];
+    sv[t] = v, si[t] = id;
+    __syncthreads();
+    int rank = 0;
+    for (int j = 0; j < 32; ++j) rank += sv[j] > v || (sv[j] == v && si[j] < id);
+    if (rank < 16) vals[c * 16 + rank] = v, ids[c * 16 + rank] = id;
+}
+void tp_merge16(float * vals, uint32_t * ids, const void * other, int n, uint32_t off, cudaStream_t s) {
+    const auto * ov = static_cast<const float *>(other);
+    tp_merge16_k<<<n, 32, 0, s>>>(vals, ids, ov, reinterpret_cast<const uint32_t *>(ov + size_t(n) * 16), off);
+}
 
 void rope_partial(__nv_bfloat16 * x, int heads, int dim, int rot, int pos, float theta, cudaStream_t s) {
     const int n = heads * rot / 2;

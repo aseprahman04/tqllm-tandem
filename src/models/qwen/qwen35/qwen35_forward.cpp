@@ -1101,6 +1101,53 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
         tqllm_cuda::topk16_big(v_logits.as<float>(), lm_head.rows, n, lg_out, id_out, s_scr.p, stream);
 }
 
+// Tensor parallel decode head (fork addition): the two-stage head's 4-bit pass split by vocabulary rows. Rank 0 (the
+// other GPU) scores rows [V0, V) and sends its top 16 per column through mapped host memory; the home GPU scores
+// [0, V0), merges the two lists and rescores the 16 with the int8 head as head_argmax does. Both GPUs hold the same
+// final residual rows. False when the head is not the two-stage one (the caller runs head_argmax).
+bool Qwen35Engine::tp_head(int n) {
+    if (lm_head.fmt || full_logits || !head4.p || !has_head8() || n > 32 || !segs.empty()) return false;
+    const int H = int(cfg.hidden), V = int(lm_head.rows), V0 = V / 2;
+    if (!tp_h4) {  // first use: rank 0's half of head4, the output norm, its top-16 buffers, the mapped exchange
+        const size_t wb = size_t(V - V0) * H / 2, sb = size_t(V - V0) * H / 32 * 4;
+        use_dev(0, false);
+        ck(cudaMalloc(reinterpret_cast<void **>(&tp_h4), wb));
+        ck(cudaMalloc(reinterpret_cast<void **>(&tp_h4s), sb));
+        ck(cudaMalloc(reinterpret_cast<void **>(&tp_onorm), size_t(H) * 4));
+        ck(cudaMalloc(&tp_htop, size_t(NB) * 16 * 8));
+        ck(cudaMalloc(&tp_hscr, size_t(NB) * 64 * 16 * 8));
+        ck(cudaHostAlloc(&tp_hx, size_t(NB) * 16 * 8, cudaHostAllocMapped | cudaHostAllocPortable));
+        ck(cudaEventCreateWithFlags(&tp_hev, cudaEventDisableTiming));
+        ck(cudaMemcpyPeer(tp_h4, cuda_of[0], head4.as<uint8_t>() + size_t(V0) * H / 2, cuda_of[1], wb));
+        ck(cudaMemcpyPeer(tp_h4s, cuda_of[0], head4s.as<char>() + size_t(V0) * H / 32 * 4,
+                          cuda_of[1], sb));
+        ck(cudaMemcpyPeer(tp_onorm, cuda_of[0], out_norm, cuda_of[1], size_t(H) * 4));
+        use_dev(1, false);
+    }
+    // rank 0: its rows' top 16 per column, out to mapped host memory
+    use_dev(0, false);
+    tqllm_cuda::rms_f(v_x.as<bf16>(), H, tp_onorm, v_np.as<bf16>(), H, H, n, cfg.eps, stream);
+    tqllm_cuda::bf16_to_h(v_np.as<bf16>(), v_xh.as<__half>(), n * H, stream);
+    tqllm_cuda::u4h_matvec(tp_h4, tp_h4s, v_xh.as<__half>(), v_logits.as<float>(), V - V0, H, n, stream);
+    auto * tv = static_cast<float *>(tp_htop);
+    tqllm_cuda::topk16_big(v_logits.as<float>(), V - V0, n, tv, reinterpret_cast<uint32_t *>(tv + size_t(n) * 16), tp_hscr,
+                           stream);
+    tqllm_cuda::tp_store(static_cast<const bf16 *>(tp_htop), static_cast<bf16 *>(tp_hx), size_t(n) * 16 * 4, stream);
+    ck(cudaEventRecord(tp_hev, stream));
+    // home: its rows, the merge, the int8 rescore
+    use_dev(1, false);
+    tqllm_cuda::rms_f(v_x.as<bf16>(), H, out_norm, v_np.as<bf16>(), H, H, n, cfg.eps, stream);
+    tqllm_cuda::bf16_to_h(v_np.as<bf16>(), v_xh.as<__half>(), n * H, stream);
+    tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(), V0, H, n, stream);
+    tqllm_cuda::topk16_big(v_logits.as<float>(), V0, n, h2_vals.as<float>(), h2_idx.as<uint32_t>(), h2_scr.p, stream);
+    ck(cudaStreamWaitEvent(stream, tp_hev, 0));
+    tqllm_cuda::tp_merge16(h2_vals.as<float>(), h2_idx.as<uint32_t>(), tp_hx, n, uint32_t(V0), stream);
+    tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(), h2_idx.as<uint32_t>(), H, n, v_tok.as<uint32_t>(), stream,
+                                   want_topk() ? s_lg.as<float>() : nullptr);
+    if (want_topk()) ck(cudaMemcpyAsync(s_id.p, h2_idx.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToDevice, stream));
+    return true;
+}
+
 void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     const int H = int(cfg.hidden);
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::embed_multi_tq3(embed.p, dtok, n, Y, H, stream);

@@ -927,6 +927,12 @@ public:
     // logits + per-column argmax (-> v_tok) of the n hidden vectors in X, normalised with `norm_w`.
     // Head on columns [col0, col0 + n) of v_x; writes v_tok (and the sampling top-16) at the same columns.
     void head_argmax(const float * norm_w, int n, int col0 = 0);
+    bool tp_head(int n);  // tensor parallel decode head, split by vocabulary rows (false: not the two-stage head)
+    uint8_t * tp_h4 = nullptr;    // rank 0's half of head4 (rows [V / 2, V)), its scales, the output norm
+    __half2 * tp_h4s = nullptr;
+    float * tp_onorm = nullptr;
+    void *tp_htop = nullptr, *tp_hscr = nullptr, *tp_hx = nullptr;  // rank 0's top 16 per column; mapped host copy
+    cudaEvent_t tp_hev = nullptr;
 
     // Column col's sampling distribution (token_sampling.hpp top_dist); recent: the last output tokens before this column
     TopDist dist(int col, const std::vector<uint32_t> & recent = {}) const {
