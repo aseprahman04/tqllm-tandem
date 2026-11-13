@@ -58,7 +58,6 @@ void Qwen35Engine::tp_setup(int slots) {
          "head and FFN counts must split evenly");
     need(!opt.native_mtp, "no --mtp yet (DFlash2 drafters run)");
     need(opt.kv_host <= 0 && opt.kv_compact <= 0, "all KV on the GPUs, no --kv-compact");
-    need(!opt.prompt_cache, "no --prompt-cache yet");
     tp = 2;
     cuda_of[0] = 1;  // rank 0 on CUDA device 1
     cuda_of[1] = 0;  // rank 1 (home: head, sampling) on CUDA device 0, where the constructor already is
@@ -360,11 +359,24 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | (uint64_t(n) << 48) |
                              (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) | (uint64_t(vkind) << 44) | uint64_t(uint32_t(max_seq));
         auto it = tp_graphs.find(key);
-        if (it == tp_graphs.end()) it = tp_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, body))).first;
+        if (it == tp_graphs.end()) {
+            it = tp_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, body))).first;
+            static const bool dbg_graphs = tqllm::debug_on("graphs");
+            if (dbg_graphs && tp_graphs.size() % 256 == 0) std::fprintf(stderr, "tp graphs: %zu\n", tp_graphs.size());
+        }
         ck(cudaGraphLaunch(it->second, stream));
     };
     auto wait = [&](cudaEvent_t e) { ck(cudaStreamWaitEvent(stream, e, 0)); };
     auto mark = [&](cudaEvent_t e) { ck(cudaEventRecord(e, stream)); };
+    if (graphs && max_seq != tp_graph_seq) {  // keep one KV bucket's segments (VRAM stays bounded); a new bucket recaptures
+        if (!tp_graphs.empty()) {
+            for (int d = 0; d < 2; ++d) use_dev(d, false), ck(cudaStreamSynchronize(stream));
+            for (auto & [k, g] : tp_graphs) use_dev(int(k >> 63), false), ck(cudaGraphExecDestroy(g));
+            tp_graphs.clear();
+            use_dev(1, false);
+        }
+        tp_graph_seq = max_seq;
+    }
     use_dev(0);  // waits for the home GPU's token / position / tree uploads
     split_mirror_control();
     for (int r = 0; r < 2; ++r) {

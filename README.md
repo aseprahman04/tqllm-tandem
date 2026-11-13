@@ -57,6 +57,7 @@ TqCache, prompt reuse and the OpenAI-compatible `tqserve`. Tandem adds the secon
 | tqLLM, TQ_XS (3-bit) + DFlash2 | 1 | 65,536 | 170–172 | 97 | prefill 1,120 tok/s, decode 88 |
 | **Tandem, TQ_L (4-bit class) + DFlash2** | **2** | **524,288** | **127–140** | **81** | **prefill 1,231 tok/s, decode 69–72** |
 | Tandem, Unsloth UD-Q6_K (22 GB, llama.cpp GGUF) + DFlash2 | 2 | 131,072 | 86–96 | 57 | — |
+| **Tandem, TQ_L + DFlash2, tensor parallel** (`TQLLM_TP=1`, [guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1)) | **2** | **262,144** | **190–197** | **111–113** | prefill 969 tok/s (36.7K) |
 | Tandem, TQ_XS split (overhead check) | 2 | 8,192 | 196–200 | 80–85 | — |
 
 Prefill (prompt reading, unique prompts, median of three), with both cards working on consecutive chunks at once:
@@ -177,6 +178,10 @@ tools), or open a coding agent on it in one command: `scripts\windows\tandem-age
 `opencode`, `pi`). `GET /props` reports the loaded context as llama.cpp does, so agents that size their compaction window from it
 work unchanged. Drop `--rope-scaling ...` and use `--context 262144` for the trained length without YaRN.
 
+**Faster decode, slower prefill:** `set TANDEM_TP=1` before `tandem-serve.bat` runs tensor parallel instead (every
+layer halved across both cards, 262,144 tokens, one slot, dense models): TQ_L decodes at 190–197 tok/s on code, reads
+prompts at ~1,000 tok/s. See [the guide](docs/guides/multi-gpu.md#tensor-parallel-tqllm_tp1).
+
 ---
 
 ## How it works
@@ -276,6 +281,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 - **A million tokens.** A host KV tail with TqCache compaction (lossy) per card, or the trellis tcq3 / tcq2 KV codecs
   (~640K on the GPUs).
 - **More of tqLLM under the split:** `--np > 1`, experts in host memory, Flash-Next, images.
+- **Tensor parallel:** prefill with the exchanges overlapped (now ~40 % slower than the split), MoE, `--np > 1`, Linux numbers.
 - **Borrowed system RAM for bigger weights** (Q8_0, BF16): a share of the layers' weights streamed from host memory
   per verify window. (UD-Q6_K already fits two 16 GB cards.)
 - **More than two cards**, and Linux numbers.
@@ -286,6 +292,7 @@ answers, and the pipelined prefill gives the same answers as v0.1.1's turn-takin
 
 | Version | What changed | TQ_L prefill, 36.7K-token prompt |
 |---|---|--:|
+| [v0.1.6](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.6) | **Tensor parallel** (`TQLLM_TP=1`, `TANDEM_TP=1`): every layer halved across both GPUs, partial sums exchanged through mapped host memory, each layer replayed as captured graph segments per GPU. TQ_L + DFlash2 at 190-197 / 111-113 tok/s (layer split 128-133 / 82-83), 262,144 tokens, `--prompt-cache on`, coding check 20 / 20, needle at 229,716 tokens. The layer split is unchanged (bit-identical to v0.1.5) | 1,650 tok/s (TP: 969) |
 | [v0.1.5](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.5) | **Fix: the YaRN table on both GPUs** (`__constant__` memory is per GPU; with `--rope-scaling` the first GPU ran plain RoPE, 524K setting affected). `--prefill-int8 on` under the split (each GPU its own int8 GEMM): TQ_L prefill 1,885 tok/s at 36.7K tokens | 1,650 tok/s (int8: 1,885) |
 | [v0.1.4](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.4) | **MoE prefill 3,416 -> 4,881 tok/s** (tiled router, grouped expert GEMMs without empty CTAs; both bit-identical). **`--mtp` under the split** (the model's own MTP head on the home GPU): Qwen3.8-35B-A3B at 213 / 206 / 158 tok/s, faster than PolyStrata's MTP (178 / 165 / 149) on the same file | 1,650 tok/s |
 | [v0.1.3](https://github.com/aseprahman04/tqllm-tandem/releases/tag/v0.1.3) | **Mixture-of-experts models** under the split (`qwen35moe`, every expert on the GPUs): Qwen3.8-35B-A3B-Distill Q4_K_M at 135-137 tok/s decode and 3,965 tok/s prefill. Decoding without a drafter now runs under the split (one graph per GPU). Thinking on / off measured | 1,650 tok/s |

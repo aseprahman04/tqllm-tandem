@@ -89,3 +89,36 @@ cards with TQ_L.
   `src/core/per_device_once.cuh`); the limit is a per-device attribute.
 - With a split the token embeddings live in portable host memory, so both cards read them (one row per token).
 - Code: `src/models/qwen/qwen35/qwen35_split.cpp` and the hooks marked "layer split" in the qwen35 engine.
+
+## Tensor parallel (`TQLLM_TP=1`)
+
+The other way to use two cards: every layer is halved, and both cards work on the same layer at once. Each card holds
+half of every layer's attention heads, Gated DeltaNet heads and FFN rows (the slice map is in
+[`docs/design/tensor-parallel.md`](../design/tensor-parallel.md)); after the mixer and after the FFN the two partial
+sums are exchanged through mapped host memory, so both cards keep the same residual stream. The LM head, sampling and
+the DFlash2 drafter run on CUDA device 0, which needs ~3 GB more: put the card without the display first.
+
+```bat
+set CUDA_VISIBLE_DEVICES=1,0
+set TQLLM_TP=1
+build\tqserve.exe --model models\Qwen3.8-27B-TQ_L.gguf ^
+  -md models\drafters\Qwen3.8-27B-DFlash2-TQ3.gguf --draft-vocab models\mtp-vocab\atx_65536.txt ^
+  --context 262144 --kv tq3 --kv-host 0 --prompt-cache on --port 8086
+```
+
+(`set TANDEM_TP=1` before `scripts\windows\tandem-serve.bat` does the same.) Measured on 2x RTX 5060 Ti, Windows 11:
+
+| TQ_L + DFlash2 | Code tok/s | Prose tok/s | Prefill 9.7K / 36.7K | VRAM (device 0 / 1) |
+|---|--:|--:|--:|--:|
+| Layer split, `K=40`, 131,072 | 128-133 | 82-83 | 1,662 / 1,650 | |
+| **Tensor parallel, 262,144** | **190-197** | **111-113** | 1,024 / 969 | 12.3 / 11.7 GB peak |
+
+Decode is ~45 % faster; prefill is ~40 % slower (prefill chunks run eagerly, with the two cards waiting on each other
+128 times per chunk). With `--prompt-cache on` a follow-up turn reads only its new tokens, so an agent pays the prefill
+price for what it adds, not for the whole conversation. A needle at 229,716 tokens was found. The answers are not
+bit-identical to one card (two partial sums per row-parallel projection), so `tandem_golden.py` does not apply; the
+20-task coding check passes 20 / 20.
+
+Limits so far: one slot (`--np 1`), dense models (no MoE), no `--mtp`, all KV on the GPUs (no `--kv-host`,
+`--kv-compact`), not together with `TQLLM_SPLIT`, 262,144 tokens tested. The ~40 us per exchange is Windows' WDDM event
+latency; Linux is expected to do better but is not measured.

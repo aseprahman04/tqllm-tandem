@@ -229,14 +229,18 @@ void Qwen35Engine::cmp_upload() {
 
 void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_host
     const size_t cb = conv_bytes(), rb = rec_bytes(), nl = conv_state.size() / NSLOT;
-    if (!pc_host) pc_host = std::make_unique<HostBuf>(nl * (cb + rb));
+    const int ranks = tp ? 2 : 1;  // tensor parallel (fork addition): each GPU holds its half of the heads' state
+    if (!pc_host) pc_host = std::make_unique<HostBuf>(ranks * nl * (cb + rb));
     auto * h = static_cast<char *>(pc_host->p);
-    for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
-        if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): copy on the state's own device
-        ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
-                           cb, cudaMemcpyDefault, stream));
-        ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
-                           rb, cudaMemcpyDefault, stream));
+    for (int r = 0; r < ranks; ++r) {
+        if (tp) use_dev(r, false);
+        for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
+            if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): copy on the state's own device
+            ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
+                               cb, cudaMemcpyDefault, stream));
+            ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
+                               rb, cudaMemcpyDefault, stream));
+        }
     }
     use_dev(1);
 }

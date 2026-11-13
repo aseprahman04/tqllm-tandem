@@ -229,6 +229,7 @@ private:
     void load_layer_tp(const GgufFile & f, Layer & L, uint32_t l, int rank);
     void verify_body_tp(int n, int max_seq);
     std::unordered_map<uint64_t, cudaGraphExec_t> tp_graphs;  // verify segments per (GPU, layer, part, shape, slots)
+    int tp_graph_seq = 0;                                       // ... all for this KV bucket
     std::unordered_map<uint64_t, cudaGraphExec_t> tp_commit_graphs;  // commit replays per (GPU, k, slots)
     bool tp_hold = false;                // ffn_block stops before its closing residual add (the caller reduces first)
     __nv_bfloat16 * tp_host[2][2] = {};  // [rank][parity] mapped host buffers, NBUF x hidden

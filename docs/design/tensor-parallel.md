@@ -84,6 +84,8 @@ stream, norms and embeddings are replicated; each card holds half the heads, hal
 | TQ_XS, **TP** + DFlash2 (segment graphs) | **206-216** | **122** | - | - |
 | TQ_S, layer split + DFlash2 | 153-160 | 86 | 1,643 | 18/20 |
 | TQ_S, **TP** + DFlash2 (segment graphs, commit graphs) | **202-212** | **113** | 1,212 (eager) | 18/20 |
+| TQ_L, layer split + DFlash2 (131K) | 128-133 | 82-83 | 1,650 | - |
+| TQ_L, **TP** + DFlash2 (262K, `--prompt-cache on`, home on the second card) | **190-197** | **111-113** | 969 (eager) | 20/20 |
 | TQ_XS without a drafter: one GPU / layer split / TP | 33.6 / 31.6 / 37.7 | | | |
 
 - Correctness: TP answers are coherent; 2 of 4 golden answers identical to one GPU, the others diverge late (two
