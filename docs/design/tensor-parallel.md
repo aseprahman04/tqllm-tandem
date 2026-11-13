@@ -96,7 +96,15 @@ stream, norms and embeddings are replicated; each card holds half the heads, hal
 - Tried: eager TP (host-bound: 167-171 / 98 on TQ_XS); one graph per GPU per step synchronised by flags in mapped
   host memory: ~1.6 ms an exchange under WDDM (`tools/tp_bench` mode D) - unusable.
 - 250 tok/s needs the exchange latency well under 40 us (Linux without WDDM, or peer access / NVLink) or fewer
-  exchanges. Next ideas: vocabulary-split head (~0.7 ms), prefill pipelined like the layer split, Linux numbers.
+  exchanges.
+- v0.1.7 (TQ_L, 262K): the second card is on PCIe 4.0 x4 and WDDM reports one copy engine per GPU
+  (`asyncEngineCount` 1). An all-reduce costs ~25 us + bytes (`tools/tp_bench -DNCOLS=`: 1 column 24 us, 8: 35 us,
+  16: 69 us; a 2,048-token prefill chunk, 21 MB: ~6.5 ms). Without exchanges (`TQLLM_DEBUG=tp_noxchg`, wrong answers,
+  timing only) prefill would run 2,089 / 1,898 tok/s; it ran 1,024 / 969. Steps: 2,048-token chunks under TP (+15 %),
+  the copy out through the copy engine on a side stream while a copy kernel pulls the other partial in (+9 %), and two
+  chunks per pass so each chunk's exchanges hide behind the other's compute (verify_pair_tp): 1,800-2,000 tok/s.
+  Decode (`TQLLM_DEBUG=tp_time`, synced): layers 25.3 ms, head 2.1 -> 1.1 ms with the vocabulary split, the gap to
+  the next verify 5.1 ms (DFlash2 draft ~2-2.5 ms: 0.79 GB of drafter weights on the home card, commit, inject, host).
 
 ## Milestones
 

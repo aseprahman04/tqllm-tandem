@@ -111,14 +111,17 @@ build\tqserve.exe --model models\Qwen3.8-27B-TQ_L.gguf ^
 | TQ_L + DFlash2 | Code tok/s | Prose tok/s | Prefill 9.7K / 36.7K | VRAM (device 0 / 1) |
 |---|--:|--:|--:|--:|
 | Layer split, `K=40`, 131,072 | 128-133 | 82-83 | 1,662 / 1,650 | |
-| **Tensor parallel, 262,144** | **190-197** | **111-113** | 1,024 / 969 | 12.3 / 11.7 GB peak |
+| **Tensor parallel, 262,144** | **195-205** | **118** | **1,810 / 1,788** | 13.2 / ~11.7 GB |
 
-Decode is ~45 % faster; prefill is ~40 % slower (prefill chunks run eagerly, with the two cards waiting on each other
-128 times per chunk). With `--prompt-cache on` a follow-up turn reads only its new tokens, so an agent pays the prefill
-price for what it adds, not for the whole conversation. A needle at 229,716 tokens was found. The answers are not
+Decode is ~50 % faster and prefill ~10 % faster than the layer split. Prefill runs two chunks per pass (mixer of
+chunk 0, mixer of chunk 1, FFN of chunk 0, FFN of chunk 1), so each chunk's exchanges cross the bus through the copy
+engine while the cards compute the other chunk; without that pairing (`TQLLM_DEBUG=tp_nopair`, same outputs) the cards
+wait on each other 128 times per chunk. The decode head's 4-bit pass is split by vocabulary rows across both cards.
+With `--prompt-cache on` a follow-up turn reads only its new tokens. A needle at 229,716 tokens was found. The answers are not
 bit-identical to one card (two partial sums per row-parallel projection), so `tandem_golden.py` does not apply; the
 20-task coding check passes 20 / 20.
 
 Limits so far: one slot (`--np 1`), dense models (no MoE), no `--mtp`, all KV on the GPUs (no `--kv-host`,
-`--kv-compact`), not together with `TQLLM_SPLIT`, 262,144 tokens tested. The ~40 us per exchange is Windows' WDDM event
-latency; Linux is expected to do better but is not measured.
+`--kv-compact`), not together with `TQLLM_SPLIT`, 262,144 tokens tested. A decode exchange costs ~25 us plus the
+bytes (16 verify columns: ~70 us here, where the second card sits on PCIe 4.0 x4); WDDM gives each card one copy
+engine. Linux is not measured.
