@@ -543,7 +543,7 @@ void Qwen35Engine::allocate() {
             int dev = 0, major = 0;
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-            defer = major >= 10 && !tp;  // tensor parallel (fork addition): commits replay on both GPUs instead
+            defer = major >= 10;  // tensor parallel (fork addition): each GPU replays its own heads' path in its verify
         }
     }
     v_pos = Buf(2 * size_t(nslots) * sizeof(int));

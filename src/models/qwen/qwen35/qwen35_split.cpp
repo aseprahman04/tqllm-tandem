@@ -362,11 +362,20 @@ void Qwen35Engine::tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, in
     bf16 * TL = n <= NVER ? v_stash2[sp][lin_i].as<bf16>() : T;
     mix_mm(L, TL, n);
     bf16 * QKVC = v_qkvc.as<bf16>();
+    tqllm_cuda::ConvReplay crp;
+    tqllm_cuda::GdnReplay grp;
+    if (defer && vpar == d_tpar.as<int>()) {  // replay the previous step's path first (deferred commit), as verify_body
+        const bf16 * RT = v_stash2[sp ^ 1][lin_i].as<bf16>();
+        crp.x = RT, crp.pend = d_pend.as<int>(), crp.smid = conv_slot(lin_i, cur + 1);
+        crp.y = d_rep_qkvc.as<bf16>();
+        grp.qkv = d_rep_qkvc.as<bf16>(), grp.b0 = RT + qkv_dim + zdim, grp.a0 = grp.b0 + lvh;
+        grp.abs_ = rows, grp.pend = d_pend.as<int>(), grp.smid = rec_slot(lin_i, cur + 1);
+    }
     tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC, qkv_dim, stream,
-                           vpar);
+                           vpar, crp);
     const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
     tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), rec_slot(lin_i, cur + 1),
-                          CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar);
+                          CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp);
     if (basis_ == Basis::Tq3Rot32) {
         tqllm_cuda::gated_rms_rot_h(CORE, TL + qkv_dim, rows, n, L.gnorm_w, XH, lvh, dv, cfg.eps, stream);
     } else {

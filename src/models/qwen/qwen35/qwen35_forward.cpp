@@ -1486,24 +1486,27 @@ void Qwen35Engine::flush_pending() {
     if (!pend_k) return;
     const int lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads), dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
     const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
-    if (split_at) {  // layer split (fork addition): each layer replays on its device; the chain table goes along
+    if (split_at || tp) {  // layer split / tensor parallel (fork addition): replays on both devices; the chain table goes along
         use_dev(0);
         split_mirror_control();
     }
-    uint32_t lin_i = 0;
-    for (uint32_t l = 0; l < cfg.layers; ++l) {
-        if (cfg.full[l]) continue;
-        use_dev(dev_of(l));
-        const auto & L = layer[l];
-        const int rows = mix_rows(L);
-        const bf16 * T = v_stash2[pend_sp][lin_i].as<bf16>();
-        tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
-                               v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
-        const bf16 * B0 = T + qkv_dim + zdim;
-        tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                              rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                              d_chain.as<int>());
-        ++lin_i;
+    for (int d = tp ? 0 : 1; d <= 1; ++d) {  // tensor parallel: each GPU replays every layer (its half of the heads)
+        if (tp) use_dev(d, false);
+        uint32_t lin_i = 0;
+        for (uint32_t l = 0; l < cfg.layers; ++l) {
+            if (cfg.full[l]) continue;
+            use_dev(dev_of(l));
+            const auto & L = layer[l];
+            const int rows = mix_rows(L);
+            const bf16 * T = v_stash2[pend_sp][lin_i].as<bf16>();
+            tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
+                                   v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
+            const bf16 * B0 = T + qkv_dim + zdim;
+            tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
+                                  rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
+                                  d_chain.as<int>());
+            ++lin_i;
+        }
     }
     use_dev(1);
     cur = (cur + 1) % NSLOT;
