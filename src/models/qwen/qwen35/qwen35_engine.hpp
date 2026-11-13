@@ -228,6 +228,15 @@ private:
     void tp_setup(int slots);
     void load_layer_tp(const GgufFile & f, Layer & L, uint32_t l, int rank);
     void verify_body_tp(int n, int max_seq);
+    void verify_pair_tp(int nA, int seqA, const uint32_t * tokB, const int * posB, int nB, int seqB);
+    void tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, int max_seq, int r);
+    void tp_ffn(uint32_t l, int n);
+    struct TpChunk { Buf x, m, px, feat, tokens, pos, rpos; };
+    TpChunk tp_pair[2];                       // [rank] the second chunk's buffers (verify_pair_tp)
+    __nv_bfloat16 * tp_hostp[2][2][2] = {};  // [chunk][rank][slot] pinned exchange buffers (copy engines)
+    __nv_bfloat16 * tp_recvp[2][2] = {};     // [chunk][rank]
+    cudaEvent_t tp_pmade[2][2][2] = {}, tp_pin[2][2][2] = {};
+    cudaStream_t tp_xin[2] = {};
     std::unordered_map<uint64_t, cudaGraphExec_t> tp_graphs;  // verify segments per (GPU, layer, part, shape, slots)
     int tp_graph_seq = 0;                                       // ... all for this KV bucket
     std::unordered_map<uint64_t, cudaGraphExec_t> tp_commit_graphs;  // commit replays per (GPU, k, slots)
@@ -803,6 +812,28 @@ public:
         last_n = n;
     }
 
+    // Tensor parallel prefill (fork addition): chunk A = nA tokens at pos and chunk B = the next nB in one pass
+    // (verify_pair_tp). tokB / posB: the caller's pinned staging. The caller commits nA, then nB.
+    void verify_pair_async(const uint32_t * tokA, const int * posA, int nA, const uint32_t * tokB, const int * posB, int nB,
+                           uint32_t pos, uint32_t * next) {
+        join_commit();
+        if (pos == 0) reset_state(), pc_drop();
+        kv_track(pos, nA);
+        kv_track(pos + uint32_t(nA), nB);
+        flush_pending();
+        vpar = vdep = nullptr;
+        auto bucket = [&](uint32_t end) {
+            uint32_t b = 256;
+            while (b < end) b *= 2;
+            return int(dfl.dspine ? context_ : std::min(b, context_));
+        };
+        ck(cudaMemcpyAsync(v_tokens.p, tokA, size_t(nA) * 4, cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(v_pos.p, posA, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        ck(cudaMemcpyAsync(v_rpos.p, posA, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        verify_pair_tp(nA, bucket(pos + uint32_t(nA)), tokB, posB, nB, bucket(pos + uint32_t(nA + nB)));
+        if (next) ck(cudaMemcpyAsync(next, v_tok.p, 4, cudaMemcpyDeviceToHost, stream));
+        last_n = nA;
+    }
     // ---- shared multi-token layer pieces (verify and MTP) ----
     // Full-attention token mixer on n tokens: XH holds the normalised, rotated input; result (pre-residual) -> M.
     // `li` >= 0 (batched verify): attention layer index; each segment then uses its own slot's cache instead of kc / vc.

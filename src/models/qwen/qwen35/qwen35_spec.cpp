@@ -255,6 +255,37 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                 positions[2 * ci] = int(t);
                 positions[2 * ci + 1] = int(t) + 1;
                 const bool final = t + uint32_t(m) == P;
+                // tensor parallel (fork addition): two chunks per pass, each one's exchanges behind the other's compute
+                static const bool tp_nopair = tqllm::debug_on("tp_nopair");
+                const uint32_t tB = t + uint32_t(m);
+                const int mB = tB < P ? int(std::min<uint32_t>(std::min<uint32_t>(uint32_t(CH), P - tB), snap > tB ? snap - tB : P)) : 0;
+                if (tp && !tp_nopair && images.empty() && !tf_path && !use_mtp && rdelta == 0 && tB != snap && m >= 256 &&
+                    mB >= 256) {
+                    positions[2 * ci + 2] = int(tB);
+                    positions[2 * ci + 3] = int(tB) + 1;
+                    prefill_final = tB + uint32_t(mB) == P;
+                    const auto * tok = static_cast<const uint32_t *>(staged_tokens.p);
+                    verify_pair_async(tok + t, positions + 2 * ci, m, tok + tB, positions + 2 * ci + 2, mB, t,
+                                      prefill_final ? h_tok : nullptr);
+                    commit(m);
+                    last_n = mB;
+                    commit(mB);
+                    for (int c = 0; c < 2; ++c) {
+                        const uint32_t tc = c ? tB : t;
+                        const int mc = c ? mB : m;
+                        const bf16 * feats = c ? tp_pair[1].feat.as<bf16>() : v_feat.as<bf16>();
+                        for (int off = 0; off < mc && dfl_on; off += DFlash::injBatch) {
+                            const int count = std::min(DFlash::injBatch, mc - off);
+                            if (tc + uint32_t(off + count) <= inj0) continue;
+                            dflash_inject(feats + size_t(off) * nf * H, count, tc + uint32_t(off));
+                        }
+                    }
+                    if (tB + uint32_t(mB) == snap) pc_copy(true), pc_snap = snap;
+                    tqllm::prefill_completed(stream, tB + uint32_t(mB), P, P0);
+                    m_last = m + mB;
+                    ++ci;
+                    continue;
+                }
                 prefill_final = final;
                 mm_chunk = !images.empty();
                 if (mm_chunk)

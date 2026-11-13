@@ -341,6 +341,48 @@ Mat Qwen35Engine::g_cat_cut(const GgufFile & f, const std::vector<CutPart> & par
     return {};
 }
 
+// One GPU's share of layer l's token mixer on the n columns of v_x (the residual stream; v_m holds the previous FFN
+// partial's sum once added): residual, norm, attention or Gated DeltaNet on this GPU's heads, its partial into v_m.
+void Qwen35Engine::tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, int max_seq, int r) {
+    const int H = int(cfg.hidden), lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads);
+    const int dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
+    const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    const auto & L = layer[l];
+    auto *X = v_x.as<bf16>(), *M = v_m.as<bf16>(), *T = v_in.as<bf16>(), *O = v_o.as<bf16>();
+    auto * CORE = v_core.as<bf16>();
+    auto * XH = v_xh.as<__half>();
+    if (l) tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
+    if (r == 1) capture_feature(l, X, v_feat.as<bf16>(), n);  // the drafter (home) reads the replicated stream
+    nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
+    if (cfg.full[l]) {
+        attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);
+        return;
+    }
+    const int rows = mix_rows(L);
+    bf16 * TL = n <= NVER ? v_stash2[sp][lin_i].as<bf16>() : T;
+    mix_mm(L, TL, n);
+    bf16 * QKVC = v_qkvc.as<bf16>();
+    tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC, qkv_dim, stream,
+                           vpar);
+    const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
+    tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), rec_slot(lin_i, cur + 1),
+                          CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar);
+    if (basis_ == Basis::Tq3Rot32) {
+        tqllm_cuda::gated_rms_rot_h(CORE, TL + qkv_dim, rows, n, L.gnorm_w, XH, lvh, dv, cfg.eps, stream);
+    } else {
+        tqllm_cuda::gated_rms_multi(CORE, TL + qkv_dim, rows, n, L.gnorm_w, O, lvh, dv, cfg.eps, stream);
+        rot_h(O, XH, zdim, n);
+    }
+    mm_h(L.w_out, M, n);
+}
+
+// One GPU's share of layer l's FFN (v_m: the mixer partials' sum): residual + norm + gate / up + down, partial into v_x.
+void Qwen35Engine::tp_ffn(uint32_t l, int n) {
+    tp_hold = true;
+    ffn_block(layer[l], n, v_x.as<bf16>());
+    tp_hold = false;
+}
+
 // verify_body under tensor parallelism (one slot, no images, no KV staging): both GPUs run every layer on their half of
 // the heads / FFN rows. Per layer and GPU two segments - A: the previous layer's FFN partial from the other GPU, the
 // residual, the mixer, this layer's mixer partial out; B: the other GPU's mixer partial in, the FFN, its partial out -
@@ -350,9 +392,7 @@ Mat Qwen35Engine::g_cat_cut(const GgufFile & f, const std::vector<CutPart> & par
 // segment as a captured graph, the events in between issued from the host (a graph cannot wait for another GPU's
 // graph safely); prefill chunks run eagerly. The head runs on the home GPU.
 void Qwen35Engine::verify_body_tp(int n, int max_seq) {
-    const int H = int(cfg.hidden), lkh = int(cfg.lin_kheads), lvh = int(cfg.lin_vheads);
-    const int dk = int(cfg.lin_dk), dv = int(cfg.lin_dv);
-    const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
+    const int H = int(cfg.hidden);
     const size_t cnt = size_t(n) * H;
     static const bool eager = tqllm::debug_on("tp_eager");
     const bool graphs = n <= NVER && !eager;
@@ -417,37 +457,9 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             if (l) wait(tp_made[1 - r][1]);  // the other GPU's FFN partial of layer l - 1 is out
             wait(tp_used[1 - r][0]);         // ... and it has read this GPU's last mixer partial
             seg(r, l, 0, [&] {
-                const auto & L = layer[l];
-                auto *X = v_x.as<bf16>(), *M = v_m.as<bf16>(), *T = v_in.as<bf16>(), *O = v_o.as<bf16>();
-                auto * CORE = v_core.as<bf16>();
-                auto * XH = v_xh.as<__half>();
-                if (l) {
-                    xadd(X, r, 1);
-                    tqllm_cuda::add_sumsq(X, M, v_px.as<float>(), n * H, stream);
-                }
-                if (r == 1) capture_feature(l, X, v_feat.as<bf16>(), n);  // the drafter (home) reads the replicated stream
-                nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
-                if (cfg.full[l]) {
-                    attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);
-                } else {
-                    const int rows = mix_rows(L);
-                    bf16 * TL = n <= NVER ? v_stash2[sp][lin_i].as<bf16>() : T;
-                    mix_mm(L, TL, n);
-                    bf16 * QKVC = v_qkvc.as<bf16>();
-                    tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC,
-                                           qkv_dim, stream, vpar);
-                    const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
-                    tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
-                                          rec_slot(lin_i, cur + 1), CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar);
-                    if (basis_ == Basis::Tq3Rot32) {
-                        tqllm_cuda::gated_rms_rot_h(CORE, TL + qkv_dim, rows, n, L.gnorm_w, XH, lvh, dv, cfg.eps, stream);
-                    } else {
-                        tqllm_cuda::gated_rms_multi(CORE, TL + qkv_dim, rows, n, L.gnorm_w, O, lvh, dv, cfg.eps, stream);
-                        rot_h(O, XH, zdim, n);
-                    }
-                    mm_h(L.w_out, M, n);
-                }
-                xstore(M, r, 0);
+                if (l) xadd(v_x.as<bf16>(), r, 1);
+                tp_mix(l, attn_i, lin_i, n, max_seq, r);
+                xstore(v_m.as<bf16>(), r, 0);
             });
             if (l) mark(tp_used[r][1]);
             made(r, 0);
@@ -459,9 +471,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             wait(tp_used[1 - r][1]);  // ... and it has read this GPU's last FFN partial
             seg(r, l, 1, [&] {
                 xadd(v_m.as<bf16>(), r, 0);
-                tp_hold = true;
-                ffn_block(layer[l], n, v_x.as<bf16>());  // residual + norm + gate / up + down (partial into v_x)
-                tp_hold = false;
+                tp_ffn(l, n);
                 xstore(v_x.as<bf16>(), r, 1);
             });
             mark(tp_used[r][0]);
@@ -488,6 +498,123 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     } else {
         head_argmax(out_norm, n);
     }
+}
+
+// Prefill under tensor parallelism, two consecutive chunks at once (fork addition). The layers run as chunk 0's mixer,
+// chunk 1's mixer, chunk 0's FFN, chunk 1's FFN, so every exchange crosses the link (copy engine, side streams) while
+// the GPUs compute the other chunk. Chunk 1 continues chunk 0's sequence: it reads the recurrent state chunk 0 writes
+// (slot cur + 1) and writes slot cur, its K/V after chunk 0's. Same kernels on the same inputs as two verify_body_tp
+// calls. Chunk 0 uses the engine's buffers (tokens / positions uploaded by the caller on the home GPU), chunk 1 its own
+// (tp_pair), its tokens and positions read from the caller's pinned staging (tokB, posB). The head (prefill_final)
+// runs on chunk 1's last position; its drafter features stay in tp_pair[1].feat.
+void Qwen35Engine::verify_pair_tp(int nA, int seqA, const uint32_t * tokB, const int * posB, int nB, int seqB) {
+    const int H = int(cfg.hidden);
+    const int nc[2] = {nA, nB}, seq[2] = {seqA, seqB};
+    const size_t xb = size_t(NBUF) * H * sizeof(bf16);
+    if (!tp_pair[0].x.p) {  // first use: chunk 1's buffers, the pinned exchange buffers, streams and events
+        const int nf = int(dfl.target_ids.size());
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            auto & q = tp_pair[r];
+            q.x = Buf(xb), q.m = Buf(xb), q.px = Buf(size_t(NBUF) * ((H + 255) / 256) * 4);
+            if (r == 1 && nf) q.feat = Buf(size_t(NBUF) * nf * H * 2);
+            q.tokens = Buf(size_t(NBUF) * 4), q.pos = Buf(2 * sizeof(int)), q.rpos = Buf(2 * sizeof(int));
+            ck(cudaStreamCreateWithFlags(&tp_xin[r], cudaStreamNonBlocking));
+            for (int c = 0; c < 2; ++c) {
+                ck(cudaMalloc(reinterpret_cast<void **>(&tp_recvp[c][r]), xb));
+                for (int s = 0; s < 2; ++s) {
+                    ck(cudaHostAlloc(reinterpret_cast<void **>(&tp_hostp[c][r][s]), xb, cudaHostAllocPortable));
+                    ck(cudaEventCreateWithFlags(&tp_pmade[c][r][s], cudaEventDisableTiming));
+                    ck(cudaEventCreateWithFlags(&tp_pin[c][r][s], cudaEventDisableTiming));
+                }
+            }
+        }
+        use_dev(1, false);
+    }
+    const int slot0 = cur;
+    auto swap_chunk = [&](int r) {
+        auto & q = tp_pair[r];
+        std::swap(v_x, q.x), std::swap(v_m, q.m), std::swap(v_px, q.px), std::swap(v_feat, q.feat);
+        std::swap(v_tokens, q.tokens), std::swap(v_pos, q.pos), std::swap(v_rpos, q.rpos);
+    };
+    auto on = [&](int c, int r, auto && fn) {  // fn for chunk c on rank r's GPU
+        use_dev(r, false);
+        if (c) swap_chunk(r), cur = (slot0 + 1) % NSLOT;
+        fn();
+        if (c) swap_chunk(r), cur = slot0;
+    };
+    auto send = [&](int c, int r, int s, const bf16 * src) {  // this GPU's partial out (copy engine)
+        ck(cudaEventRecord(tp_ready[r], stream));
+        ck(cudaStreamWaitEvent(tp_xout[r], tp_ready[r], 0));
+        ck(cudaStreamWaitEvent(tp_xout[r], tp_pin[c][1 - r][s], 0));  // the other GPU has read the buffer's last partial
+        ck(cudaMemcpyAsync(tp_hostp[c][r][s], src, size_t(nc[c]) * H * 2, cudaMemcpyDeviceToHost, tp_xout[r]));
+        ck(cudaEventRecord(tp_pmade[c][r][s], tp_xout[r]));
+    };
+    auto fetch = [&](int c, int s) {  // once both GPUs queued their send: the other GPU's partial in (copy engine)
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            ck(cudaStreamWaitEvent(tp_xin[r], tp_ready[r], 0));  // tp_recvp's last partial is added
+            ck(cudaStreamWaitEvent(tp_xin[r], tp_pmade[c][1 - r][s], 0));
+            ck(cudaMemcpyAsync(tp_recvp[c][r], tp_hostp[c][1 - r][s], size_t(nc[c]) * H * 2, cudaMemcpyHostToDevice,
+                               tp_xin[r]));
+            ck(cudaEventRecord(tp_pin[c][r][s], tp_xin[r]));
+        }
+    };
+    auto add = [&](int c, int r, int s, bf16 * dst) {  // dst (this GPU's slot-s partial, sent) += the other GPU's
+        ck(cudaStreamWaitEvent(stream, tp_pin[c][r][s], 0));
+        ck(cudaStreamWaitEvent(stream, tp_pmade[c][r][s], 0));
+        tqllm_cuda::tp_add(dst, tp_recvp[c][r], size_t(nc[c]) * H, stream);
+    };
+    use_dev(0);  // waits for the home GPU's uploads of chunk 0's tokens and positions
+    split_mirror_control();
+    for (int r = 0; r < 2; ++r)
+        on(1, r, [&] {
+            ck(cudaMemcpyAsync(v_tokens.p, tokB, size_t(nB) * 4, cudaMemcpyHostToDevice, stream));
+            ck(cudaMemcpyAsync(v_pos.p, posB, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+            ck(cudaMemcpyAsync(v_rpos.p, posB, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+        });
+    for (int c = 0; c < 2; ++c)
+        for (int r = 0; r < 2; ++r)
+            on(c, r, [&] {
+                embed_multi(v_tokens.as<uint32_t>(), nc[c], v_x.as<bf16>());
+                tqllm_cuda::sumsq(v_x.as<bf16>(), v_px.as<float>(), nc[c] * H, stream);
+            });
+    uint32_t attn_i = 0, lin_i = 0;
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        for (int c = 0; c < 2; ++c) {
+            for (int r = 0; r < 2; ++r)
+                on(c, r, [&] {
+                    if (l) add(c, r, 1, v_x.as<bf16>());
+                    tp_mix(l, attn_i, lin_i, nc[c], seq[c], r);
+                    send(c, r, 0, v_m.as<bf16>());
+                });
+            fetch(c, 0);
+        }
+        cfg.full[l] ? ++attn_i : ++lin_i;
+        for (int c = 0; c < 2; ++c) {
+            for (int r = 0; r < 2; ++r)
+                on(c, r, [&] {
+                    add(c, r, 0, v_m.as<bf16>());
+                    tp_ffn(l, nc[c]);
+                    send(c, r, 1, v_x.as<bf16>());
+                });
+            fetch(c, 1);
+        }
+    }
+    for (int c = 0; c < 2; ++c)
+        for (int r = 0; r < 2; ++r)
+            on(c, r, [&] {
+                add(c, r, 1, v_x.as<bf16>());
+                tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), nc[c] * H, stream);
+            });
+    on(1, 1, [&] {  // home: chunk 1's hidden rows, and the head on its last position
+        auto * X = v_x.as<bf16>();
+        ck(cudaMemcpyAsync(v_hid.p, X, size_t(nB) * H * 2, cudaMemcpyDeviceToDevice, stream));
+        if (prefill_final) {
+            ck(cudaMemcpyAsync(X, X + size_t(nB - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
+            head_argmax(out_norm, 1);
+        }
+    });
 }
 
 // Rank r's shard of one dense qwen35 layer (the slice map of docs/design/tensor-parallel.md), with cfg still whole.

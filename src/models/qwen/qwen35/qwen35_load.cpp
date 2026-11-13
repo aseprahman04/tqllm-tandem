@@ -394,6 +394,9 @@ void Qwen35Engine::allocate() {
         NPF = NBUF = prefill_chunk(int64_t(context_), tot, fr, kv_dev);  // GB10 prefill 8K: 650 -> 1135 tok/s
         prefill_room = fr > kv_dev ? fr - kv_dev : 0;
     }
+    // tensor parallel (fork addition): each GPU holds half the weights, room for 2048-token chunks at any context
+    // (TQ_L at 262,144 tokens: 512-token chunks prefill ~15 % slower)
+    if (tp) NPF = NBUF = std::max(NPF, 2048);
     if (opt.ubatch) NPF = NBUF = std::max(NVER, opt.ubatch);
     // A trained draft block can be wider than the requested prefill micro-batch or verify capacity.
     if (!opt.draft_model.empty()) NBUF = std::max(NBUF, 16 * nslots);
