@@ -23,6 +23,7 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <random>
 #include <string_view>
@@ -908,6 +909,13 @@ inline void extract_tool_calls(DecodeResult & r) {
 
 inline void usage_timings(std::string & out, const DecodeResult & result);
 
+// Tool call ids unique across the conversation, not call_0 per answer: agent clients (ARN) drop a tool call whose id
+// they have already seen, so every call after the first was lost.
+inline std::string tool_call_id() {
+    static std::atomic<unsigned long long> n{0};
+    return "call_" + std::to_string(std::time(nullptr)) + "_" + std::to_string(++n);
+}
+
 inline std::string completion_json(const std::string & model, const DecodeResult & result, bool chat) {
     std::string out = "{\"id\":";
     jstr(out, chat ? "chatcmpl-tqllm" : "cmpl-tqllm");
@@ -927,7 +935,7 @@ inline std::string completion_json(const std::string & model, const DecodeResult
             for (size_t i = 0; i < result.tool_calls.size(); ++i) {
                 if (i) out.push_back(',');
                 out += "{\"id\":";
-                jstr(out, "call_" + std::to_string(i));
+                jstr(out, tool_call_id());
                 out += ",\"type\":\"function\",\"function\":{\"name\":";
                 jstr(out, result.tool_calls[i].name);
                 out += ",\"arguments\":";
@@ -1030,7 +1038,7 @@ public:
                 for (size_t i = 0; i < result.tool_calls.size(); ++i) {
                     if (i) out.push_back(',');
                     out += "{\"index\":" + std::to_string(i) + ",\"id\":";
-                    jstr(out, "call_" + std::to_string(i));
+                    jstr(out, tool_call_id());
                     out += ",\"type\":\"function\",\"function\":{\"name\":";
                     jstr(out, result.tool_calls[i].name);
                     out += ",\"arguments\":";
