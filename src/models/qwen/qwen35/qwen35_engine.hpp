@@ -248,6 +248,11 @@ private:
     cudaStream_t tp_xout[2] = {};        // [rank] prefill: the copy out runs beside the main stream's copy in
     cudaEvent_t tp_ready[2] = {};
     cudaEvent_t tp_made[2][2] = {}, tp_used[2][2] = {};
+    // Tensor parallel verify steps (default; TQLLM_DEBUG=tp_nospin turns it off): counters in mapped host memory, [kind (0 made, 1 used)][rank][slot] plus an error word at 8;
+    // per GPU device shadows: [0, 4) this GPU's own counters' values, [4, 8) the next value it waits for (kind * 2 + slot)
+    uint32_t * tp_flags = nullptr;
+    uint32_t * tp_shadow[2] = {};
+    bool tp_spin_off = false;  // set after a timed-out wait: host-ordered exchanges from then on
     std::unique_ptr<KvMemory> kv_mem0;  // device 0's KV memory / pool / store (attention layers below the split)
     std::unique_ptr<KvPool> kv_pool0;
     std::unique_ptr<KvStore> kv_seq0;
@@ -737,6 +742,11 @@ public:
         ck(cudaStreamSynchronize(stream));
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(e));
+        if (tp_flags && *reinterpret_cast<volatile uint32_t *>(tp_flags + 8)) {  // a tensor-parallel exchange wait timed out
+            tp_flags[8] = 0;
+            tp_spin_off = true;
+            throw std::runtime_error("tp: an exchange wait timed out; this request failed, later ones order the exchanges from the host");
+        }
     }
     bool full_logits = tqllm::debug_value("full_head") != nullptr;  // TQLLM_DEBUG=full_head: full-vocabulary int8 head, the reference for the shortlist
     void set_full_logits(bool on) override { full_logits = on; }

@@ -851,6 +851,36 @@ void tp_add(__nv_bfloat16 * x, const __nv_bfloat16 * host_other, size_t n, cudaS
     const unsigned blocks = unsigned(std::min<size_t>((n8 + 255) / 256, 512));
     tp_add_k<<<blocks, 256, 0, s>>>(reinterpret_cast<uint4 *>(x), reinterpret_cast<const uint4 *>(host_other), n8);
 }
+// Tensor parallel verify steps (fork addition): the two GPUs order their exchanges through counters in mapped host memory
+// instead of host-issued events, so each GPU's whole verify step is one captured graph. A signal bumps this GPU's own
+// counter (single writer; the device shadow holds its value); a wait spins until the other GPU's counter reaches the
+// next expected value (lag 1 for "buffer read" counters: the first use of a buffer needs no read). Partial stores are
+// earlier kernels on the same stream, so they reach host memory before the signal (PCIe posted writes stay in order).
+// A wait that takes longer than timeout_ns sets *err and returns: the step's results are then wrong, so the host fails
+// that request and orders later exchanges itself (Qwen35Engine::sync_ck).
+__global__ void tp_signal_k(uint32_t * shadow, volatile uint32_t * flag) {
+    const uint32_t v = ++*shadow;
+    __threadfence_system();
+    *flag = v;
+}
+__global__ void tp_wait_k(uint32_t * expect, const volatile uint32_t * flag, uint32_t lag, volatile uint32_t * err,
+                          unsigned long long timeout_ns) {
+    const uint32_t e = ++*expect - lag;
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    while (int32_t(*flag - e) < 0) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > timeout_ns) {
+            *err = 1;
+            break;
+        }
+    }
+    __threadfence_system();
+}
+void tp_signal(uint32_t * shadow, uint32_t * flag, cudaStream_t s) { tp_signal_k<<<1, 1, 0, s>>>(shadow, flag); }
+void tp_wait(uint32_t * expect, const uint32_t * flag, uint32_t lag, uint32_t * err, cudaStream_t s) {
+    tp_wait_k<<<1, 1, 0, s>>>(expect, flag, lag, err, 200ull * 1000 * 1000);  // 200 ms, far below the 2 s TDR limit
+}
 // The top 16 of two vocabulary halves' top-16 lists (one block of 32 threads a column): vals / ids in place from
 // [0, off) with the other half's (ids relative to off) read from `other` ([n][16] floats, then [n][16] ids).
 __global__ void tp_merge16_k(float * vals, uint32_t * ids, const float * ov, const uint32_t * oi, uint32_t off) {

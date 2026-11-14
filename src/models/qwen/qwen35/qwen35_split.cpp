@@ -174,9 +174,13 @@ void Qwen35Engine::split_alloc_dev0() {
         alloc_seq_state();  // ends on device 1
         use_dev(0);
         const size_t xb = size_t(NBUF) * cfg.hidden * sizeof(bf16);
+        ck(cudaHostAlloc(reinterpret_cast<void **>(&tp_flags), 16 * sizeof(uint32_t), cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(tp_flags, 0, 16 * sizeof(uint32_t));
         for (int r = 0; r < 2; ++r) {
             use_dev(r);
             ck(cudaMalloc(reinterpret_cast<void **>(&tp_recv[r]), xb));
+            ck(cudaMalloc(reinterpret_cast<void **>(&tp_shadow[r]), 8 * sizeof(uint32_t)));
+            ck(cudaMemset(tp_shadow[r], 0, 8 * sizeof(uint32_t)));
             ck(cudaStreamCreateWithFlags(&tp_xout[r], cudaStreamNonBlocking));
             ck(cudaEventCreateWithFlags(&tp_ready[r], cudaEventDisableTiming));
             for (int s = 0; s < 2; ++s) {
@@ -496,6 +500,53 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         if (mm_chunk) tqllm_cuda::mm_scatter(v_x.as<bf16>(), mm_tab.as<int>(), n, mm_img.as<bf16>(), H, stream);  // image rows
         tqllm_cuda::sumsq(v_x.as<bf16>(), v_px.as<float>(), n * H, stream);
     }
+    // Verify blocks (fork addition, default; TQLLM_DEBUG=tp_nospin: the per-segment path below): the same segments, waits
+    // and marks in one captured graph per GPU, the cross-GPU order kept by counters in mapped host memory
+    // (tqllm_cuda::tp_wait / tp_signal) instead of host events. TQ_L, 2x RTX 5060 Ti: layers 28.0 -> 24.4 ms a step,
+    // decode +10-13 %, greedy outputs identical. A wait that times out fails that request (sync_ck) and turns this off.
+    static const bool spin = !tqllm::debug_on("tp_nospin");
+    if (graphs && spin && !tp_spin_off && !noxchg) {
+        auto body = [&](int r) {
+            uint32_t * sh = tp_shadow[r];
+            auto sig = [&](int kind, int s) { tqllm_cuda::tp_signal(sh + kind * 2 + s, tp_flags + (kind * 2 + r) * 2 + s, stream); };
+            auto swt = [&](int kind, int s) {  // kind 0: made (lag 0), 1: used (lag 1)
+                tqllm_cuda::tp_wait(sh + 4 + kind * 2 + s, tp_flags + (kind * 2 + 1 - r) * 2 + s, uint32_t(kind), tp_flags + 8, stream);
+            };
+            uint32_t ai = 0, li = 0;
+            for (uint32_t l = 0; l < cfg.layers; ++l) {
+                if (l) swt(0, 1);
+                swt(1, 0);
+                if (l) xadd(v_x.as<bf16>(), r, 1);
+                tp_mix(l, ai, li, n, max_seq, r);
+                xstore(v_m.as<bf16>(), r, 0);
+                if (l) sig(1, 1);
+                sig(0, 0);
+                cfg.full[l] ? ++ai : ++li;
+                swt(0, 0);
+                swt(1, 1);
+                xadd(v_m.as<bf16>(), r, 0);
+                tp_ffn(l, n);
+                xstore(v_x.as<bf16>(), r, 1);
+                sig(1, 0);
+                sig(0, 1);
+            }
+            swt(0, 1);  // the last FFN partial
+            xadd(v_x.as<bf16>(), r, 1);
+            tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
+            sig(1, 1);
+        };
+        const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
+                              (uint64_t(vkind) << 44) | uint64_t(uint32_t(max_seq));
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            const uint64_t key = (uint64_t(r) << 63) | key0;
+            auto it = tp_graphs.find(key);
+            if (it == tp_graphs.end())
+                it = tp_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, [&] { body(r); }))).first;
+            ck(cudaGraphLaunch(it->second, stream));
+            (void)cudaStreamQuery(stream);  // WDDM batches submissions: hand this graph to the GPU now
+        }
+    } else {
     uint32_t attn_i = 0, lin_i = 0;
     for (uint32_t l = 0; l < cfg.layers; ++l) {
         for (int r = 0; r < 2; ++r) {
@@ -530,6 +581,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         xadd(v_x.as<bf16>(), r, 1);
         tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
         mark(tp_used[r][1]);
+    }
     }
     use_dev(1, false);
     tmark(1);
