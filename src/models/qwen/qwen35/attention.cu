@@ -5,6 +5,7 @@
 #include "common.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
+#include "per_device_once.cuh"
 
 #include <math_constants.h>
 #include <cstdlib>

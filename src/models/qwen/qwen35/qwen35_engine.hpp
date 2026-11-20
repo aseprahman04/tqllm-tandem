@@ -258,9 +258,21 @@ private:
     // (the server's request threads) is already there when it enters the engine, and use_dev() returns there.
     int cuda_of[2] = {0, 0};
     cudaEvent_t hop_ev{};  // recorded on the current stream when leaving a device
+    // --moe-cache-mb: CLOCK cache of host experts in VRAM, one pool per expert layout (slot stride == the kernels' expert
+    // stride), keyed by a global host-expert index (layer base + cold slot). Under a layer split each stage has its own pools.
+    struct MoeCache {
+        long long bytes[tqllm_cuda::kMoeStageSpans] = {};
+        uint32_t types[3] = {};
+        Buf buf[tqllm_cuda::kMoeStageSpans], key, ref, hand;
+        int slots = 0;
+        long weight = 0;
+    };
     struct DevStash {
         cudaStream_t stream{}, side{};
         cudaEvent_t ev_fork{}, ev_join{}, hop{};
+        cudaStream_t moe_side{};  // --moe-host-mb decode: this stage's side branch for the host experts
+        cudaEvent_t moe_fork{}, moe_join{};
+        std::vector<MoeCache> moe_cache;  // this stage's host-expert cache pools
         cublasHandle_t blas{};
         std::vector<Buf> bufs;  // dev_bufs() order
         std::unique_ptr<tqllm_cuda::Int8Gemm> i8;  // --prefill-int8 on: each GPU's own cuBLASLt handle and buffers
@@ -617,20 +629,17 @@ private:
     Buf moe_stage_buf[tqllm_cuda::kMoeStageSpans], moe_stage_ids;
     long long moe_stage_bytes[tqllm_cuda::kMoeStageSpans] = {};
     int moe_stage_slots = 0;
-    // --moe-cache-mb: CLOCK cache of host experts in VRAM, one pool per expert layout (slot stride == the kernels' expert
-    // stride), keyed by a global host-expert index (layer base + cold slot)
-    struct MoeCache {
-        long long bytes[tqllm_cuda::kMoeStageSpans] = {};
-        uint32_t types[3] = {};
-        Buf buf[tqllm_cuda::kMoeStageSpans], key, ref, hand;
-        int slots = 0;
-        long weight = 0;
-    };
-    std::vector<MoeCache> moe_cache;
+    std::vector<MoeCache> moe_cache;  // the current stage's pools (swapped by use_dev)
     std::vector<int> moe_cache_of, moe_cold_base;  // per layer: pool (-1 none), first global host-expert index
     Buf moe_cache_table, moe_cache_slot, moe_cache_fill;
     void alloc_moe_cache();
     void alloc_moe_stage();
+    void moe_side_init() {  // the side stream and events of the current stage, made before any graph capture
+        if (moe_side) return;
+        ck(cudaStreamCreateWithFlags(&moe_side, cudaStreamNonBlocking));
+        ck(cudaEventCreateWithFlags(&moe_fork, cudaEventDisableTiming));
+        ck(cudaEventCreateWithFlags(&moe_join, cudaEventDisableTiming));
+    }
     Buf moe_prof; std::string moe_prof_path;  // TQLLM_DEBUG=moe_profile: routing counts [L][E]
     void moe_profile_write();
     // per Gated DeltaNet layer: [n][mix rows] projected inputs of a verify (replayed at commit), double-buffered so a

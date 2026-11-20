@@ -880,10 +880,9 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
         for (int z0 = 0; qsa_mixed && z0 < nq; z0 += qmax)
             tq3_launch<4, KC, VC, 1>(q + int64_t(z0) * h * 256, k, v, y, part + int64_t(z0) * h * ps * (256 + 2), dseq0,
                                      std::min(qmax, nq - z0), h, kh, scale, nsplit, s, dep ? dep + z0 : nullptr, ps, z0, nullptr);
-        static bool configured = false;
-        if (!configured) {
+        static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+        if (configured.raise(1)) {
             cudaFuncSetAttribute(attn_tq3kv_k<4, KC, VC, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tq3a::smem<4, 1>()));
-            configured = true;
         }
         attn_tq3kv_k<4, KC, VC, 1, true><<<dim3(kh, nq, nsplit), 4 * 32, tq3a::smem<4, 1>(), s>>>(
             q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, dep, ps, 0, nullptr, 0, nullptr, 0, 0, qsa_sel, qsa_from);

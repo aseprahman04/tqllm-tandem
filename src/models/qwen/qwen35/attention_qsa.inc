@@ -55,10 +55,9 @@ void attention_mq256_qsa(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, cons
         throw std::invalid_argument("QSA attention: two-part verify block, <= 16 heads per KV head");
     constexpr int KS = DIM + 8;
     const size_t smem = (size_t(MQ_MAXROWS) + 4 * MQ_TILE) * KS * 2 + size_t(MQ_MAXROWS) * (MQ_TILE + 4) * 4;
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         cudaFuncSetAttribute(attn_mq_k<DIM, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
-        configured = true;
     }
     // a block that crosses `from`: the dense cache part first, then the sparse rows' partials replace theirs
     if (mixed) mq_launch<false, false>(q, kc, vc, nullptr, nullptr, y, part, dseq0, nq, h, kh, scale, nsplit, s, 0, par, dep);
@@ -85,10 +84,9 @@ static void ctv_qsa_launch(const __nv_bfloat16 * q, const void * kc, const void 
     for (int off = 0; mixed && off < nq; off += chunk)
         ctv_launch<T4K, T4V>(q + int64_t(off) * h * 256, kc, vc, ksc, y + int64_t(off) * h * 256, part, dseq0, std::min(chunk, nq - off),
                              h, kh, scale, nsplit, s, off);
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         cudaFuncSetAttribute(attn_ctv_k<T4K, T4V, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(ctv::smem(T4K, T4V)));
-        configured = true;
     }
     attn_ctv_k<T4K, T4V, true><<<dim3(kh, nsplit, nq), 256, ctv::smem(T4K, T4V), s>>>(q, kc, static_cast<const uint8_t *>(vc), ksc, part,
                                                                                     dseq0, nq, h, kh, scale, nsplit, 0, sel, from);

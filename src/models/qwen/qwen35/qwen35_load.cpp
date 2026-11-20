@@ -890,13 +890,16 @@ void Qwen35Engine::allocate() {
 
 void Qwen35Engine::alloc_moe_cache() {
     if (opt.moe_cache_mb <= 0 || !moe_stage_slots) return;
-    moe_cache_of.assign(layer.size(), -1), moe_cold_base.assign(layer.size(), 0);
+    // layer split: called once per stage (stage 1 from allocate(), stage 0 from split_alloc_dev0()); each stage pools only
+    // its own layers, within its own --moe-cache-mb
+    if (moe_cache_of.empty()) moe_cache_of.assign(layer.size(), -1), moe_cold_base.assign(layer.size(), 0);
     int total = 0;
     for (size_t l = 0; l < layer.size(); ++l) {
         const auto & L = layer[l];
         moe_cold_base[l] = total;
         if (L.n_cold <= 0) continue;
         total += L.n_cold;
+        if (dev_of(uint32_t(l)) != cur_dev) continue;
         MoeCache sig;
         const Mat * m[3] = {&L.cx_gate, &L.cx_up, &L.cx_down};
         for (int j = 0; j < 3; ++j) {
@@ -923,7 +926,8 @@ void Qwen35Engine::alloc_moe_cache() {
         for (long long b : c.bytes) slot_b += b;
         c.slots = int(budget * double(c.weight) / double(wsum) / double(slot_b));
         if (c.slots < 2 * moe_stage_slots) {  // too small to keep a step's experts: those layers use the stage
-            for (auto & p : moe_cache_of) if (p == int(i)) p = -1;
+            for (size_t l = 0; l < moe_cache_of.size(); ++l)
+                if (dev_of(uint32_t(l)) == cur_dev && moe_cache_of[l] == int(i)) moe_cache_of[l] = -1;
             c.slots = 0;
             continue;
         }
@@ -939,8 +943,8 @@ void Qwen35Engine::alloc_moe_cache() {
     moe_cache_fill = Buf(size_t(moe_stage_slots) * sizeof(int));
     int slots = 0;
     for (const auto & c : moe_cache) slots += c.slots;
-    std::fprintf(stderr, "tqllm: MoE host-expert cache: %d slots in %zu pool(s), %.0f MiB of VRAM (--moe-cache-mb)\n", slots,
-                 moe_cache.size(), used / 1048576.0);
+    std::fprintf(stderr, "tqllm: MoE host-expert cache%s: %d slots in %zu pool(s), %.0f MiB of VRAM (--moe-cache-mb)\n",
+                 split_at ? (cur_dev ? " (stage 1)" : " (stage 0)") : "", slots, moe_cache.size(), used / 1048576.0);
 }
 
 void Qwen35Engine::alloc_moe_stage() {
@@ -964,6 +968,7 @@ void Qwen35Engine::alloc_moe_stage() {
     moe_stage_ids = Buf(size_t(moe_stage_slots) * sizeof(int));
     std::fprintf(stderr, "tqllm: MoE host experts staged through %.0f MiB of VRAM (%d assignments)\n", total / 1048576.0,
                  moe_stage_slots);
+    moe_side_init();
 }
 
 void Qwen35Engine::upload_rpos(int nseg, const std::function<int(int)> & delta) {

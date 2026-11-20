@@ -28,8 +28,7 @@ void Qwen35Engine::split_setup(int slots) {
     need(n >= 2, "needs two CUDA devices; this process sees " + std::to_string(n));
     need(slots == 1, "one slot so far: pass --np 1");
     need(k > 0 && k < int(cfg.layers), "K must be a layer in 1.." + std::to_string(cfg.layers - 1));
-    need(!cfg.moe || (opt.moe_host_mb <= 0 && opt.moe_cache_mb <= 0 && opt.n_cpu_moe <= 0),
-         "MoE models with every expert on the GPUs only so far (no --moe-host-mb / --moe-cache-mb / -ncmoe)");
+    need(!cfg.moe || opt.n_cpu_moe <= 0, "MoE models: host experts through --moe-host-mb / --moe-cache-mb (no -ncmoe)");
     need(!cfg.tied, "models with an untied LM head only (the head lives on the second GPU)");
     need(opt.kv_host <= 0, "all KV on the GPUs so far: pass --kv-host 0");
     need(opt.kv_compact <= 0, "no --kv-compact yet");
@@ -68,7 +67,7 @@ void Qwen35Engine::tp_setup(int slots) {
 
 // Every scratch buffer the layers, the head or the drafter's inputs use: one copy per device.
 std::vector<Buf *> Qwen35Engine::dev_bufs() {
-    return {&x,      &norm,   &resid,  &mix,    &gate,      &up,     &act,      &logits_buf, &token,   &part,
+    std::vector<Buf *> v = {&x,      &norm,   &resid,  &mix,    &gate,      &up,     &act,      &logits_buf, &token,   &part,
             &xq,     &xs,     &xf,     &part_x, &part_m,    &amax,   &t_in,     &t_qg,       &t_q,     &t_k,
             &t_v,    &t_o,    &t_qkv,  &t_qkvc, &t_z,       &t_a,    &t_b,      &t_core,     &t_gn,    &v_x,
             &v_m,    &v_r,    &v_np,   &v_in,   &v_o,       &v_core, &v_act,    &v_xh,       &v_xf,    &v_px,
@@ -78,7 +77,12 @@ std::vector<Buf *> Qwen35Engine::dev_bufs() {
             &blas_ws, &fp8_sw, &v_feat,
             // MoE routing and expert scratch (every expert of a layer lives on that layer's GPU)
             &moe_logits, &moe_ids, &moe_counts, &moe_groups, &moe_xids, &moe_weights, &moe_shared_weights, &moe_gate,
-            &moe_up, &moe_act, &moe_out, &moe_shared};
+            &moe_up, &moe_act, &moe_out, &moe_shared,
+            // --moe-host-mb: the host-expert split's id tables, staging buffers and cache index tables, one set per stage
+            &moe_hot_ids, &moe_cold_ids, &moe_counts2, &moe_groups2, &moe_stage_ids, &moe_cache_table, &moe_cache_slot,
+            &moe_cache_fill};
+    for (Buf & b : moe_stage_buf) v.push_back(&b);
+    return v;
 }
 
 void Qwen35Engine::use_dev(int d, bool wait) {
@@ -95,6 +99,10 @@ void Qwen35Engine::use_dev(int d, bool wait) {
     DevStash & to = dstash[d];
     from.stream = stream, from.side = side, from.ev_fork = ev_fork, from.ev_join = ev_join, from.hop = hop_ev;
     from.blas = blas;
+    from.moe_side = moe_side, from.moe_fork = moe_fork, from.moe_join = moe_join;
+    std::swap(moe_cache, from.moe_cache), std::swap(moe_cache, to.moe_cache);
+    moe_side = to.moe_side, moe_fork = to.moe_fork, moe_join = to.moe_join;
+    to.moe_side = nullptr, to.moe_fork = to.moe_join = nullptr;
     const auto list = dev_bufs();
     from.bufs.resize(list.size());
     to.bufs.resize(list.size());
@@ -191,6 +199,8 @@ void Qwen35Engine::split_alloc_dev0() {
         }
         use_dev(0);
     }
+    // host experts: stage 0's own cache pools (the staging buffers and index tables were mirrored above)
+    if (cfg.moe && opt.moe_host_mb > 0) alloc_moe_cache(), moe_side_init();
     // the verify tables start as allocate() wrote them; d_pend starts at 0
     split_mirror_control();
     sync_ck();

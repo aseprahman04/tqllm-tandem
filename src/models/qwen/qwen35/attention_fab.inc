@@ -225,10 +225,9 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
                         (Q8 ? (Q8V ? 4 : 2) * size_t(MQ_TILE) * (DIM / 32) * 2 : 0) +  // their scales
                         (TURBO3V ? (2 * MQ_TILE * V3B + 15) / 16 * 16 + 8 * 4 : 0) + // Turbo3 V stages + LUT
                         size_t(MQ_MAXROWS) * (MQ_TILE + 4) * 4;
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         cudaFuncSetAttribute(attn_mq_k<DIM, Q8, TURBO3V>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
-        configured = true;
     }
     if (par) {  // two-part verify attention: cache keys here, the block's ancestors in attn_blk_k, merged in fixed order
         if (Q8 || TURBO3V || query_offset) throw std::invalid_argument("tree attention: BF16 K/V, one verify block");
@@ -265,12 +264,11 @@ void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, 
                              __nv_bfloat16 * y, float * part, size_t part_floats, const int * dseq0, int nq, int h, int kh,
                              float scale, int nsplit, cudaStream_t s) {
     constexpr int DIM = 256;
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         if (cudaFuncSetAttribute(attn_bf16_prefill_k<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
             cudaSuccess)
             throw std::runtime_error("attention_mq256_prefill: 99 KB of shared memory per block unavailable");
-        configured = true;
     }
     const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;
     attn_bf16_prefill_k<true><<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
@@ -278,12 +276,11 @@ void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, 
 
 void attention_mq256_prefill_bidir(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
                                    __nv_bfloat16 * y, const int * dseq0, int nq, int h, int kh, float scale, cudaStream_t s) {
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         if (cudaFuncSetAttribute(attn_bf16_prefill_k<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
             cudaSuccess)
             throw std::runtime_error("attention_mq256_prefill_bidir: 99 KB of shared memory per block unavailable");
-        configured = true;
     }
     const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;
     attn_bf16_prefill_k<false><<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
@@ -301,10 +298,9 @@ static void ctv_launch(const __nv_bfloat16 * q, const void * kc, const void * vc
                        cudaStream_t s, int query_offset) {
     if (h % kh || (h / kh) * nq > ctv::MAXR)
         throw std::invalid_argument("CTV attention: nq * group must be <= 48");
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         cudaFuncSetAttribute(attn_ctv_k<T4K, T4V>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(ctv::smem(T4K, T4V)));
-        configured = true;
     }
     attn_ctv_k<T4K, T4V><<<dim3(kh, nsplit), 256, ctv::smem(T4K, T4V), s>>>(q, kc, static_cast<const uint8_t *>(vc), ksc, part,
                                                                   dseq0, nq, h, kh, scale, nsplit, query_offset);
@@ -333,10 +329,9 @@ void attention_mq256_t4kv(const __nv_bfloat16 * q, const Turbo4K256 * kc, const 
 void attention_mq256_t4kv_prefill(const __nv_bfloat16 * q, const Turbo4K256 * kc, const Turbo4K256 * vc,
                                   __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale,
                                   int nsplit, cudaStream_t s) {
-    static bool configured = false;
-    if (!configured) {
+    static tqllm_cuda::PerDeviceLimit configured;  // multi-GPU fork: the limit is per device
+    if (configured.raise(1)) {
         cudaFuncSetAttribute(attn_t4kv_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fap::smem()));
-        configured = true;
     }
     const int blocks = ((h / kh) * nq + fap::ROWS - 1) / fap::ROWS;
     attn_t4kv_prefill_k<<<dim3(kh, blocks), fap::NW * 32, fap::smem(), s>>>(
