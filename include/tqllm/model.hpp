@@ -39,6 +39,9 @@ public:
     // Sampling for generate_spec: temperature 0 = greedy; top_k <= 16, top_p, seed.
     void set_sampling(float temperature, float top_p = 1.f, int top_k = 0, uint64_t seed = 0, float presence = 0.f);
     void set_penalties(float repeat = 1.f, float frequency = 0.f);  // after set_sampling: repeat (1 = off) / frequency penalty
+    // Runtime LoRA (EngineOptions::lora): adapters loaded, and the active slot's scales for its next request (one per adapter)
+    int lora_count() const;
+    void set_lora(const std::vector<float> & scales);
     void set_ignore_eos(bool on);  // decode to max_tokens through end-of-sequence tokens (fixed-length benchmarks)
     void set_first_token_hook(std::function<void()> hook);  // the next spec_begin calls it once its first token is picked
     void set_continuation(int phase);  // thinking budget: 1 phase 1, 2 phase 2 (continues phase 1), 0 neither (Engine::set_continuation)
@@ -70,11 +73,15 @@ public:
     // ids generated so far by a begun slot (streaming); a reference into the engine, valid until its next step / begin
     const std::vector<uint32_t> & spec_tokens(int slot = 0) const;
     uint32_t prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const;  // prompt tokens the slot would reuse
+    // while idle: prefill what the slot's next prompt is expected to begin with (Engine::prefill_ahead); true: prefilled
+    bool prefill_ahead(int slot, const std::vector<uint32_t> & prefix);
     // Drafter target features [P][nf * hidden] (BF16 bits) of every position of `tokens` (prefilled from 0); returns nf.
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats);
     // Prefill tokens at positions [pos, pos + n) without the LM head (KV and recurrent state only); false: unsupported.
     bool prefill_state(const std::vector<uint32_t> & tokens, uint32_t pos);
     void synchronize();
+    // --split layer, ranks > 0: make rank 0's engine calls until it stops (no HTTP server on these ranks)
+    void follow();
     uint32_t layers() const;
     uint32_t hidden_size() const;
     uint32_t vocab_size() const;

@@ -2,6 +2,9 @@
 // Modified in the multi-GPU fork: state resets, prompt-cache copies and pending commits run on each layer's GPU;
 // prefill calibration times this GPU's matrices (TQLLM_SPLIT; see qwen35_split.cpp).
 #include "qwen35_engine.hpp"
+#include "calib_dump.hpp"
+#include "cuda_compat.hpp"
+#include "device_free.hpp"
 
 namespace tqllm {
 namespace qwen35_detail {
@@ -18,7 +21,8 @@ void Qwen35Engine::release_raw() {
     }
     if (hop_ev) cudaEventDestroy(hop_ev);
     hop_ev = nullptr;
-    glru.clear([](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
+    glru.clear([this](cudaGraphExec_t g) { drop_graph(g); });
+    if (stage_dummy_host) cudaFreeHost(stage_dummy_host);
     if (side) cudaStreamDestroy(side);
     if (kv_side) cudaStreamDestroy(kv_side);
     if (solver) cusolverDnDestroy(solver);
@@ -52,8 +56,8 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
     if (id >= cfg.vocab || pos >= context_) throw std::runtime_error("token or context outside configured bounds");
     {  // weights the single-token path cannot read (TQ4, W4A16, ...): one-column verify + commit, the same
        // per-column arithmetic as verify(n) (tqverify then checks verify(n) against this chain)
-        const Mat & probe = layer[0].w_gu.p ? layer[0].w_gu : layer[0].w_down;
-        if (cfg.moe || (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16)) {
+        const Mat & probe = layer[lr_.lo].w_gu.p ? layer[lr_.lo].w_gu : layer[lr_.lo].w_down;
+        if (cfg.moe || tp_ || lora_n || (probe.type != GGML_TQ3_4S && probe.type != GGML_BF16)) {
             if (capture) throw std::runtime_error("hidden-state capture needs TQ3_4S / BF16 weights");
             uint32_t next = 0;
             verify(&id, 1, pos, &next);
@@ -68,6 +72,7 @@ uint32_t Qwen35Engine::step(uint32_t id, uint32_t pos, bool sample, float * capt
     const int qkv_dim = 2 * lkh * dk + lvh * dv, zdim = lvh * dv;
     auto *xp = x.as<bf16>(), *np = norm.as<bf16>(), *rp = resid.as<bf16>(), *mp = mix.as<bf16>();
     if (pos == 0) reset_state(), pc_drop();  // recurrent layers carry state; a new sequence starts from zero
+    qsa.plan.unkeyed(int(pos));  // this path writes no token keys
 
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::tq3_row(embed.p, int(id), xp, H, stream);
     else if (embed.type == GGML_Q6_K) tqllm_cuda::q6k_row(embed.p, int(id), xp, H, stream);
@@ -236,6 +241,7 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
         if (tp) use_dev(r, false);
         for (uint32_t l = 0; l < nl; ++l, h += cb + rb) {
             if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): copy on the state's own device
+            if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
             ck(cudaMemcpyAsync(save ? h : static_cast<void *>(conv_slot(l, cur)), save ? static_cast<void *>(conv_slot(l, cur)) : h,
                                cb, cudaMemcpyDefault, stream));
             ck(cudaMemcpyAsync(save ? h + cb : static_cast<void *>(rec_slot(l, cur)), save ? static_cast<void *>(rec_slot(l, cur)) : h + cb,
@@ -246,12 +252,10 @@ void Qwen35Engine::pc_copy(bool save) {  // recurrent state of slot cur <-> pc_h
 }
 
 uint32_t Qwen35Engine::pc_match(const std::vector<uint32_t> & prompt) {
-    const auto P = uint32_t(prompt.size());
-    auto shared = [&](uint32_t n) {
-        return n > 0 && n < P && n <= pc_seq.size() && std::equal(pc_seq.begin(), pc_seq.begin() + n, prompt.begin());
-    };
-    if (pc_live && shared(uint32_t(pc_seq.size()))) return uint32_t(pc_seq.size());
-    if (!shared(pc_snap)) return 0;
+    // exact: resume only at a kept prefill state; the live state's last tokens came from decode steps, whose numbers
+    // differ from a prefill of the same tokens
+    const uint32_t n = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt);
+    if (!n || (pc_live && n == pc_seq.size())) return n;
     if (pend_k) set_pending(0);  // the live state's deferred path is discarded with it
     pc_copy(false);
     return pc_snap;
@@ -478,6 +482,7 @@ void Qwen35Engine::reset_state() {
     }
     for (uint32_t l = 0; l < conv_state.size() / NSLOT; ++l) {
         if (split_at) use_dev(lin_dev[l]);  // layer split (fork addition): the state lives on its layer's device
+        if (!conv_state[size_t(l) * NSLOT].p) continue;  // another rank's layer (--split layer)
         ck(cudaMemsetAsync(conv_slot(l, 0), 0, conv_bytes, stream));
         ck(cudaMemsetAsync(rec_slot(l, 0), 0, rec_bytes, stream));
     }
@@ -529,6 +534,11 @@ void Qwen35Engine::swap_seq(SeqState & s) {
     std::swap(samp, s.samp);
     std::swap(rng, s.rng);
     std::swap(gen, s.gen);
+    std::swap(pc_live, s.pc_live);
+    std::swap(pc_snap, s.pc_snap);
+    std::swap(pc_seq, s.pc_seq);
+    std::swap(pc_host, s.pc_host);
+    std::swap(pc_conv, s.pc_conv);
 }
 
 void Qwen35Engine::st(const char * name) {
@@ -541,7 +551,7 @@ void Qwen35Engine::st(const char * name) {
     stage_t = t;
 }
 
-void Qwen35Engine::mm_h(const Mat & m, bf16 * out, int n, Basis in) {
+void Qwen35Engine::mm_h_base(const Mat & m, bf16 * out, int n, Basis in) {
     if (m.type == GGML_BF16) {  // small BF16 matrices of W4A16 models (Gated DeltaNet b/a): input is un-rotated
         tqllm_cuda::h_to_bf16(v_xh.as<__half>(), v_xb.as<bf16>(), int64_t(n) * m.cols, stream);
         // fixed-order kernel, not cuBLAS: a column's result must not depend on the verify width
@@ -557,6 +567,7 @@ void Qwen35Engine::mm_h(const Mat & m, bf16 * out, int n, Basis in) {
         for (int c0 = 0; c0 < n; c0 += mc)
             m.fmt->matvec(m, xh + size_t(c0) * m.cols, out + size_t(c0) * m.rows, std::min(mc, n - c0), stream);
     };
+    calib_dump(m, n, in);  // every multi-token product of a quantised matrix reads v_xh here
     switch (path_of(m, n)) {
     case PrefillPath::matvec: m.fmt->matvec(m, xh, out, n, stream); return;
     case PrefillPath::batched: batched(); return;
@@ -566,10 +577,47 @@ void Qwen35Engine::mm_h(const Mat & m, bf16 * out, int n, Basis in) {
         break;
     case PrefillPath::dequant: break;
     }
+    struct Inner { bool & f; explicit Inner(bool & x) : f(x) { f = true; } ~Inner() { f = false; } } inner(cd_inner);
     gemm_rows(m, out, n, m.rows);
 }
 
+void Qwen35Engine::lora_mm(const Mat & m, bf16 * out, int n) {
+    const auto it = lora_of.find(&m);
+    if (it == lora_of.end() || !lora_now()) return;
+    const auto * xh = v_xh.as<__half>();
+    float * sc = d_lscale.as<float>();
+    for (const auto & p : it->second) {
+        const auto * a = p.a.as<float>();
+        const auto * b = p.b.as<float>();
+        if (segs.empty()) {
+            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh, out, n, m.rows, sc + size_t(active) * lora_n + p.adapter,
+                                   lora_t.as<float>(), stream);
+            continue;
+        }
+        for (const auto & g : segs)  // batched verify: each slot's columns with its own request's scale
+            tqllm_cuda::lora_apply(a, b, m.rows, m.cols, p.rank, xh + size_t(g.col0) * m.cols, out + size_t(g.col0) * m.rows,
+                                   g.n, m.rows, sc + size_t(g.slot) * lora_n + p.adapter, lora_t.as<float>(), stream);
+    }
+}
+
+void Qwen35Engine::set_lora(const std::vector<float> & scales) {
+    if (int(scales.size()) != lora_n)
+        throw std::invalid_argument("LoRA: " + std::to_string(scales.size()) + " scales for " + std::to_string(lora_n) + " adapters");
+    if (!lora_n) return;
+    auto & cur = lora_slot[size_t(active)];
+    if (cur == scales) return;
+    // the slot's kept prompt state (prompt cache, prefill ahead) was built with the old scales: not reused
+    if (pend_k) set_pending(0);
+    pc_drop();
+    pc_seq.clear();
+    cur = scales;
+    // pageable source on purpose: staged before cudaMemcpyAsync returns; verifies queued earlier keep the old scales
+    ck(cudaMemcpyAsync(d_lscale.as<float>() + size_t(active) * lora_n, cur.data(), size_t(lora_n) * 4, cudaMemcpyHostToDevice,
+                       stream));
+}
+
 void Qwen35Engine::calibrate_prefill() {
+    struct Pause { bool & f; explicit Pause(bool & x) : f(x) { f = true; } ~Pause() { f = false; } } pause(cd_pause);
     if (!fmt_target || !gemm_w.p || NPF < NGEMM_BLAS) return;
     if (const std::string * v = tqllm::debug_value("prefill_path"); v && *v == "old") return;
     std::map<const WeightFormat *, const Mat *> rep;
@@ -637,8 +685,104 @@ PrefillPath Qwen35Engine::path_of(const Mat & m, int n) const {
     return prefill_path(n, prefill_fmt(m), gemm_w.p != nullptr, verify_width);
 }
 
+// int8 SmoothQuant scales for this gemm_rows call (one s for all parts of a composite, so the activations are quantised
+// once). Per-token int8 activations are where the int8 prefill loses accuracy (the per-row int8 weights do not: the
+// FP16 GEMM on int8-rounded weights alone is at the FP16 KLD); moving the outlier channels into the weights recovers it.
+const float * Qwen35Engine::smooth_aw(const Mat & m) {
+    static const bool off = tqllm::debug_on("i8_nosmooth");
+    if (off || !i8 || !m.p || !m.fmt || m.cols % 16) return nullptr;
+    std::vector<Mat> parts;
+    if (const auto * ps = m.fmt->parts()) parts.assign(ps->begin(), ps->end());
+    else parts.push_back(m);
+    for (const Mat & p : parts) {
+        // rotated formats (TQ3 / TQ4: Walsh-Hadamard input basis) already spread the activation outliers: smoothing buys no
+        // accuracy there (int8 drafter features on TQ_XS unchanged) and costs ~2 % of prefill
+        if (p.fmt->basis() != Basis::Plain) return nullptr;
+        // a format with its own int8 reconstruct but no column-scaled one keeps it, unsmoothed
+        if (p.fmt->has_dequant_i8() && !p.fmt->has_dequant_i8_cm()) return nullptr;
+    }
+    auto it = sm_aw.find(m.p);
+    if (it == sm_aw.end()) {  // the weights' column abs-max, once per matrix (at load: smooth_prebuild)
+        Buf aw(size_t(m.cols) * 4);
+        ck(cudaMemsetAsync(aw.p, 0, size_t(m.cols) * 4, stream));
+        for (const Mat & p : parts) {
+            p.fmt->dequant_h(p, gemm_w.as<__half>(), stream);
+            tqllm_cuda::int8_colmax_h(gemm_w.as<__half>(), p.rows, p.cols, p.cols, aw.as<float>(), stream);
+        }
+        it = sm_aw.emplace(m.p, std::move(aw)).first;
+    }
+    return it->second.as<float>();
+}
+
+void Qwen35Engine::smooth_prebuild() {
+    if (!i8) return;
+    for (const auto & L : layer)
+        for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
+                              &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
+            smooth_aw(*m);
+    sync_ck();
+}
+
+// int8 SmoothQuant scales for this gemm_rows call (one s for all parts of a composite, so the activations are quantised
+// once). Per-token int8 activations are where the int8 prefill loses accuracy (the per-row int8 weights do not: the
+// FP16 GEMM on int8-rounded weights alone is at the FP16 KLD); moving the outlier channels into the weights recovers it.
+bool Qwen35Engine::smooth_setup(const Mat & m, int n) {
+    static const float alpha = [] {
+        const std::string * v = tqllm::debug_value("i8_alpha");
+        return v ? std::stof(*v) : 0.75f;
+    }();
+    if (!i8 || gemm_pad_rows(n, NBUF) < 1024) return false;
+    const float * aw = smooth_aw(m);
+    if (!aw) return false;
+    ck(cudaMemsetAsync(sm_ax.p, 0, size_t(m.cols) * 4, stream));
+    tqllm_cuda::int8_colmax_h(v_xh.as<__half>(), n, m.cols, m.cols, sm_ax.as<float>(), stream);
+    tqllm_cuda::int8_smooth_scales(sm_ax.as<float>(), aw, sm_s.as<float>(), m.cols, alpha, stream);
+    return true;
+}
+
+void Qwen35Engine::calib_dump(const Mat & m, int n, Basis in) {
+    static const std::string * v = tqllm::debug_value("calib_dump");
+    if (!v || cd_pause || n <= 1) return;  // not the load-time calibration (synthetic inputs), not decode
+    static const CalibDumpSpec spec = parse_calib_dump(*v);
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) return;  // no host copy in a graph
+    const char * role = nullptr;
+    int L = -1;
+    for (int l : spec.layers) {
+        if (l >= int(layer.size())) break;
+        const Layer & Y = layer[size_t(l)];
+        // the first matrix that reads each input (fused at load, or the first of the separate ones)
+        const Mat * mix = Y.w_mix.p ? &Y.w_mix : Y.wq.p ? &Y.wq : &Y.w_qkv;
+        const Mat * gu = Y.w_gu.p ? &Y.w_gu : &Y.w_gate;
+        const Mat * out = Y.wo.p ? &Y.wo : &Y.w_out;
+        role = &m == mix ? "mix" : &m == gu ? "gu" : &m == &Y.w_down ? "down" : &m == out ? "out" : nullptr;
+        if (role) { L = l; break; }
+    }
+    if (!role) return;
+    const std::string key = spec.dir + "/L" + std::to_string(L) + "_" + role;
+    std::vector<uint16_t> x(size_t(n) * size_t(m.cols));
+    sync_ck();
+    ck(cudaMemcpy(x.data(), v_xh.p, x.size() * 2, cudaMemcpyDeviceToHost));
+    long long & tok = cd_tok[key];
+    FILE * f = std::fopen((key + ".x16").c_str(), tok ? "ab" : "wb");  // the first write of a run starts the file afresh
+    if (!f) throw std::runtime_error("calib_dump: cannot write " + key + ".x16");
+    const bool ok = std::fwrite(x.data(), 2, x.size(), f) == x.size();
+    std::fclose(f);
+    if (!ok) throw std::runtime_error("calib_dump: short write to " + key + ".x16 (disk full?)");
+    if (!tok) std::fprintf(stderr, "calib_dump: %s.x16 (K %d, %s)\n", key.c_str(), m.cols, m.fmt ? m.fmt->name() : "?");
+    tok += n;
+    const char * bn = in == Basis::Tq4Rot128 ? "tq4rot128" : in == Basis::Tq3Rot32 ? "tq3rot32" : "plain";
+    if (FILE * j = std::fopen((key + ".json").c_str(), "w")) {
+        std::fprintf(j, "{\"k\": %d, \"tokens\": %lld, \"basis\": \"%s\", \"format\": \"%s\"}\n", m.cols, tok, bn,
+                     m.fmt ? m.fmt->name() : "?");
+        std::fclose(j);
+    }
+}
+
 void Qwen35Engine::gemm_rows(const Mat & m, bf16 * out, int n, int ldo) {
+    if (!cd_inner) calib_dump(m, n, m.fmt->basis());  // direct callers (fused GDN mix, FFN gate / up straight to SwiGLU)
     fp8_x_ready = fp8_used = i8_used = false;
+    sm_on = smooth_setup(m, n);
     if (const auto * ps = m.fmt->parts()) {  // composite: each part's GEMM into its own row block
         int r0 = 0;
         for (const auto & p : *ps) {
@@ -679,14 +823,15 @@ void Qwen35Engine::gemm_c_rows(const Mat & m, int n, int ldo, int r_off) {
         // Formats that can quantise their weights to int8 themselves (X3's straight-to-int8 reconstruct with
         // load-time scales) skip the FP16 round trip and the per-chunk weight quantise pass entirely.
         float* sw = fp8_sw.as<float>() + r_off;
-        const bool preq = m.fmt->dequant_i8(m, i8->w8(), sw, stream);
+        const float * cm = sm_on ? sm_s.as<float>() : nullptr;  // SmoothQuant column scales (smooth_setup)
+        const bool preq = cm ? m.fmt->dequant_i8_cm(m, cm, i8->w8(), sw, stream) : m.fmt->dequant_i8(m, i8->w8(), sw, stream);
         if (!preq) m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
         if (!fp8_x_ready) {
-            i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream);
+            i8->quant_x(v_xh.as<__half>(), m.cols, np, m.cols, stream, cm);
             fp8_x_ready = true;
         }
         if (preq) i8->gemm_prequant(m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, stream);
-        else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream);
+        else i8->gemm(gemm_w.as<__half>(), m.rows, m.cols, np, gemm_c.as<int32_t>() + r_off, ldo, sw, stream, cm);
         i8_used = true;
         return;
     }
@@ -828,6 +973,10 @@ void Qwen35Engine::kv_stage_window(uint32_t pos, int n) {
     if (kv_cmp) ring_used = std::min(kRing, ring_used + n), ring_end = int((pos + uint32_t(n)) % kRing);
     const int64_t b[2] = {int64_t(kv_pool->staged_bytes(true)), int64_t(kv_pool->staged_bytes(false))};
     ck(cudaMemcpyAsync(d_stage_bytes.p, b, sizeof(b), cudaMemcpyHostToDevice, stream));
+    if (qsa.tail_off.p) {  // pageable source: staged before the call returns
+        const int64_t g = int64_t(kv_mem->granule()), o[2] = {std::max<int64_t>(0, b[0] - g), std::max<int64_t>(0, b[1] - g)};
+        ck(cudaMemcpyAsync(qsa.tail_off.p, o, sizeof(o), cudaMemcpyHostToDevice, stream));
+    }
 }
 
 void Qwen35Engine::kv_track(uint32_t pos, int n) {
@@ -837,13 +986,116 @@ void Qwen35Engine::kv_track(uint32_t pos, int n) {
         ring_used = std::min(kRing, ring_used + n), ring_end = int((pos + uint32_t(n)) % kRing);
     }
     kv_end = pos + uint32_t(n);
+    if (qsa.on) qsa_plan(pos, n);
+}
+
+void Qwen35Engine::qsa_plan(uint32_t pos, int n) {
+    // token keys are written for one sequence at column 0
+    const bool keys = segs.empty() || (segs.size() == 1 && segs[0].col0 == 0);
+    const auto step = qsa.plan.write(int(pos), n, keys, n <= NVER && !mm_chunk && gen.rdelta == 0, qsa.from);
+    for (auto & q : qsa.layer)
+        tqllm_cuda::qsa27_pool_blocks(static_cast<const __half *>(q.tok->p), q.block_norm, q.blocks.as<float>(), step.pool_first,
+                                      step.pool_count, cfg.theta, cfg.eps, stream);
+    qsa.mode = step.mode;
+}
+
+void Qwen35Engine::qsa_index(const Layer & L, uint32_t attn_i, int n, const int * dpos, const int * dep) {
+    using namespace tqllm_cuda;
+    const auto & q = qsa.layer[attn_i];
+    const int H = int(cfg.hidden);
+    auto * xu = qsa.xu.as<__half>();
+    auto * P = qsa.proj.as<float>();
+    auto * tok = static_cast<__half *>(q.tok->p);
+    qsa.cur = nullptr;
+    // the indexer reads the layer's normalised input in the model's own basis (weight formats rotate inside their products)
+    norm_h(v_x.as<bf16>(), L.in_norm, v_px.as<float>(), cfg.eps, xu, H, n, stream);
+    if (n > NVER) {  // prefill chunk: token keys only, one GEMM
+        const float alpha = 1.f, beta = 0.f;
+        cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, kQsa27Dim, n, H, &alpha, q.w + size_t(kQsa27Heads) * kQsa27Dim * H,
+                        CUDA_R_16F, H, xu, CUDA_R_16F, H, &beta, P, CUDA_R_32F, kQsa27Dim, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        qsa27_token_keys(P, kQsa27Dim, 0, q.k_norm, tok, dpos, n, cfg.eps, stream);
+        return;
+    }
+    if (!qsa.mode) {
+        qsa27_project(xu, q.w, P, kQsa27Heads * kQsa27Dim, kQsa27Dim, n, H, stream);
+        qsa27_token_keys(P, kQsa27Dim, 0, q.k_norm, tok, dpos, n, cfg.eps, stream);
+        return;
+    }
+    qsa27_project(xu, q.w, P, 0, kQsa27Rows, n, H, stream);
+    qsa27_token_keys(P, kQsa27Rows, kQsa27Heads * kQsa27Dim, q.k_norm, tok, dpos, n, cfg.eps, stream);
+    qsa27_queries(P, kQsa27Rows, q.q_norm, qsa.q.as<float>(), dpos, dep, n, cfg.theta, cfg.eps, stream);
+    qsa27_select(qsa.q.as<float>(), q.blocks.as<float>(), qsa.bits.as<uint32_t>(), qsa.sel.as<int32_t>(), dpos, dep, n,
+                 qsa.from, qsa.max_blocks, stream);
+    qsa.cur = qsa.sel.as<int32_t>();
+    if (kv_staged && qsa.mode == 1)  // every row sparse: only the picked old positions come back from host memory, once each
+        qsa27_stage_selected(qsa.cur, n, dpos, dep, qsa.from, kv_pool->host_copy(int(attn_i), true), kv_pool->host_copy(int(attn_i), false),
+                             key_cache[attn_i].p, value_cache[attn_i].p, d_stage_bytes.as<int64_t>(), int(kv_row_bytes(true)),
+                             int(kv_row_bytes(false)), qsa.mark.as<int>(), qsa.mark.as<int>() + qsa.max_blocks, stream);
+}
+
+// TQLLM_DEBUG=qsa_mass (eager verify blocks): share of row 0's dense attention on its selected keys, per layer
+void Qwen35Engine::qsa_mass_report(uint32_t attn_i) {
+    const int nh = int(cfg.heads), kvh = int(cfg.kvheads);
+    tqllm_cuda::attention_qsa_mass(v_q.as<bf16>(), key_cache[attn_i].as<bf16>(), qsa.cur, v_pos.as<int>() + 1, nh, kvh,
+                                   1.f / std::sqrt(float(cfg.head_dim)), qsa.mass.as<float>(), stream);
+    std::vector<float> m(size_t(nh) * 3);
+    int pos[2] = {0, 0};
+    ck(cudaMemcpyAsync(m.data(), qsa.mass.p, m.size() * 4, cudaMemcpyDeviceToHost, stream));
+    ck(cudaMemcpyAsync(pos, v_pos.p, sizeof(pos), cudaMemcpyDeviceToHost, stream));
+    ck(cudaStreamSynchronize(stream));
+    double sel = 0, cache = 0, tail = 0, worst = 1;
+    for (int h = 0; h < nh; ++h) {
+        const double s = m[size_t(h) * 3], r = m[size_t(h) * 3 + 1], t = m[size_t(h) * 3 + 2], all = s + r + t;
+        sel += s / all / nh, cache += (s + r) / all / nh, tail += t / all / nh;
+        if (s + r > 0) worst = std::min(worst, s / (s + r));
+    }
+    const int split = tqllm_cuda::qsa27_split_point(pos[0]);
+    std::fprintf(stderr, "qsa_mass pos %d layer %u: cache part %.4f of the attention, selected keys hold %.4f of it "
+                 "(worst head %.4f; uniform %.4f), tail %.4f\n", pos[0], attn_i, cache, cache > 0 ? sel / cache : 0.0, worst,
+                 split > 0 ? double(tqllm_cuda::kQsa27Pick * tqllm_cuda::kQsa27Block) / split : 0.0, tail);
+    if (attn_i + 1 == qsa.layer.size()) --qsa.mass_left;
+}
+
+// [K bytes, V bytes, K offset, V offset] each attention layer stages host -> staging this step: the compacted prefix is not
+// staged; a block of sparse rows reads old positions from host memory, so only the last evicted granule (rows that straddle
+// the boundary are read from the staging copy) comes back
+std::array<int64_t, 4> Qwen35Engine::stage_plan() const {
+    std::array<int64_t, 4> s{int64_t(kv_pool->staged_bytes(true)), int64_t(kv_pool->staged_bytes(false)), 0, 0};
+    if (kv_cmp) s[2] = cmp_pos * int64_t(kv_row_bytes(true)), s[3] = cmp_pos * int64_t(kv_row_bytes(false));
+    else if (qsa.tail_off.p && qsa.mode == 1) {
+        const int64_t g = int64_t(kv_mem->granule());
+        s[2] = std::max<int64_t>(0, s[0] - g), s[3] = std::max<int64_t>(0, s[1] - g);
+    }
+    return s;
+}
+void Qwen35Engine::stage_copy(const std::array<int64_t, 4> & s, uint32_t a, bool key, void ** dst, const void ** src, size_t * n) const {
+    const int64_t off = s[key ? 2 : 3], end = s[key ? 0 : 1];
+    if (end > off) {
+        *src = static_cast<const char *>(kv_pool->host_copy(int(a), key)) + off;
+        *dst = static_cast<char *>(key ? key_cache[a].p : value_cache[a].p) + off;
+        *n = size_t(end - off);
+    } else *src = stage_dummy_host, *dst = stage_dummy_dev.p, *n = 16;
 }
 
 void Qwen35Engine::kv_prefetch(uint32_t a) {  // attention layer a's old positions host -> its staging buffer (parity a & 1)
-    const auto * nb = d_stage_bytes.as<int64_t>();
-    const auto * off = kv_cmp ? d_stage_off.as<int64_t>() : nullptr;  // the compacted prefix is not staged
-    tqllm_cuda::kv_stage_copy(kv_pool->host_copy(int(a), true), key_cache[a].p, nb, kv_blocks, kv_side, off);
-    tqllm_cuda::kv_stage_copy(kv_pool->host_copy(int(a), false), value_cache[a].p, nb + 1, kv_blocks, kv_side, off ? off + 1 : nullptr);
+    // by the copy engine (in a captured verify graph: memcpy nodes, kept and updated per plan): no kernel reads host memory
+    const auto s = stage_plan();
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    ck(cudaStreamIsCapturing(kv_side, &cs));
+    const bool capturing = cs != cudaStreamCaptureStatusNone;
+    for (const bool key : {true, false}) {
+        void * d = nullptr; const void * src = nullptr; size_t n = 0;
+        stage_copy(s, a, key, &d, &src, &n);
+        if (!capturing && src == stage_dummy_host) continue;
+        ck(cudaMemcpyAsync(d, src, n, cudaMemcpyHostToDevice, kv_side));
+        if (capturing) {
+            const cudaGraphNode_t * deps = nullptr; size_t nd = 0;
+            ck(tqllm_cuda::stream_capture_deps(kv_side, &cs, &deps, &nd));
+            if (nd != 1) throw std::runtime_error("KV host tail: staging copy node not found in the capture");
+            stage_capture.push_back({deps[0], a, key});
+        }
+    }
     ck(cudaEventRecord(kv_ready[a & 1], kv_side));
 }
 
@@ -1148,6 +1400,9 @@ bool Qwen35Engine::tp_head(int n) {
     return true;
 }
 
+// With the embeddings in host memory (fit, 12/16 GB cards) this is a deliberate zero-copy gather: n rows (a few KB) whose
+// ids exist only on the device inside captured verify / draft graphs; bulk host data goes by the copy engine
+// (zero_copy_guard.hpp)
 void Qwen35Engine::embed_multi(const uint32_t * dtok, int n, bf16 * Y) {
     const int H = int(cfg.hidden);
     if (embed.type == GGML_TQ3_4S) tqllm_cuda::embed_multi_tq3(embed.p, dtok, n, Y, H, stream);
@@ -1519,6 +1774,150 @@ void Qwen35Engine::flush_pending() {
     use_dev(1);
     cur = (cur + 1) % NSLOT;
     set_pending(0);
+}
+
+
+void Qwen35Engine::split_enter(bf16 * X, int n) {
+    const int from = tp_->rank() - 1;
+    const size_t H = cfg.hidden, nf = dfl.present ? dfl.target_ids.size() : 0;
+    tp_->recv(X, size_t(n) * H * 2, from, stream);
+    tp_->recv(v_px.p, size_t(n) * (H / 256) * 4, from, stream);
+    if (nf) tp_->recv(v_feat.p, size_t(n) * nf * H * 2, from, stream);
+}
+
+void Qwen35Engine::split_leave(bf16 * X, int n) {
+    if (!tp_) return;
+    const int last = tp_->world() - 1;
+    const size_t H = cfg.hidden, nf = dfl.present ? dfl.target_ids.size() : 0;
+    const size_t xb = size_t(n) * H * 2, pb = size_t(n) * (H / 256) * 4, fb = size_t(n) * nf * H * 2;
+    if (tp_->rank() < last) {
+        tp_->send(X, xb, tp_->rank() + 1, stream);
+        tp_->send(v_px.p, pb, tp_->rank() + 1, stream);
+        if (fb) tp_->send(v_feat.p, fb, tp_->rank() + 1, stream);
+    }
+    tp_->broadcast(X, xb, last, stream);
+    tp_->broadcast(v_px.p, pb, last, stream);
+    if (fb) tp_->broadcast(v_feat.p, fb, last, stream);
+}
+
+int Qwen35Engine::split_min(int v) {
+    if (!tp_) return v;
+    const int w = tp_->world();
+    Buf one(sizeof(int)), all(size_t(w) * sizeof(int));
+    ck(cudaMemcpyAsync(one.p, &v, sizeof(int), cudaMemcpyHostToDevice, stream));
+    tp_->all_gather(one.p, all.p, sizeof(int), stream);
+    std::vector<int> h(static_cast<size_t>(w));
+    ck(cudaMemcpyAsync(h.data(), all.p, h.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    sync_ck();
+    return *std::min_element(h.begin(), h.end());
+}
+
+
+void Qwen35Engine::park_init(int slots) {
+    if (!pc_on || slots < 2 || opt.prompt_park == 0) return;
+    // spaces are sized for a typical kept conversation (half the slot's context; each space's buffer is allocated to
+    // fit when it is used): sized for the full context, 16 agents of 17K tokens got 13 spaces on a GB10 and 3 lost theirs
+    const uint32_t typical = std::max<uint32_t>(context_ / 2, 1);
+    size_t per = size_t(typical) * size_t(kv_row_bytes(true) + kv_row_bytes(false));  // one conversation's KV, this rank
+    per = per * size_t(std::count_if(key_cache.begin(), key_cache.end(), [](const KvRef & k) { return k.p != nullptr; }));
+    per += (conv_state.size() / NSLOT) * (conv_bytes() + rec_bytes());
+    per += 2 * dfl_park_bytes(typical) * dfl_kc.size();
+    int n = opt.prompt_park;
+    if (n < 0) {
+        const size_t host = tqllm::host_ram_bytes();  // physical RAM capped by the container limit (portable: no sysconf)
+        int dev = 0, integrated = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+        const size_t budget = integrated ? host / 4 : std::min(host / 4, size_t(16) << 30);
+        n = int(std::min<size_t>(size_t(4) * size_t(slots), per ? budget / per : 0));
+    }
+    if (n <= 0) return;
+    park_ = std::make_unique<PromptPark>(n);
+    park_sp_.resize(size_t(n));
+    std::fprintf(stderr, "tqllm: prompt park: %d kept conversations outside the slots (up to %.2f GB host memory)\n", n,
+                 double(per) * n / 1e9);
+}
+
+uint32_t Qwen35Engine::park_best(const std::vector<uint32_t> & prompt, int * where) const {
+    uint32_t best = 0;
+    if (where) *where = -1;
+    if (!park_) return 0;
+    for (size_t i = 0; i < park_sp_.size(); ++i) {
+        const auto & sp = park_sp_[i];
+        if (!sp.snap || park_->where(sp.conv) != int(i)) continue;
+        if (lora_n && sp.lora != lora_slot[size_t(active)]) continue;  // built with other LoRA scales
+        const uint32_t n = pc_shared(sp.seq, false, sp.snap, prompt);
+        if (n > best) { best = n; if (where) *where = int(i); }
+    }
+    return best;
+}
+
+// the active slot's kept state -> a park space (the slot is about to hold another conversation)
+void Qwen35Engine::park_out() {
+    if (!park_ || !pc_conv || !pc_snap || !pc_host || pc_seq.size() < pc_snap) return;
+    const int s = park_->park(pc_conv);
+    if (s < 0) return;
+    auto & sp = park_sp_[size_t(s)];
+    const size_t kr = size_t(kv_row_bytes(true)) * pc_snap, vr = size_t(kv_row_bytes(false)) * pc_snap;
+    const size_t db = dfl_park_bytes(pc_snap);
+    size_t need = 2 * db * dfl_kc.size();
+    for (const auto & k : key_cache) need += k.p ? kr + vr : 0;
+    if (sp.kv_cap < need) sp.kv = std::make_unique<HostBuf>(need), sp.kv_cap = need;
+    auto * h = static_cast<char *>(sp.kv->p);
+    for (size_t a = 0; a < key_cache.size(); ++a) {
+        if (!key_cache[a].p) continue;
+        ck(cudaMemcpyAsync(h, key_cache[a].p, kr, cudaMemcpyDeviceToHost, stream)), h += kr;
+        ck(cudaMemcpyAsync(h, value_cache[a].p, vr, cudaMemcpyDeviceToHost, stream)), h += vr;
+    }
+    for (size_t l = 0; db && l < dfl_kc.size(); ++l) {  // the drafter's cache, so a resumed conversation drafts as before
+        ck(cudaMemcpyAsync(h, dfl_kc[l].p, db, cudaMemcpyDeviceToHost, stream)), h += db;
+        ck(cudaMemcpyAsync(h, dfl_vc[l].p, db, cudaMemcpyDeviceToHost, stream)), h += db;
+    }
+    sync_ck();
+    sp.conv = pc_conv;
+    sp.seq.assign(pc_seq.begin(), pc_seq.begin() + pc_snap);
+    sp.snap = pc_snap;
+    sp.lora = lora_n ? lora_slot[size_t(active)] : std::vector<float>();
+    sp.state = std::move(pc_host);
+    pc_drop();
+    pc_conv = 0;
+}
+
+// before a request on the active slot: if a parked conversation shares more of the prompt than the slot's own, the slot's
+// state is parked and that one comes back (KV rows; its recurrent state at snap is restored by pc_match as usual)
+void Qwen35Engine::park_swap(const std::vector<uint32_t> & prompt) {
+    if (!park_) return;
+    const uint32_t own = pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt);
+    int s = -1;
+    const uint32_t best = park_best(prompt, &s);
+    if (s < 0 || best <= own) {
+        if (!own) park_out();  // a new conversation takes this slot: keep the one it held
+        return;
+    }
+    park_out();
+    auto & sp = park_sp_[size_t(s)];
+    const size_t kr = size_t(kv_row_bytes(true)) * sp.snap, vr = size_t(kv_row_bytes(false)) * sp.snap;
+    const auto * h = static_cast<const char *>(sp.kv->p);
+    if (pend_k) set_pending(0);
+    qsa.plan.unkeyed(0);  // token keys are not parked: the resumed rows stay dense
+    for (size_t a = 0; a < key_cache.size(); ++a) {
+        if (!key_cache[a].p) continue;
+        ck(cudaMemcpyAsync(key_cache[a].p, h, kr, cudaMemcpyHostToDevice, stream)), h += kr;
+        ck(cudaMemcpyAsync(value_cache[a].p, h, vr, cudaMemcpyHostToDevice, stream)), h += vr;
+    }
+    const size_t db = dfl_park_bytes(sp.snap);
+    for (size_t l = 0; db && l < dfl_kc.size(); ++l) {
+        ck(cudaMemcpyAsync(dfl_kc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
+        ck(cudaMemcpyAsync(dfl_vc[l].p, h, db, cudaMemcpyHostToDevice, stream)), h += db;
+    }
+    sync_ck();
+    pc_seq = std::move(sp.seq);
+    pc_snap = sp.snap;
+    pc_live = false;
+    pc_host = std::move(sp.state);
+    pc_conv = sp.conv;
+    sp.snap = 0;
+    park_->pickup(sp.conv);
 }
 
 }  // namespace qwen35_detail

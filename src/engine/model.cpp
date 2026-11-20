@@ -37,6 +37,8 @@ Model::Model(const std::string & w, const std::string & t, uint32_t c, int slots
     }
     const std::string mode_note = check_mode(p, o, *engine, slots);
     impl_->e = engine->make(w, t, c, slots, o);
+    if (!o.lora.empty() && impl_->e->lora_count() != int(o.lora.size()))
+        throw std::invalid_argument("--lora: this model's engine does not support runtime LoRA adapters");
     auto & note = impl_->e->note;
     if (!mode_note.empty()) note = note.empty() ? mode_note : mode_note + " " + note;
 }
@@ -46,6 +48,7 @@ Model & Model::operator=(Model &&) noexcept = default;
 
 uint32_t Model::forward(uint32_t token, uint32_t pos, bool sample) { return impl_->e->step(token, pos, sample, nullptr); }
 void Model::synchronize() { impl_->e->synchronize(); }
+void Model::follow() { impl_->e->follow(); }
 bool Model::prefill_state(const std::vector<uint32_t> & tokens, uint32_t pos) { return impl_->e->prefill_state(tokens, pos); }
 int Model::slots() const { return impl_->e->slots(); }
 bool Model::incremental() const { return impl_->e->incremental(); }
@@ -69,6 +72,7 @@ void Model::spec_step(const std::vector<int> & slots, std::vector<char> & done) 
 std::vector<uint32_t> Model::spec_finish(uint64_t * stats) { return impl_->e->spec_finish(stats); }
 const std::vector<uint32_t> & Model::spec_tokens(int slot) const { return impl_->e->spec_tokens(slot); }
 uint32_t Model::prefix_reuse(int slot, const std::vector<uint32_t> & prompt) const { return impl_->e->prefix_reuse(slot, prompt); }
+bool Model::prefill_ahead(int slot, const std::vector<uint32_t> & prefix) { return impl_->e->prefill_ahead(slot, prefix); }
 int Model::drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) {
     return impl_->e->drafter_features(tokens, feats);
 }
@@ -80,6 +84,8 @@ void Model::commit(int accepted) { impl_->e->commit(accepted); }
 void Model::spec_abort(int slot) { impl_->e->spec_abort(slot); }
 const float * Model::verify_logits() const { return impl_->e->verify_logits(); }
 void Model::set_full_logits(bool on) { impl_->e->set_full_logits(on); }
+int Model::lora_count() const { return impl_->e->lora_count(); }
+void Model::set_lora(const std::vector<float> & scales) { impl_->e->set_lora(scales); }
 void Model::set_ignore_eos(bool on) { impl_->e->set_ignore_eos(on); }
 void Model::set_first_token_hook(std::function<void()> hook) { impl_->e->set_first_token_hook(std::move(hook)); }
 void Model::set_continuation(int phase) { impl_->e->set_continuation(phase); }

@@ -2,6 +2,7 @@
 
 #include "flags_gen.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +100,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
             throw std::invalid_argument("--prefill-borrow must be all, auto or a bank count");
         o.prefill_borrow = v;
     }
+    else if (a == "--embed-host" || a == "--head-host") {  // memory placement the fit otherwise picks only when short
+        const std::string v = value();
+        if (v != "on" && v != "off") throw std::invalid_argument(a + " must be on or off");
+        (a == "--embed-host" ? o.embed_host : o.head_host) = v == "on";
+    }
     else if (a == "--prefill-int8") {
         const std::string v = value();
         if (v != "on" && v != "off") throw std::invalid_argument("--prefill-int8 must be on or off");
@@ -114,6 +120,7 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
         if (v != "on" && v != "off") throw std::invalid_argument("--prompt-cache must be on or off");
         o.prompt_cache = v == "on";
     }
+    else if (a == "--prompt-park") o.prompt_park = std::stoi(value());
     else if (a == "--rope-scaling") o.rope.type = value();
     else if (a == "--rope-scale") o.rope.factor = std::stof(value());
     else if (a == "--yarn-orig-ctx") o.rope.orig_ctx = std::stol(value());
@@ -124,10 +131,24 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
     else if (a == "-md" || a == "--model-draft") o.draft_model = value();
     else if (a == "--tp-rank") o.tp_rank = std::stoi(value()), o.tp_world = 2;
     else if (a == "--tp-peer") o.tp_peer = value();
+    else if (a == "--split") {
+        const std::string v = value();
+        if (v == "layer") o.split_layers = true;
+        else if (v == "experts") o.split_experts = true;
+        else throw std::invalid_argument("--split: layer or experts");
+    }
+    else if (a == "--split-at") o.split_at = std::stoi(value());
     else if (a == "--tp-port") o.tp_port = std::stoi(value());
     else if (a == "--plugin") o.plugins.push_back(value());
     else if (a == "--hot-map") o.hot_map = value();
     else if (a == "--draft-vocab") o.draft_vocab = value();
+    else if (a == "--lora") o.lora.push_back(value()), o.lora_scaled.push_back(std::nanf(""));
+    else if (a == "--lora-scaled") {
+        const std::string f = value();
+        o.lora.push_back(f), o.lora_scaled.push_back(std::stof(value()));
+    }
+    else if (a == "--lora-scale") o.lora_scale = std::stof(value());
+    else if (a == "--lora-init-without-apply") o.lora_init_without_apply = true;
     else if (a == "--mtp") o.native_mtp = true;
     else if (a == "--draft-window") o.draft_window = count(0);
     else if (a == "--draft-retrieve") o.draft_retrieve = count(0);
@@ -159,10 +180,11 @@ bool parse_engine_option(int argc, char ** argv, int & i, EngineOptions & o) {
 }
 
 const char * engine_options_usage() {
-    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
-           "          [--qsa-from N|off (QSA models: sparse attention past N keys; default the file's, else 49152)]\n"
+    return "  engine: [--exact on|off (on)] [-ctk K] [-ctv V] (KV codecs; llama.cpp names q8_0 / q4_0 / tq3_0 too) | [--kv FORMAT] (--list-kv) [--kv-store flat] [--kv-host N [--kv-stage on|off] [--kv-compact R [--kv-compact-at idle|turn]]] [--embed-host on|off] [--head-host on|off] [--prompt-cache on|off] [--prefill-fp8 on|off] [--prefill-int8 on|off]\n"
+           "          [--qsa-from N|off (QSA models: sparse attention past N keys; Metal default the file's, else 49152; CUDA off unless given)]\n"
            "          [--plugin PATH (repeatable: weight-format plugin, CUDA builds)]\n"
            "          [--rope-scaling none|linear|yarn --rope-scale F [--yarn-orig-ctx N]] (context past training, llama.cpp names)\n"
+           "          [--lora FILE | --lora-scaled FILE S (repeatable: runtime LoRA adapters, ids 0, 1, ...)] [--lora-scale S (1)] [--lora-init-without-apply] (a request's \"lora\": [{\"id\": 0, \"scale\": 1}] overrides)\n"
            "          [-md DRAFTER.gguf] [--draft-vocab FILE] [--draft-window N] [--draft-retrieve C] [--no-tree] [--lookup L [--lookup-first K]] [-ub N] [-ncmoe N (first N layers\' MoE experts in host memory)] [--moe-host-mb M|auto [--moe-profile FILE] (least-routed experts in host memory) [--moe-cache-mb C|auto (VRAM cache of recently used host experts, default auto)]]\n"
            "          Flash-Next prefill: [--prefill-chunk N (16384)] [--prefill-sub N (2048)] [--prefill-stage N (192)] [--prefill-reserve-mb N (1000)]\n"
            "          [--prefill-arena-mb N (3800)] [--dense-cache-mb N (600)] [--prefill-borrow auto|all|N (auto)]\n"

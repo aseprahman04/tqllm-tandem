@@ -3,6 +3,156 @@
 All notable changes to tqLLM. Images: `ytan2000/tqllm:<version>` and `ghcr.io/turbo-tan/tqllm:<version>` (multi-arch:
 x86-64 RTX 30 / 40 / 50 and arm64 GB10 / DGX Spark). `latest` is the newest release.
 
+## Unreleased
+
+### Fixed
+- Qwen3.8-27B with K/V in system RAM (`-fit on` moved part of a long conversation to the host, e.g. 16 GB cards with
+  `-ctk q8_0 -ctv q8_0`): a long prompt after a shorter one on the same server failed with "generation failed: invalid
+  argument". The decode graph recorded while nothing was in host memory could not be updated to read the host part; the
+  two cases now keep separate graphs.
+
+### Docs
+- [Choose a setup](docs/guides/choose-your-setup.md): which model, drafter and flags for 16 / 24 / 32 GB cards and GB10,
+  with measured speeds (new RTX 5060 Ti 16 GB rows: TQ_XS / TQ_M + DFlash2 with tq3 K/V, QSA at 123K / 200K).
+
+### Added
+- Runtime LoRA adapters (llama.cpp names): `--lora FILE` (repeatable), `--lora-scaled FILE S`, `--lora-scale S`,
+  `--lora-init-without-apply`; a request picks its scales with `"lora": [{"id": 0, "scale": 1.0}]`, and
+  `GET` / `POST /lora-adapters` list and change the defaults. Qwen3.5 / 3.8 dense GGUF, `attn_output` / `ssm_out` /
+  `ffn_down` adapters (e.g. Heretic abliteration exports), plain or TQ rotated weight bases. The base weights are not
+  changed: a request at scale 0 gives the same tokens as serving without `--lora`. Qwen3.8-27B Q4_K_M + a rank-3 abliteration
+  adapter, RTX 3090: refusals 100/100 at scale 0, 13/100 at scale 1 (the same adapter merged into the weights before
+  quantising: 15/100); decode with DFlash2 at temperature 0.7 is 130.0 tok/s on vs 132.1 off, 8K prefill 1561 vs 1669 tok/s.
+- `--embed-host on|off` and `--head-host on|off`: keep the token embeddings / the int8 LM head in system RAM even when
+  the model fits, to free VRAM for context (until now only the memory fit chose this, when the card was short).
+  Qwen3.8-27B IQ4_XS on an RTX 3090, both on: 1.98 GB less VRAM, decode 141.7 -> 141.2 tok/s and 8K prefill
+  2005 -> 1995 tok/s with a DFlash2 drafter (noise), greedy replies identical.
+- TQV-12 weight format (GGUF type 305 with `tqllm.tqv.codebook = tqv12-v1`): TQ4's size (4.125 bits per weight) and
+  rotated basis, 4 weights per 12-bit index into a 4096-point int8 codebook, decode matvec 1-16 columns, native prefill
+  GEMM, FP16 / int8 prefill. No file is published: `tools/convert/qwen35/tqv12_quant.py` makes one from the BF16
+  weights, a stock TQ file as layout template and calibration text with vector GPTQ (docs/guides/tqv12.md; about 2 h on
+  an RTX 3090), using the new `TQLLM_DEBUG=calib_dump` capture. Qwen3.8-27B, same size as TQ_L (14.72 GB): KLD against
+  BF16 0.0184 vs TQ_L 0.0245 (WikiText-2, 8 x 2048 tokens); GSM8K 250 (low effort, greedy) 242 vs 245 (paired p = 0.45).
+- TQT weight format (GGUF type 306 with `tqllm.tqt.code = tqt-c2-v1`): TQ4's size (4.125 bits per weight) and rotated
+  basis, each 128-weight block a tail-biting bitshift-trellis code (QTIP-style, 18-bit window, table-free code), decode
+  matvec 1-16 columns, native prefill GEMM, FP16 / int8 prefill. Made with `tqv12_quant.py skeleton --format tqt` and a
+  CUDA Viterbi encoder (docs/guides/tqt.md; about 5 h 40 min on an RTX 3090). Qwen3.8-27B, 14.72 GB: KLD against BF16
+  0.0134 vs TQV-12 0.0184 and TQ_L 0.0245 (WikiText-2, 8 x 2048 tokens); GSM8K 250 243 vs 242 / 245.
+- TQV-12 / TQT quantiser encoder options `--damp-form median`, `--damp-role`, `--order`, `--refit`, `--icm N` (same file
+  format): Qwen3.8-27B TQV-12 KLD 0.0184 -> 0.0168.
+- Contextual embeddings: `tqserve --model <embedding GGUF>` serves `POST /v1/embeddings` for perplexity's
+  pplx-embed-v2-context models (MIT). A document is sent as a list of chunks and embedded as one sequence, so each
+  chunk's vector sees the rest of the document; `"task": "query"` embeds queries; `encoding_format` `float`, `base64`
+  (the OpenAI client's default) or `int8`. No embedding GGUF is published: you convert perplexity's Hugging Face
+  snapshot with `tools/convert/pplx/pplx_context_to_gguf.py` into one of three files: 0.6B BF16 with an F32 token table
+  (`--outtype bf16`, 2.4 GB served), 9B TQ4 for 8 GB GPUs (`--outtype tq4`, 6.6 GB), 9B Q8_0 for 12 / 16 GB
+  (`--outtype q8_0`, 10.2 GB). 0.6B vs
+  the Hugging Face model in FP32 (RTX 3090): covid-qa nDCG@10 56.17 (HF 56.32); DGX Spark (GB10) 51.1K document
+  tokens/s and ~2.3K queries/s (HF bf16 34.9K / 1,021), RTX 3090 75.2K / ~2.9K (HF 21.1K / 283). Limits per request:
+  4,096 inputs, 32,768 chunks, 16 MB of text, 1,048,576 tokens. See docs/guides/embeddings.md.
+
+### Changed
+- 27B on an RTX 3090, 9-16 verify rows (copy passes): the TQ3 gate/up and GDN mixer matvecs read two 16-row tiles per
+  block (same numbers). TQ_S + DFlash2-TQ3, greedy, same session: editing code 392.9 -> 402.9 tok/s, editing JSONL
+  417.1 -> 428.8; text identical.
+- 27B on an RTX 3090: the TQ3 gate/up matvec at 7-8 verify rows reads two 16-row tiles per block (one activation load
+  for both; same numbers). TQ_S + DFlash2-TQ3, greedy, same session: code 208.7 -> 217.5 tok/s, story 106.2 -> 110.7,
+  translation 176.1 -> 184.3, structured 292.5 -> 302.5, long JSONL 282.4 -> 291.0; text identical.
+- 27B with a DFlash2 drafter: when the reply repeats at least 32 tokens of the prompt or of itself, the copy is verified
+  beside the drafter's tree in one 16-row pass (it was 8). Text is unchanged. RTX 3090, TQ_S + DFlash2-TQ3, greedy,
+  same session: editing code 205.6 -> 388.2 tok/s, editing JSONL 277.0 -> 413.5; tasks without such a repeat unchanged
+  (within run-to-run range).
+- Mac: the same copy drafts beside the token tree, in the 16-row verify the Mac already runs. M5 Pro, TQ_L-QSA + DFlash2,
+  greedy, same session: editing code 138.4 -> 188.7 tok/s; editing JSONL 188.9 -> 191.3 (the drafter already filled the
+  block); the other 13 tasks unchanged (within run-to-run range); text unchanged on all 15.
+- Flash-Next with many users: when every expert is resident, the layers of every decode batch run as captured graphs
+  with the slot and dedup maps built on the device, at every batch size a step makes (up to 64 rows: 21 users at 3 rows,
+  32 at 2; it was 32 rows), the GDN, attention, rollback and accept steps run once for all
+  sequences of a batch, and `--np` goes up to 32 when every expert is resident (16 otherwise). Replies are unchanged.
+  Two DGX Sparks (GB10), NVIDIA NVFP4 experts, through the router, same session: 16 users 238.5 -> 265.3 tok/s;
+  32 users (16 + 16) 314-322 tok/s. One box: 8 users 124.0 -> 135.0, 16 users 130.2 -> 153.2. RTX 3090, the model
+  card's files: 8 users 85.1 -> 91.0, one user unchanged.
+- 27B with the oldest K/V in host memory: the tail is staged by the copy engine (it was a kernel reading host memory),
+  and an LM head placed in host memory is built and read back by the copy engine. RTX 3090 at a 16 GB budget:
+  159.7 -> 166.0 tok/s, text identical.
+- Small cards (12-16 GB) with `--np` above 1 no longer run the CPU expert pool (one request keeps it; the startup log
+  says which). On one test machine that CPU load beside the GPU's copies from host memory ended in GPU faults
+  (Xid 31 / 32, "unspecified launch failure") within 4-12 minutes; the same fault was reproduced there without tqLLM,
+  with a plain CUDA copy test beside a CPU memory reader, so it is a platform limit. 12 GB, 4 users, 512-token
+  requests: 64.9 tok/s either way. If you see these faults, check that your memory runs at the CPU's rated speed for
+  your DIMM count, and try the kernel parameter `iommu=pt`.
+- Sampled requests (temperature > 0) on the 27B use the DFlash2 token tree on CUDA too (it was greedy-only): the walk draws each node's token from the target's distribution and follows a matching child. RTX 4090, Qwen3.8-27B TQ4 + DFlash2-TQ3, temperature 0.6, 6 x 2,000 tokens: 146 -> 173 tok/s, accepted drafts 30 % -> 37 %. `TQLLM_DEBUG=sample_chain` keeps chain drafts.
+
+### Fixed
+- A request that failed for lack of GPU memory could leave the server faulting the GPU on every later request ("illegal
+  memory access", Xid 31; 27B on an RTX 3090 beside another GPU process). Moving the oldest K/V to host memory unmapped a
+  granule before mapping its replacement; when that map failed, the granule stayed unmapped and the next request's
+  attention read the hole. A failed move now puts the old mapping back (the request fails, the K/V is unchanged), and
+  Flash-Next's page moves do the same. Should the GPU context still be lost, tqserve answers that request with HTTP 500
+  and exits with status 70 so a supervisor restarts it, instead of serving on; `compose.yaml` now restarts on failure.
+- 27B with a DFlash2 drafter: a reply ends at its end-of-sequence token. When the EOS was accepted inside a draft block, the drafts after it and the bonus token were appended too (greedy or sampled, chain or tree).
+- MSVC: `tests/gguf_validation.cpp`, `tests/tokenizer_gguf.cpp` and `tests/expert_bank_plan.cpp` build without `<unistd.h>` / `setenv`, `tqllm/rope_scaling.hpp` no longer needs `M_PI`, and `-DBUILD_TESTING=OFF` defines no test target (124 `test-*` executables were still built).
+- 27B with a DFlash2 drafter, sampled requests (thinking on): when the drafter's guess equalled the first copied token,
+  the walk followed the drafter's one-token branch and dropped the copy, so sampled edits got almost none of the copy
+  speed-up. RTX 3090, TQ_S + DFlash2-TQ3, thinking on (temperature 1.0), same seed: editing code 85.1 -> 216.6 tok/s,
+  editing JSONL 123.0 -> 341.6; text identical.
+- The graph cache emptied itself on every miss when free VRAM sat just under its reserve (27B at a 16 GB budget with a
+  host K/V tail): the same graphs were captured again and again (2,392 captures for 16 graphs in a 12K-token chat). It
+  now keeps a working set under low memory.
+- Native Windows build (MSVC): 1.6.0 stopped on `<unistd.h>` in the qwen35 engine and on GCC-only target attributes in the K-quant CPU matvec. The prompt park sizes itself from `host_ram_bytes()`; MSVC builds take the scalar K-quant path.
+- Sampled requests (temperature > 0) on the 27B drew their first token from the wrong prompt position since 1.6.0 (the first position of the final prefill chunk instead of the last prompt position). Greedy requests were not affected.
+
+## 1.6.0 (2026-11-13)
+
+### Added
+- QSA sparse attention for the 27B on CUDA (`--qsa-from N`, opt-in, approximate): past N keys, each answer token attends
+  only to the key blocks the in-file indexer picks (top 512 blocks + the recent keys); prompt speed is unchanged. Works
+  with every compact KV format (tq3, q4 / tcq2, q8, turbo4 / t4kv, trellis pairs), also when the oldest K/V sits in host
+  memory (the picked rows are staged back once per layer). Files: `Qwen3.8-27B-TQ_L-QSA.gguf` (and TQ3_4S-v2-QSA).
+  RTX 3090, TQ_L-QSA + DFlash2-TQ3, turbo4 KV, mean of 3 prompts: 128K 143.6 -> 182.2 tok/s, 256K 119.5 -> 170.5, 32K
+  unchanged; q8/q8 KV with a host tail at 256K 27.3 -> 147.4. RTX 5060 Ti 16 GB, TQ_XS-QSA + DFlash2-TQ3, tq3 KV, 200K
+  prompt: 29.3 -> 93.4 tok/s. Quality at 128K vs the same config dense (last 2,048 positions): top-1 agreement 87-92 %,
+  mean KLD 0.05-0.26; needle 3/3 on every KV format. `--exact on` warns when QSA is on.
+- Two GPUs in one PC: `--split layer` for the dense 27B (layers split by rank, K/V on the owning rank; NCCL builds and the
+  Docker image). See docs/guides/multi-gpu.md.
+- Mac: next-turn reuse (`--prompt-cache on`): a chat's next turn resumes from the state its previous prompt kept, and the
+  answer is prefilled while the server is idle. Follow-up first token at 34K: 0.36-0.47 s. Without the flag prefill is
+  unchanged from 1.5.0.
+- Flash-Next over two linked boxes: `--split experts` (with `--tp-rank 0 / 1 --tp-peer`, NCCL builds). While the second
+  box has no request of its own it computes half of each layer's experts for the first box's decode steps; the output is
+  the same as one box (every expert stays resident on both). Run both behind `--peer`: a lone request is helped, several
+  users spread over both boxes. Two DGX Sparks (GB10), NVIDIA NVFP4 experts, one user over 32 unseen questions: through
+  the router 64.4 -> 68.4 tok/s (median, faster on all 32; 4 / 8 / 16 users and the second box's own users unchanged);
+  two `--np 1` servers 66.8 -> 70.5.
+
+### Changed
+- int8 prefill (`--prefill-int8`, Ampere / RTX 40 / RTX 50) for llama.cpp IQ4_XS GGUFs: the weights are quantised to int8
+  straight from the 4-bit data (one pass, bit-identical to the FP16 dequant + quantise passes), the int8 weight operand
+  lives inside the FP16 prefill scratch (no extra VRAM), and plain-basis weights get dynamic SmoothQuant column scales
+  (activation outlier channels moved into the weights, per GEMM). Per-token int8 activations were all of the int8 error
+  on these files (KLD vs a Q6_K reference 0.0079 FP16 -> 0.0103 int8; with the scales 0.0080), and the int8 drafter
+  features test now passes on them. RTX 3090, Qwen3.8-27B IQ4_XS, DFlash2, 128K q8/q4, prefill tok/s FP16 / int8 before /
+  int8 now: 8K 1739 / 1968 / 2102, 32K 1590 / 1880 / 1994, 98K 1270 / 1458 / 1527. TQ formats (rotated basis) keep plain
+  int8: the scales buy them nothing.
+- Flash-Next on 16 GB cards: prompts shorter than a chunk prefill at their own length, staging is per request and MTP
+  catch-up runs in pieces (1.2K-token first token 2.41 -> 1.91 s); the guess pipeline holds demand misses on the link
+  (decode +4-5 %); the prefill plan is fixed at start, so the same prompt always gets the same chunks.
+
+### Fixed
+- #38: garbage tokens on M1-M4 Macs. NAX layouts and tensor-op attention run only on the M5 matrix unit; M1-M4 use MLX
+  affine weights.
+- Metal: requests from different threads could extend the previous request's text (also in 1.5.0).
+- x3 (EXL3) experts: uploads are ordered before the stream reads them, the shared scratch orders calls across streams, and
+  x3 weights on a second GPU in one process are refused with a clear message.
+- Flash-Next: a finished request no longer turns off the shared expert cache's copy stream while another request is bound
+  to it; on PCIe GPUs the fallback miss path uses the copy engine (no kernel reads of pinned host memory).
+- Decode graphs are keyed by model, and a finished request releases its graph execs (~2.4 MB leaked per request).
+
+### Known issue
+- The 12 GB / 4-user copy-engine fault reported in 1.5.0 is not fixed. It reproduces on one RTX 3090 desktop under a
+  constant 4-user load with the CPU expert pool; another 3090 runs the same load clean. Workaround: `--np 2` on 12 GB
+  cards, or 16 GB+.
+
 ## 1.5.0 (2026-11-10)
 
 ### Added

@@ -8,10 +8,13 @@
 #include "serve/session.hpp"
 #include "serve/api_adapters.hpp"
 #include "serve/jinja_template.hpp"
+#include "serve/embeddings.hpp"
+#include "serve/cuda_health.hpp"
 #include "gguf.hpp"
 #include "flags_gen.hpp"
 #if TQLLM_WITH_CUDA
 #include "kv_format.hpp"
+#include "models/qwen/qwen35/pplx_embed.hpp"
 #include "plugin_format.hpp"
 #endif
 #include "kv_store.hpp"
@@ -38,6 +41,7 @@
 #include <memory>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -140,19 +144,191 @@ void usage() {
                  "  --peer URL (repeatable, needs --np > 1): other tqserve boxes with the same model; each chat request goes to the box expected to\n"
                  "    answer first (free slots, decoding load, the K/V a slot already holds for the prompt); POST /admin/route reports a box's status\n";
 }
-// A generation that throws (e.g. a kernel launch that fails on a nearly full device) fails its own request only: the next
-// request starts at position 0 and resets the sequence state.
+// A generation that throws (e.g. a kernel launch that fails on a nearly full device) fails its own request only: `on_fail`
+// drops what the request half-wrote (the engine's prompt cache for its slot) and a pending CUDA error is cleared, so the
+// next request starts clean. A lost CUDA context (a kernel fault) fails the request and tqserve exits (cuda_health.hpp).
 const char * const kFailed = "generation failed: ";
-template <class F> tqserve::DecodeResult guarded(F && f) {
+// engine_thread: the engine runs here (no scheduler); with --np the scheduler's thread checks the context itself (a device
+// sync from every HTTP thread would stall the batch)
+template <class F, class G> tqserve::DecodeResult guarded(F && f, G && on_fail, bool engine_thread) {
+    tqserve::DecodeResult r;
+    if (const std::string lost = engine_thread ? tqserve::check_cuda_context() : tqserve::context_lost() ? std::string("lost earlier") : std::string();
+        !lost.empty()) {
+        r.error = std::string(kFailed) + "the CUDA context was lost by an earlier request (" + lost + "); tqserve is restarting";
+        return r;
+    }
     try {
+        static const int fault_at = tqllm::debug_int("cuda_fault");
+        static std::atomic<int> requests{0};
+#if TQLLM_WITH_CUDA
+        if (engine_thread && fault_at > 0 && ++requests == fault_at) tqllm_cuda::debug_device_fault();
+#endif
         return f();
     } catch (const std::exception & e) {
         std::cerr << "tqserve: " << kFailed << e.what() << "\n";
-        tqserve::DecodeResult r;
+        try { on_fail(); } catch (...) {}
         r.error = std::string(kFailed) + e.what();
+        if (engine_thread && !tqserve::check_cuda_context().empty()) r.error += " (the CUDA context is lost: tqserve is restarting)";
         return r;
     }
 }
+
+#if TQLLM_WITH_CUDA
+// A contextual embedding GGUF (pplx-embed-v2-context): POST /v1/embeddings only. Connections run on their own threads;
+// tokenizing runs in parallel, the forward passes one request at a time on the one GPU.
+int serve_embeddings(const std::string & model_path, const tqllm::Tokenizer & tokenizer, const std::string & host, int port,
+                     const std::string & name, const std::string & api_key) {
+    constexpr size_t kEmbedBatchTokens = 65536;
+    auto model = tqllm::PplxEmbedder::load(model_path, 0, tqllm::PplxEmbedder::Mode::fast);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t n = tokenizer.warm_cache();
+        std::cerr << "tqserve: tokenizer piece cache warmed (" << n << " pieces, "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s)\n";
+    }
+    {  // one short document and one query at load: lazy CUDA module loading, cuBLAS setup and the activation buffers
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<tqllm::EmbedInput> warm;
+        warm.push_back(tqllm::embed_document_input(tokenizer, model->prompt(), {"Warm-up document.", "Second chunk."}));
+        model->embed_many(warm);
+        warm.clear();
+        warm.push_back(tqllm::embed_query_input(tokenizer, model->prompt(), "warm-up query"));
+        model->embed_many(warm);
+        std::cerr << "tqserve: embedder warmed (" << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s)\n";
+    }
+    listener = bind_socket(host, static_cast<uint16_t>(port));
+    if (listener < 0) throw std::runtime_error("socket bind/listen failed (error " + std::to_string(tqnet::last_error()) + ")");
+    std::signal(SIGINT, stop_server);
+    std::signal(SIGTERM, stop_server);
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    std::cerr << "tqserve: engine turbo-tan/tqllm " TQLLM_COMMIT "\n";
+    std::cerr << "tqserve: embeddings on " << host << ':' << port << " (model=" << name << ", dim " << model->dim()
+              << ", POST /v1/embeddings)\n";
+    std::string models = "{\"object\":\"list\",\"data\":[{\"id\":";
+    tqserve::jstr(models, name);
+    models += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
+    std::mutex gpu;
+    std::atomic<int> inflight{0};
+    // one thread per connection (at most 64): a slow client, or a long request, never holds up /health or another accept
+    auto handle = [&](int client) {
+            tqnet::set_recv_timeout(client, 30);
+            tqserve::Request request;
+            std::string error;
+            int status = 400;
+            std::string body;
+            if (!receive_request(client, request, error, status)) {
+                body = tqserve::json_error(error);
+            } else if (!api_key.empty() && request.authorization != "Bearer " + api_key) {
+                status = 401; body = tqserve::json_error("invalid or missing API key");
+            } else if (request.method == "GET" && request.path == "/health") {  // never waits for the GPU
+                status = 200; body = "{\"status\":\"ok\"}";
+            } else if (request.method == "GET" && request.path == "/v1/models") {
+                status = 200; body = models;
+            } else if (request.path != "/v1/embeddings") {
+                status = 404; body = tqserve::json_error("not found: this server serves an embedding model (POST /v1/embeddings)");
+            } else if (request.method != "POST") {
+                status = 405; body = tqserve::json_error("POST /v1/embeddings");
+            } else {
+                const auto t_start = std::chrono::steady_clock::now();
+                auto ms_since = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); };
+                const auto r = tqserve::parse_embed_request(std::string(request.body.begin(), request.body.end()));
+                const std::string dim_error = r.error.empty() ? tqserve::check_dimensions(r, model->dim()) : std::string();
+                if (!r.error.empty() || !dim_error.empty()) {
+                    status = 400; body = tqserve::json_error(r.error.empty() ? dim_error : r.error);
+                } else {
+                    try {
+                        std::vector<std::vector<float>> vectors;
+                        // tokenize the entries on worker threads (the tokenizer is read-only and its piece cache is shared)
+                        std::vector<tqllm::EmbedInput> ins(r.docs.size());
+                        std::vector<std::exception_ptr> errs(r.docs.size());
+                        {
+                            const size_t nt = std::min<size_t>(r.docs.size(), std::max(1u, std::thread::hardware_concurrency()));
+                            std::vector<std::thread> pool;
+                            for (size_t t = 0; t < nt; ++t)
+                                pool.emplace_back([&, t] {
+                                    for (size_t i = t; i < r.docs.size(); i += nt) {
+                                        try {
+                                            ins[i] = r.query ? tqllm::embed_query_input(tokenizer, model->prompt(), r.docs[i][0])
+                                                             : tqllm::embed_document_input(tokenizer, model->prompt(), r.docs[i]);
+                                        } catch (...) { errs[i] = std::current_exception(); }
+                                    }
+                                });
+                            for (auto & th : pool) th.join();
+                            for (auto & e : errs) if (e) std::rethrow_exception(e);
+                        }
+                        size_t request_tokens = 0;
+                        for (const auto & in : ins) request_tokens += in.ids.size();
+                        if (request_tokens > tqserve::kEmbedMaxTokens)
+                            throw std::invalid_argument("the request has " + std::to_string(request_tokens) + " tokens; the limit per request is " +
+                                                        std::to_string(tqserve::kEmbedMaxTokens));
+                        const double t_tok = ms_since(t_start);
+                        std::lock_guard<std::mutex> lock(gpu);  // one forward at a time on the one GPU; tokenizing runs outside it
+                        const auto t_gpu = std::chrono::steady_clock::now();
+                        std::vector<tqllm::EmbedInput> batch;
+                        size_t tokens = 0, batch_tokens = 0;
+                        auto flush = [&] {
+                            for (auto & v : model->embed_many(batch)) vectors.push_back(std::move(v));
+                            batch.clear(); batch_tokens = 0;
+                        };
+                        for (auto & in : ins) {  // entries run as segments of one pass, up to kEmbedBatchTokens (64K; the engine splits passes)
+                            if (in.ids.size() > model->max_tokens())
+                                throw std::invalid_argument("input of " + std::to_string(in.ids.size()) + " tokens; the model takes " +
+                                                            std::to_string(model->max_tokens()));
+                            if (!batch.empty() && batch_tokens + in.ids.size() > kEmbedBatchTokens) flush();
+                            tokens += in.ids.size();
+                            batch_tokens += in.ids.size();
+                            batch.push_back(std::move(in));
+                        }
+                        if (!batch.empty()) flush();
+                        const double t_fwd = ms_since(t_gpu);
+                        const auto t_out = std::chrono::steady_clock::now();
+                        status = 200; body = tqserve::embed_response(r, vectors, model->dim(), name, tokens);
+                        std::fprintf(stderr, "tqserve: embeddings %zu inputs, %zu tokens: parse + tokenize %.1f ms, forward %.1f ms, response %.1f ms\n",
+                                     r.docs.size(), tokens, t_tok, t_fwd, ms_since(t_out));
+                    } catch (const std::invalid_argument & e) {
+                        status = 400; body = tqserve::json_error(e.what());
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: embeddings failed: " << e.what() << "\n";
+                        status = 500; body = tqserve::json_error(std::string("embeddings failed: ") + e.what());
+                    }
+                }
+            }
+        tqnet::set_send_timeout(client, 30);  // a client that stops reading cannot hold its thread forever
+        send_all(client, response(status, body));
+        tqnet::close(client);
+    };
+    while (running) {
+        const int client = tqnet::accept(listener);
+        if (client < 0) {
+            const int e = tqnet::last_error();
+            if (!running || tqnet::interrupted(e)) break;
+            continue;
+        }
+        if (inflight >= 64) {
+            tqnet::set_send_timeout(client, 5);
+            send_all(client, response(503, tqserve::json_error("too many connections")));
+            tqnet::close(client);
+            continue;
+        }
+        ++inflight;
+        try {
+            std::thread([&, client] {
+                try { handle(client); }
+                catch (const std::exception & e) {
+                    std::fprintf(stderr, "tqserve: embeddings request failed: %s\n", e.what());
+                    send_all(client, response(500, tqserve::json_error(std::string("request failed: ") + e.what())));
+                    tqnet::close(client);
+                }
+                --inflight;
+            }).detach();
+        } catch (...) { --inflight; tqnet::close(client); }
+    }
+    for (; inflight > 0;) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return 0;
+}
+#endif
 
 } // namespace
 
@@ -282,6 +458,9 @@ int main(int argc, char ** argv) {
         std::cerr << "tqserve: loading model from " << model_path << "\n";
         tqllm::Tokenizer tokenizer;
         tokenizer.load(tokenizer_path);
+#if TQLLM_WITH_CUDA
+        if (tqllm::PplxEmbedder::is_embedding_gguf(model_path)) return serve_embeddings(model_path, tokenizer, host, port, name, api_key);
+#endif
         if (tokenizer.encode("</mm:think>").size() == 1) {  // MiniMax-M3: its own thinking tags; the answer follows the end tag
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
@@ -344,6 +523,16 @@ int main(int argc, char ** argv) {
 #endif
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it
         tqllm::Model & model = *model_ptr;
+        {  // --lora: request defaults (ids in load order)
+            auto & ld = tqserve::lora_defaults();
+            ld.paths = engine.lora;
+            for (size_t i = 0; i < engine.lora.size(); ++i) ld.scales.push_back(engine.lora_init(i));
+        }
+        if (engine.split_layers && engine.tp_rank > 0) {  // --split layer: this rank follows rank 0's server
+            std::fprintf(stderr, "tqserve: --split layer rank %d loaded; following rank 0\n", engine.tp_rank);
+            model.follow();
+            return 0;
+        }
         std::unique_ptr<tqserve::Monitor> monitor;
         std::unique_ptr<tqserve::MonitorServer> monitor_server;
         {
@@ -362,6 +551,62 @@ int main(int argc, char ** argv) {
         if (np > 1) scheduler = std::make_unique<tqserve::Scheduler>(tokenizer, model, slot_context);
         std::atomic<int> inflight{0};
         std::mutex generation_mutex;
+        // one slot: after a chat reply the engine may prefill the reply as the client will return it (Engine::prefill_ahead).
+        // It runs here under the generation lock, so a request that arrives first is served first (and cancels it); a
+        // request that arrives during it waits for the tokens it would prefill itself when the expectation holds.
+        struct AheadWorker {
+            tqllm::Model & model;
+            std::mutex & generation;
+            std::mutex m;
+            std::condition_variable cv;
+            // the expected next prompt, rendered and tokenized on this thread (off the reply's path)
+            std::function<std::vector<uint32_t>()> next;
+            uint64_t posted = 0;  // counts posts: a post or cancel during the rendering makes that rendering stale
+            bool stop = false;
+            std::thread t;
+            AheadWorker(tqllm::Model & mo, std::mutex & g) : model(mo), generation(g), t([this] { run(); }) {}
+            ~AheadWorker() {
+                { std::lock_guard<std::mutex> l(m); stop = true; }
+                cv.notify_all();
+                t.join();
+            }
+            void post(std::function<std::vector<uint32_t>()> f) {
+                { std::lock_guard<std::mutex> l(m); next = std::move(f); ++posted; }
+                cv.notify_all();
+            }
+            void cancel() { std::lock_guard<std::mutex> l(m); next = nullptr; ++posted; }
+            void run() {
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> l(m);
+                        cv.wait(l, [&] { return stop || next; });
+                        if (stop) return;
+                    }
+                    std::vector<uint32_t> p;
+                    uint64_t mine = 0;
+                    try {
+                        std::function<std::vector<uint32_t>()> f;
+                        { std::lock_guard<std::mutex> l(m); f = next; mine = posted; }
+                        if (f) p = f();
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: next prompt for the idle prefill: " << e.what() << "\n";
+                    }
+                    std::lock_guard<std::mutex> g(generation);
+                    {
+                        std::lock_guard<std::mutex> l(m);
+                        if (!next || posted != mine) continue;  // a request came first, or a newer reply was posted
+                        next = nullptr;
+                    }
+                    if (p.empty()) continue;
+                    try {
+                        model.select_slot(0);
+                        model.prefill_ahead(0, p);
+                    } catch (const std::exception & e) {
+                        std::cerr << "tqserve: idle prefill failed: " << e.what() << "\n";
+                    }
+                }
+            }
+        } ahead_worker{model, generation_mutex};
         listener = bind_socket(host, static_cast<uint16_t>(port));
         if (listener < 0) throw std::runtime_error("socket bind/listen failed (error " + std::to_string(tqnet::last_error()) + ")");
         std::signal(SIGINT, stop_server);
@@ -369,6 +614,7 @@ int main(int argc, char ** argv) {
 #ifdef SIGPIPE
         std::signal(SIGPIPE, SIG_IGN);
 #endif
+    bool template_effort = false;  // the chat template reads reasoning_effort (the monitor chat then offers the levels)
     tqserve::PromptRenderer renderer;
     tqllm::Json default_kwargs;
     if (use_jinja || !template_file.empty()) {
@@ -411,9 +657,15 @@ int main(int argc, char ** argv) {
                 try { default_kwargs = tqllm::parse_json(template_kwargs_text); } catch (const std::exception & e) { std::cerr << "tqserve: --chat-template-kwargs: " << e.what() << "\n"; return 2; }
             }
             std::cerr << "tqserve: chat template: Jinja (" << src.size() << " bytes), llama.cpp's engine\n";
+            template_effort = src.find("reasoning_effort") != std::string::npos;
         }
     }
 
+        if (monitor) {  // levels: the template's reasoning_effort, or the native Qwen layout where the server writes the effort text
+            std::string def = effort == "minimal" ? "low" : (effort == "high" || effort == "max") ? "xhigh" : effort;
+            monitor->reasoning(reasoning, (template_effort || !renderer) ? std::vector<std::string>{"low", "medium", "xhigh"}
+                                                                         : std::vector<std::string>{}, def);
+        }
         std::cerr << "tqserve: engine turbo-tan/tqllm " TQLLM_COMMIT "\n";
         std::cerr << "tqserve: listening on " << host << ':' << port << " (model=" << name
                   << ", context=" << slot_context << (np > 1 ? " per slot, slots=" + std::to_string(np) : std::string())
@@ -458,8 +710,9 @@ int main(int argc, char ** argv) {
             // --np 1 (no scheduler): one generation at a time, but /health and /v1/models answer while it runs; every
             // connection has its own thread, so a long generation no longer blocks the accept loop
             static std::mutex single_slot;
-            const bool status_path = request.method == "GET" && (request.path == "/health" || request.path == "/props" ||
-                                                                 request.path == "/v1/models" || request.path == "/v1/models/" + name);
+            const bool status_path = (request.method == "GET" && (request.path == "/health" || request.path == "/props" ||
+                                                                   request.path == "/v1/models" || request.path == "/v1/models/" + name)) ||
+                                     request.path == "/lora-adapters";  // request defaults only: never waits for the GPU
             std::unique_lock<std::mutex> hold(single_slot, std::defer_lock);
             if (!scheduler && !status_path) hold.lock();
             std::string body;
@@ -504,6 +757,31 @@ int main(int argc, char ** argv) {
                 body = "{\"object\":\"list\",\"data\":[{\"id\":";
                 tqserve::jstr(body, name);
                 body += ",\"object\":\"model\",\"owned_by\":\"tqllm\"}]}";
+            } else if (request.path == "/lora-adapters" && (request.method == "GET" || request.method == "POST")) {
+                // llama.cpp's endpoint: GET lists [{"id", "path", "scale"}]; POST [{"id": N, "scale": S}] sets the scales of
+                // requests without a "lora" field (adapters not listed keep theirs)
+                auto & ld = tqserve::lora_defaults();
+                std::lock_guard<std::mutex> lk(ld.mu);
+                if (request.method == "POST") {
+                    std::string err;
+                    std::vector<float> sc = ld.scales;
+                    try {
+                        const auto root = tqllm::parse_json(std::string(request.body.begin(), request.body.end()));
+                        if (tqserve::read_lora_list(root, sc, err)) ld.scales = sc;
+                    } catch (const std::exception & e) { err = e.what(); }
+                    if (!err.empty()) status = 400, body = tqserve::json_error(err);
+                }
+                if (status == 200) {
+                    body = "[";
+                    for (size_t i = 0; i < ld.paths.size(); ++i) {
+                        body += std::string(i ? "," : "") + "{\"id\":" + std::to_string(i) + ",\"path\":";
+                        tqserve::jstr(body, ld.paths[i]);
+                        char num[32];
+                        std::snprintf(num, sizeof num, "%g", double(ld.scales[i]));
+                        body += std::string(",\"scale\":") + num + "}";
+                    }
+                    body += "]";
+                }
             } else if (request.method == "POST" && request.path == "/v1/messages/count_tokens") {
                 body = "{\"input_tokens\":" + std::to_string(request.body.size() / 4) + "}";  // estimate (Claude Code asks)
             } else if (request.method == "POST" && tqserve::api_for_path(request.path) != tqserve::Api::None) {
@@ -515,6 +793,7 @@ int main(int argc, char ** argv) {
                 else if (api == tqserve::Api::Messages) in = tqserve::messages_to_chat(in, adapt_error);
                 std::unique_lock<std::mutex> generation_lock(generation_mutex, std::defer_lock);
                 if (!scheduler) generation_lock.lock();
+                if (!scheduler) ahead_worker.cancel();
                 auto parsed = adapt_error.empty()
                     ? tqserve::parse_request(in, max_tokens, system, chat, reasoning, effort, renderer ? &renderer : nullptr, &default_kwargs)
                     : tqserve::ChatRequest{};
@@ -527,6 +806,7 @@ int main(int argc, char ** argv) {
                     for (size_t i = 0; i < peers.size(); ++i)
                         asks.emplace_back([&, i] { boxes[i + 1] = tqserve::peer_status(peers[i], parsed.prompt_text, request.authorization, 100); });
                     boxes[0] = scheduler->route_status(parsed.prompt_text);
+                    boxes[0].helped = engine.split_experts && engine.tp_rank == 0;
                     for (auto & t : asks) t.join();
                     const double prompt = double(parsed.prompt_text.size()) / scheduler->chars_per_token();
                     const double gen = std::min<double>(parsed.max_tokens, 512);
@@ -542,6 +822,17 @@ int main(int argc, char ** argv) {
                         }
                         pick = tqserve::pick_box(boxes, prompt, gen);
                         ++inflight[size_t(pick)];
+                        if (tqllm::debug_on("route")) {
+                            std::string line = "tqserve: route -> box " + std::to_string(pick) + " |";
+                            for (size_t i = 0; i < boxes.size(); ++i) {
+                                const auto & b = boxes[i];
+                                char buf[160];
+                                std::snprintf(buf, sizeof buf, " b%zu ok %d free %d busy %d queued %d inflight %d cost %.2f", i, int(b.ok),
+                                              b.free, b.busy, b.queued, b.inflight, b.ok ? tqserve::route_cost(b, prompt, gen) : -1.0);
+                                line += buf;
+                            }
+                            std::fprintf(stderr, "%s\n", line.c_str());
+                        }
                     }
                     if (pick > 0) {
                         const auto & peer = peers[size_t(pick - 1)];
@@ -567,6 +858,17 @@ int main(int argc, char ** argv) {
                         parsed.thinking = false;
                     }
                 }
+                // --prompt-cache on, after a chat reply: the engine may prefill the reply as the client will return it while the server is idle
+                // (Engine::prefill_ahead). Not for tool calls (the next request follows at once) or image prompts.
+                auto prefill_ahead = [&](const tqserve::DecodeResult & reply) {
+                    if (!engine.prompt_cache || scheduler || !chat || !reply.error.empty() || !reply.tool_calls.empty() || !parsed.images.empty()) return;
+                    // rendered on the worker: a non-streamed reply is sent without waiting for it
+                    ahead_worker.post([&tokenizer, &renderer, &default_kwargs, body = in, reply, max_tokens, system, reasoning, effort] {
+                        const auto prefix = tqserve::next_prompt_prefix(body, reply, tqserve::returns_reasoning(body), max_tokens, system, reasoning,
+                                                                        effort, renderer ? &renderer : nullptr, &default_kwargs);
+                        return prefix.empty() ? std::vector<uint32_t>{} : tokenizer.encode(prefix);
+                    });
+                };
                 if (!parsed.ok) {
                     status = 400;
                     body = tqserve::json_error(parsed.error);
@@ -594,7 +896,7 @@ int main(int argc, char ** argv) {
                         auto result = guarded([&] {
                             return scheduler ? scheduler->submit_stream(r, on_tokens)
                                              : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
-                        });
+                        }, [&] { if (!scheduler) model.spec_abort(0); }, !scheduler);
                         observe_result(r.observation, result);
                         return result;
                     };
@@ -635,6 +937,7 @@ int main(int argc, char ** argv) {
                         const auto generated = run_stream(parsed, out);
                         if (!generated.error.empty()) out.error(generated.error);
                         else out.close(generated);
+                        prefill_ahead(generated);
                     }
                     if (!scheduler) model.set_continuation(0);  // a thinking budget's held phase 1 state, if phase 2 did not run
                     if (parsed.observation) parsed.observation->finish();
@@ -642,7 +945,8 @@ int main(int argc, char ** argv) {
                     return;
                 } else {
                     auto run = [&](const tqserve::ChatRequest & r) {
-                        auto result = guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        auto result = guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); },
+                                              [&] { if (!scheduler) model.spec_abort(0); }, !scheduler);
                         observe_result(r.observation, result);
                         return result;
                     };
@@ -678,6 +982,7 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         generated = run(parsed);
+                        prefill_ahead(generated);
                     }
                     if (!scheduler) model.set_continuation(0);
                     if (!generated.error.empty()) {
@@ -692,7 +997,7 @@ int main(int argc, char ** argv) {
                 if (parsed.observation) parsed.observation->finish(status == 200 ? "complete" : "failed");
                 if (status != 200 && api == tqserve::Api::Messages) body = tqserve::messages_error(body);
             } else {
-                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" || request.path == "/admin/route" ||
+                const bool known_path = request.path == "/health" || request.path == "/v1/models" || request.path == "/admin/slots" || request.path == "/admin/route" || request.path == "/lora-adapters" ||
                     request.path == "/v1/models/" + name || tqserve::api_for_path(request.path) != tqserve::Api::None;
                 status = known_path ? 405 : 404;
                 body = tqserve::json_error(known_path ? "method not allowed" : "not found");

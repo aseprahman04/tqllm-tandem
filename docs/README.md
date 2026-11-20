@@ -5,6 +5,7 @@
 | Start here | Guide |
 |---|---|
 | Install, Docker, native build and tokenizer conversion | [Quick start](guides/quickstart.md) |
+| Pick the model and flags for your GPU, with measured speeds | [Choose a setup](guides/choose-your-setup.md) |
 | Observe prefill, decode and hardware on the API port | [Runtime monitor](MONITOR.md) |
 | Follow a recorded monitor walkthrough | [Monitor demo](demos/monitor/README.md) |
 | Run on a Mac (Apple Silicon, Metal) | [Mac](guides/mac.md) |
@@ -12,7 +13,10 @@
 | Connect coding agents | [Agent setup](guides/coding-agents.md) |
 | Add DFlash2 or native MTP drafting | [Speculative decoding](guides/speculative-decoding.md) |
 | Fit a long context into GPU and host memory | [TqCache](guides/long-context.md) |
+| Serve contextual embeddings (pplx-embed-v2-context, `POST /v1/embeddings`) | [Embeddings](guides/embeddings.md) |
 | Choose model weight formats | [Formats](reference/formats.md), [illustrated](reference/formats.html) |
+| Make a TQV-12 model (vector-codebook GPTQ, TQ4's size) | [TQV-12](guides/tqv12.md) |
+| Make a TQT model (trellis code, TQ4's size, most accurate at 4.125 bpw) | [TQT](guides/tqt.md) |
 | Configure serving, sampling and memory | [Options](reference/options.md) |
 | Reproduce performance measurements | [Benchmarks](BENCHMARKS.md) |
 | Understand source layout | [Architecture](ARCHITECTURE.md) |

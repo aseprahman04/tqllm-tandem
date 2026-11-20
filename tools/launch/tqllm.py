@@ -24,7 +24,7 @@ split across two GPUs, see scripts/windows/tandem-agent.bat (TQLLM_SPLIT in the 
 """
 import argparse, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
-IMAGE = "ghcr.io/turbo-tan/tqllm:1.4.2"
+IMAGE = "ghcr.io/turbo-tan/tqllm:1.6.0"
 NAME = "tqllm"
 # multi-GPU fork: Windows has no SIGHUP
 STOP_SIGNALS = tuple(getattr(signal, s) for s in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, s))

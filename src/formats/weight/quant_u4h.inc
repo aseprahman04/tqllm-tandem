@@ -168,7 +168,7 @@ __device__ __forceinline__ uint32_t nvf4_codes(uint32_t c) {
 // TQFN_TILED expert banks: the code bytes of 16-row x 4-block tiles are stored lane-contiguous (row-in-tile major, then
 // block-in-quad), so the 32 lanes of a warp load one contiguous run instead of 8 strided row pieces. Same bytes, same math.
 __constant__ int c_tiled_experts = 0;
-__host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
+__host__ __device__ constexpr int tiled_bpb(int f) { return f == 4 || f == 5 ? 12 : f == 13 || f == 14 || f == 16 ? 16 : f >= 8 && f <= 12 ? ud_bpb(f) : 0; }
 __device__ __forceinline__ int64_t u4h_block_off(int r, int s, int nb, int bpb, bool tiled) {
     if (!tiled) return (int64_t(r) * nb + s) * bpb;
     return (((int64_t(r >> 4) * (nb >> 2) + (s >> 2)) * 16 + (r & 15)) * 4 + (s & 3)) * bpb;
@@ -189,8 +189,8 @@ struct U4hTile {
         if (ok) {
             const bool tl = GROUPED && tiled_bpb(FMT) && c_tiled_experts;
             if constexpr (FMT == 16) {  // NVF4: 16 B natural nibbles per 32 weights; aux row = k / 16 E4M3 scales, then the F32 global
-                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(ra) * nb + s) * 16));
-                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(rb) * nb + s) * 16));
+                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(ra, s, nb, 16, tl)));
+                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(rb, s, nb, 16, tl)));
                 const auto * ab = reinterpret_cast<const uint8_t *>(sm);
                 const int64_t rs = k / 16 + 4;
                 const uint8_t * pa = ab + int64_t(ra) * rs, * pb = ab + int64_t(rb) * rs;
@@ -419,13 +419,20 @@ struct U4hTile {
 #ifndef U4H_DENSE_MINB
 #define U4H_DENSE_MINB 1
 #endif
-template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false>
+// CT (dense): CT blocks of NCOL columns per row block, adjacent in blockIdx.x so they read the same weight rows together
+// (the second read hits L2); each column's math is unchanged.
+template <int NCOL, class OUT = __nv_bfloat16, int MT = 1, int FMT = 0, int PF = 0, bool GROUPED = false, int CT = 1>
 __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) u4h_matvec_k(const uint8_t * w4, const __half2 * sm, const __half * xh,
                                                     OUT * y, int rows, int k, int nc, const uint32_t * rid = nullptr,
                                                     int ldy = 0, const int * expert_ids = nullptr, int topk = 1, bool per_expert_input = false,
                                                     const uint8_t * w4b = nullptr, const __half2 * smb = nullptr, OUT * yb = nullptr,
                                                     int ngroups = 0) {
     if (blockIdx.z) { w4 = w4b; sm = smb; y = yb; }  // second matrix of a paired launch (gate + up)
+    // dense, columns split over CTAs (short matrices): blockIdx.y is the block of NCOL columns; each column's math is unchanged
+    if constexpr (!GROUPED)
+        if (const int tile = int(blockIdx.y) + (CT > 1 ? int(blockIdx.x) % CT : 0)) {
+            xh += int64_t(tile) * NCOL * k; y += int64_t(tile) * NCOL * (ldy ? ldy : rows); nc -= tile * NCOL;
+        }
     int source_row = 0;
     // Dedup (GROUPED, NCOL > 1): expert_ids holds kDedupStride ints per unique expert: slot, columns, input rows[4],
     // output assignments[4]; the expert's weights are read once for all assignments that use it.
@@ -469,7 +476,8 @@ __global__ void __launch_bounds__(256, GROUPED ? (PF ? 3 : 4) : U4H_DENSE_MINB) 
         }
     }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, g = lane / 4, t = lane % 4;
-    const int row0 = blockIdx.x * 16 * MT;
+    static_assert(CT == 1 || !GROUPED, "u4h_matvec_k: CT is dense only");
+    const int row0 = int(blockIdx.x) / CT * 16 * MT;
     const uint32_t NEG1024 = 0xE400E400u;
     const int nb = k / 32;  // a lane owns one 32-weight block (16 B codes + one (s, m) pair) per iteration
     // Dedup: a block walks groups blockIdx.y, + gridDim.y, ... up to ngroups or the first slot -1 (a device-built map is

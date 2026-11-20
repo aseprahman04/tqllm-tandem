@@ -343,7 +343,7 @@ constexpr uint32_t TQ3_CB_HI = 0x01315372u;  // negative: -14, -45, -79, -127
 // activation fragment (L2) serves MT tiles (the 3-bit weights are fewer bytes than the activations they meet). Per row
 // and column the k split, MMA order and 8-warp reduction do not depend on MT or PF: same results.
 template <int NCOL, class OUT, int PF = 0, int MT = 1, bool PFX = false, int BITS = 3>
-__global__ void __launch_bounds__(256) tq3b_matvec_h_k(const uint32_t * w3, const __half * sc,
+__global__ void __launch_bounds__(256, NCOL > 8 && MT == 2 ? 2 : 1) tq3b_matvec_h_k(const uint32_t * w3, const __half * sc,
                                                                       const __half * xh, OUT * y, int rows, int k, int nc,
                                                                       int ldy) {
     constexpr int NACC = NCOL > 8 ? 8 : 4;
@@ -785,14 +785,16 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
             if (u > best + 1e-9) best = u, nw = w;
         }
     }
-    // the 16-row split-K kernel (tq3b_matvec_h_k) for <= 16 columns; prefetch mode 0 / 1 / 2 (see the kernel);
-    // variants 20 / 21 / 22 force it with that mode (tests / benches)
-    auto launch_new = [&](int pfm) {
+    // the 16-row split-K kernel (tq3b_matvec_h_k) for <= 16 columns; prefetch mode 0 / 1 / 2 (see the kernel), 16 x mtn
+    // rows per block; variants 20 / 21 / 22 force it with that mode, 23-25 the same with 2 row tiles, 26-28 with 4 (benches)
+    auto launch_new = [&](int pfm, int mtn = 1) {
         const uint32_t * w = reinterpret_cast<const uint32_t *>(w4);
-        const int grid = (rows + 15) / 16;
+        const int grid = (rows + 16 * mtn - 1) / (16 * mtn);
         auto go3 = [&](auto ncol_c, auto pf_c) {
             constexpr int NC = decltype(ncol_c)::value, P = decltype(pf_c)::value;
-            tq3b_matvec_h_k<NC, OUT, P, 1, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            if (mtn == 4) tq3b_matvec_h_k<NC, OUT, P, 4, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            else if (mtn == 2) tq3b_matvec_h_k<NC, OUT, P, 2, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
+            else tq3b_matvec_h_k<NC, OUT, P, 1, false, BITS><<<grid, 256, 0, s>>>(w, sc, xh, y, rows, k, ncols, ldy);
         };
         auto by_pf = [&](auto ncol_c) {
             if (pfm == 2) go3(ncol_c, std::integral_constant<int, 2>{});
@@ -802,14 +804,14 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
         if (ncols <= 8) by_pf(std::integral_constant<int, 8>{});
         else by_pf(std::integral_constant<int, 16>{});
     };
-    if (v >= 20 && v <= 22 && ncols <= 16) {
-        launch_new(v - 20);
+    if (v >= 20 && v <= 28 && ncols <= 16) {
+        launch_new((v - 20) % 3, v >= 26 ? 4 : v >= 23 ? 2 : 1);
         return;
     }
     if (v == 0) {  // default: the rule table (src/formats/weight/matvec_rules.hpp)
         const auto pick = mvr::choose(BITS, rows, k, ncols);
         if (pick.kern == mvr::Kern::Split16) {
-            launch_new(pick.pf);
+            launch_new(pick.pf, pick.mt);
             return;
         }
     }
@@ -992,6 +994,81 @@ __global__ void iq4n_dequant_h_k(const uint8_t * w, const uint8_t * rec, __half 
 void iq4n_dequant_h(const uint8_t * w, const uint8_t * rec, __half * out, int rows, int k, cudaStream_t s) {
     const int64_t n = int64_t(rows) * (k / 16);
     iq4n_dequant_h_k<<<unsigned((n + 255) / 256), 256, 0, s>>>(w, rec, out, n, k);
+}
+
+// The 16 FP16 weights of group gi exactly as iq4n_dequant_h_k writes them.
+__device__ __forceinline__ void iq4n_group_h(const uint8_t * w, const uint8_t * rec, int64_t gi, int k, __half (&v)[16]) {
+    const int64_t blk = gi / 2;
+    const int h = int(gi % 2), nb = k / 32;
+    const int64_t row = blk / nb;
+    const int b = int(blk % nb);
+    const __half sc = tq4k::iq4_scale(rec + (row * (nb / 8) + b / 8) * 8, b % 8);
+    const uint2 q = *reinterpret_cast<const uint2 *>(w + blk * 16 + h * 8);
+    const uint32_t qw[2] = {q.x, q.y};
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const uint32_t lv = tq4k::iq4_levels((u & 1) ? qw[u / 2] >> 16 : qw[u / 2]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) v[4 * u + e] = __hmul(__int2half_rn(int((lv >> (8 * e)) & 0xFF) - 128), sc);
+    }
+}
+
+// IQ4N straight to int8 [rows][k] for the int8 prefill GEMM, one block per row: the row scale amax/127 of the FP16 row
+// iq4n_dequant_h writes (1 for a zero row), then the values int8_quant_rows makes of that row - the same int8 operand and
+// scales as dequant_h + int8_quant_rows, without the FP16 round trip (the second pass re-reads the row from L1/L2).
+// cm (k floats, optional): the FP16 values times cm[column] first (SmoothQuant column scales).
+template <bool CM>
+__global__ void __launch_bounds__(64) iq4n_dequant_i8_k(const uint8_t * w, const uint8_t * rec, int k, int8_t * out, float * scale,
+                                                        const float * cm) {
+    // 64 threads per row: 5120 / 17408 columns are 320 / 1088 groups of 16, a multiple of 64 (no idle second pass)
+    const int64_t r = blockIdx.x, g0 = r * (k / 16);
+    const int ng = k / 16;
+    auto group = [&](int g, float (&f)[16]) {
+        __half v[16];
+        iq4n_group_h(w, rec, g0 + g, k, v);
+        if constexpr (CM) {
+            const float4 * c4 = reinterpret_cast<const float4 *>(cm + g * 16);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float4 c = __ldg(c4 + q);
+                f[4 * q] = __half2float(v[4 * q]) * c.x;
+                f[4 * q + 1] = __half2float(v[4 * q + 1]) * c.y;
+                f[4 * q + 2] = __half2float(v[4 * q + 2]) * c.z;
+                f[4 * q + 3] = __half2float(v[4 * q + 3]) * c.w;
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) f[e] = __half2float(v[e]);
+        }
+    };
+    float m = 0.f;
+    for (int g = threadIdx.x; g < ng; g += 64) {
+        float f[16];
+        group(g, f);
+#pragma unroll
+        for (int e = 0; e < 16; ++e) m = fmaxf(m, fabsf(f[e]));
+    }
+    __shared__ float red[2];
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+    if (threadIdx.x % 32 == 0) red[threadIdx.x / 32] = m;
+    __syncthreads();
+    m = fmaxf(red[0], red[1]);
+    const float sc = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sc;
+    if (threadIdx.x == 0) scale[r] = sc;
+    for (int g = threadIdx.x; g < ng; g += 64) {
+        float f[16];
+        group(g, f);
+        __align__(16) int8_t q[16];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) q[e] = int8_t(__float2int_rn(fminf(fmaxf(f[e] * inv, -127.f), 127.f)));
+        reinterpret_cast<uint4 *>(out)[g0 + g] = *reinterpret_cast<const uint4 *>(q);
+    }
+}
+void iq4n_dequant_i8(const uint8_t * w, const uint8_t * rec, int8_t * out, float * scale, int rows, int k, cudaStream_t s,
+                     const float * cm) {
+    if (rows < 1) return;
+    if (cm) iq4n_dequant_i8_k<true><<<rows, 64, 0, s>>>(w, rec, k, out, scale, cm);
+    else iq4n_dequant_i8_k<false><<<rows, 64, 0, s>>>(w, rec, k, out, scale, nullptr);
 }
 
 // dequantise IQ4L to FP16 [rows][k]; one thread per 16-weight group, two 16-byte stores

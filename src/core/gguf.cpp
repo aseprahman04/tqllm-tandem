@@ -152,6 +152,8 @@ bool gguf_block_layout(uint32_t type, uint64_t & elems, uint64_t & bytes) {
         case GGML_IQ4_XS: elems = 256; bytes = 136; return true;
         case GGML_TQ4:    elems = 128; bytes = 66;  return true;  // TQLLM: FP16 scale + 64 B of 4-bit codes
         case GGML_TQ3:    elems = 128; bytes = 50;  return true;  // TQLLM: FP16 scale + 48 B of 3-bit planes
+        case GGML_TQV12:  elems = 128; bytes = 66;  return true;  // TQLLM: FP16 scale + 4 x 16 B (8 x 12-bit index + 32 signs)
+        case GGML_TQT:    elems = 128; bytes = 66;  return true;  // TQLLM: FP16 scale + 64 B trellis stream
         default: return false;
     }
 }
@@ -292,6 +294,16 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
     }
     f.n_kv = n_kv;
     f.kv_end = uint64_t(r.in.tellg());
+    // TQV-12 files (docs/reference/formats.md): tensor type 305 + the codebook tag; any other tag is a codebook this build does not have
+    const auto tqv = f.kv.find("tqllm.tqv.codebook");
+    const bool tqv12 = tqv != f.kv.end();
+    if (tqv12 && tqv->second.str != "tqv12-v1")
+        throw std::runtime_error("GGUF " + path + ": TQV codebook \"" + tqv->second.str + "\" is not supported (this build has tqv12-v1)");
+    // TQT files: tensor type 306 + the code tag; another tag is a code this build does not decode
+    const auto tqt = f.kv.find("tqllm.tqt.code");
+    const bool tqt_c2 = tqt != f.kv.end();
+    if (tqt_c2 && tqt->second.str != "tqt-c2-v1")
+        throw std::runtime_error("GGUF " + path + ": TQT code \"" + tqt->second.str + "\" is not supported (this build has tqt-c2-v1)");
     std::vector<std::pair<std::string, GgufTensor>> infos;
     for (uint64_t i = 0; i < n_tensors; ++i) {
         auto name = r.str();
@@ -308,6 +320,8 @@ GgufFile gguf_open_shard(const std::string & path, GgufDialect dialect) {
         t.type_header_offset = uint64_t(r.in.tellg());
         t.type = r.get<uint32_t>();
         if (dialect == GgufDialect::GsqRco && t.type == 42) t.type = GGML_GSQ_Q2_0;
+        if (t.type == GGML_TQV12 && !tqv12) throw std::runtime_error("GGUF TQV-12 tensor " + name + " without tqllm.tqv.codebook");
+        if (t.type == GGML_TQT && !tqt_c2) throw std::runtime_error("GGUF TQT tensor " + name + " without tqllm.tqt.code");
         t.offset = r.get<uint64_t>();
         if (t.type == GGML_X3) {  // self-describing X3Record groups (the K can differ per expert): size from x3.bytes.<name>
             t.bytes = uint64_t(f.num("x3.bytes." + name, 0));

@@ -107,6 +107,39 @@ inline SamplingDefaults & sampling_defaults() {
     return d;
 }
 
+// --lora adapters (ids in load order) and the scales requests without a "lora" field run with (POST /lora-adapters)
+struct LoraDefaults {
+    std::mutex mu;
+    std::vector<std::string> paths;
+    std::vector<float> scales;
+};
+inline LoraDefaults & lora_defaults() {
+    static LoraDefaults d;
+    return d;
+}
+// [{"id": N, "scale": S}, ...] (llama.cpp's request and /lora-adapters body) onto `scales`; false + error on a bad entry
+inline bool read_lora_list(const tqllm::Json & x, std::vector<float> & scales, std::string & error) {
+    if (x.kind != tqllm::Json::Array) {
+        error = "lora must be an array of {\"id\": N, \"scale\": S}";
+        return false;
+    }
+    for (const auto & e : x.arr) {
+        const auto * id = e.kind == tqllm::Json::Object ? e.get("id") : nullptr;
+        const auto * sc = e.kind == tqllm::Json::Object ? e.get("scale") : nullptr;
+        if (!id || id->kind != tqllm::Json::Number || std::floor(id->num) != id->num || id->num < 0 ||
+            id->num >= double(scales.size())) {
+            error = "invalid adapter id (" + std::to_string(scales.size()) + " LoRA adapters loaded)";
+            return false;
+        }
+        if (sc && (sc->kind != tqllm::Json::Number || !std::isfinite(sc->num))) {
+            error = "LoRA scale must be a number";
+            return false;
+        }
+        scales[size_t(id->num)] = sc ? float(sc->num) : 0.f;
+    }
+    return true;
+}
+
 struct ChatRequest {
     std::shared_ptr<Monitor::Request> observation;  // server-owned counters; never parsed from client JSON
     std::string prompt_text;
@@ -129,6 +162,7 @@ struct ChatRequest {
     float repeat_penalty = sampling_defaults().repeat_penalty;      // sampling only: repeat_penalty / repetition_penalty
     float frequency_penalty = sampling_defaults().frequency_penalty;
     uint64_t seed = 0;
+    std::vector<float> lora;  // scale per --lora adapter for this request (empty: none loaded)
     bool ignore_eos = false;  // decode to max_tokens through end-of-sequence tokens (vLLM / llama.cpp field)
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
@@ -205,6 +239,16 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
         req.ignore_eos = ieos && ieos->kind == tqllm::Json::Bool && ieos->num != 0;
         const auto * rti = root.get("return_token_ids");
         req.return_token_ids = rti && rti->kind == tqllm::Json::Bool && rti->num != 0;
+
+        {  // runtime LoRA: the defaults, or the request's list (llama.cpp: adapters it does not name run at 0)
+            auto & ld = lora_defaults();
+            std::lock_guard<std::mutex> lk(ld.mu);
+            req.lora = ld.scales;
+        }
+        if (const auto * x = root.get("lora"); x && x->kind != tqllm::Json::Null) {
+            std::fill(req.lora.begin(), req.lora.end(), 0.f);
+            if (!read_lora_list(*x, req.lora, req.error)) return req;
+        }
 
         auto num = [&](const char * key, double & v) {
             if (const auto * x = root.get(key); x && x->kind == tqllm::Json::Number) { v = x->num; return true; }
@@ -560,6 +604,60 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// The prompt a chat client's next request most likely begins with: this request's messages plus the reply as it comes
+// back (its content and tool calls; its reasoning too when the client returns reasoning), rendered as any request is, up to
+// the end of the reply's message. A request that begins with it shares that much with a prefill made in the meantime.
+// Empty when the request has no messages or does not render.
+inline std::string next_prompt_prefix(const std::string & body, const DecodeResult & reply, bool with_reasoning,
+                                      uint32_t default_max_tokens, const std::string & system, bool reasoning = false,
+                                      const std::string & default_effort = "xhigh", const PromptRenderer * renderer = nullptr,
+                                      const tqllm::Json * default_kwargs = nullptr) {
+    static const std::string probe = "\x02tqllm-next-turn\x02";  // the next user message: the prefix ends where its message starts
+    try {
+        auto root = tqllm::parse_json(body);
+        tqllm::Json * messages = nullptr;
+        for (auto & [k, v] : root.obj)
+            if (k == "messages") messages = &v;
+        if (!messages || messages->kind != tqllm::Json::Array || messages->arr.empty()) return {};
+        auto text = [](const std::string & t) { tqllm::Json j; j.kind = tqllm::Json::String; j.str = t; return j; };
+        auto object = [](std::vector<std::pair<std::string, tqllm::Json>> fields) {
+            tqllm::Json j; j.kind = tqllm::Json::Object; j.obj = std::move(fields); return j;
+        };
+        auto answer = object({{"role", text("assistant")}, {"content", text(reply.text)}});
+        if (with_reasoning && !reply.reasoning.empty()) answer.obj.push_back({"reasoning_content", text(reply.reasoning)});
+        if (!reply.tool_calls.empty()) {
+            tqllm::Json calls; calls.kind = tqllm::Json::Array;
+            for (const auto & c : reply.tool_calls)
+                calls.arr.push_back(object({{"type", text("function")},
+                                            {"function", object({{"name", text(c.name)}, {"arguments", text(c.arguments)}})}}));
+            answer.obj.push_back({"tool_calls", calls});
+        }
+        messages->arr.push_back(answer);
+        messages->arr.push_back(object({{"role", text("user")}, {"content", text(probe)}}));
+        const auto next = parse_request(dump(root), default_max_tokens, system, true, reasoning, default_effort, renderer, default_kwargs);
+        const auto at = next.ok ? next.prompt_text.find(probe) : std::string::npos;
+        const auto start = at == std::string::npos ? at : next.prompt_text.rfind("<|im_start|>", at);
+        return start == std::string::npos ? std::string() : next.prompt_text.substr(0, start);
+    } catch (const std::exception &) {
+        return {};
+    }
+}
+// whether the client returns reasoning: an assistant message of its request carries some
+inline bool returns_reasoning(const std::string & body) {
+    try {
+        const auto root = tqllm::parse_json(body);
+        const auto * messages = root.get("messages");
+        if (!messages || messages->kind != tqllm::Json::Array) return false;
+        for (const auto & m : messages->arr) {
+            const auto * role = m.kind == tqllm::Json::Object ? m.get("role") : nullptr;
+            if (!role || role->kind != tqllm::Json::String || role->str != "assistant") continue;
+            for (const char * key : {"reasoning_content", "thinking"})
+                if (const auto * r = m.get(key); r && r->kind == tqllm::Json::String && !r->str.empty()) return true;
+        }
+    } catch (const std::exception &) {}
+    return false;
+}
+
 // Closing tags of the tool-call syntax at the end of plain prose, with no call before them: the model echoes them
 // after a long tool-using conversation ("... done.\n</parameter>"). They are never answer text: where the trailing run
 // of such tags (and whitespace) starts, or t.size() when the text does not end with one. `partial`: a tail that may still
@@ -790,6 +888,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     // The forward() loop below prefills token by token (one full weight pass per prompt token).
     if (incremental) {
         model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+        if (!req.lora.empty()) model.set_lora(req.lora);
         model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
         model.set_continuation(req.continuation);
@@ -1231,6 +1330,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     if (!result.error.empty()) return result;
     if (req.observation) req.observation->prefill(result.prompt_tokens);
     model.set_sampling(req.temperature, req.top_p, req.top_k, req.seed, req.presence_penalty);
+    if (!req.lora.empty()) model.set_lora(req.lora);
     model.set_penalties(req.repeat_penalty, req.frequency_penalty);
         model.set_ignore_eos(req.ignore_eos);
         model.set_continuation(req.continuation);

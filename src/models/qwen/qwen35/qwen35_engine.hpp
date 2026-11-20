@@ -10,6 +10,8 @@
 #include "debug.hpp"
 #include "batch_graph_key.hpp"
 #include "engine.hpp"
+#include <array>
+#include <unordered_map>
 #include <random>
 #include "nlohmann/json.hpp"
 #include "qwen2_kernels.cuh"
@@ -21,11 +23,14 @@
 #include "graph_capture.hpp"
 #include "graph_lru.hpp"
 #include "tree_columns.hpp"
+#include "suffix_copy.hpp"
 #include "dev_alloc.cuh"
 #include "fp8_gemm.cuh"
 #include "int8_gemm.cuh"
 #include "qwen35_guard.hpp"
 #include "qwen35_kernels.cuh"
+#include "qwen35_qsa.cuh"
+#include "qwen35_qsa_plan.hpp"
 #include "quant_kernels.cuh"
 #include "moe_kernels.cuh"
 #include "vision_kernels.cuh"
@@ -38,6 +43,8 @@
 #include "kv_store.hpp"
 #include "tqllm/rope_scaling.hpp"
 #include "weight_format.hpp"
+#include "lora.hpp"
+#include "lora.cuh"
 #include "tqllm/tokenizer.hpp"
 
 #include <cublas_v2.h>
@@ -63,7 +70,7 @@
 #include <vector>
 
 #ifndef TQLLM_VERIFY_COLUMNS
-#define TQLLM_VERIFY_COLUMNS 12
+#define TQLLM_VERIFY_COLUMNS 16
 #endif
 
 namespace tqllm {
@@ -72,14 +79,20 @@ MixStaging mix_staging(Basis basis, bool bf16_ba, bool quantized_model);
 }  // namespace tqllm
 #include "qwen35_types.hpp"
 #include "token_sampling.hpp"
+#include "layer_split.hpp"
+#include "../../../kv/prompt_park.hpp"
+#include "tp_comm.hpp"
+#include "qwen35_rules.hpp"
 namespace tqllm {
 namespace qwen35_detail {
 
 class Qwen35Engine final : public Engine {
 public:
     // `path`: a checkpoint directory (safetensors, BF16), a .gguf file (TQ3_4S / Q6_K / F32), or a mapped folder (exl3).
-    Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o)
-        : opt(o), context_(ctx) {
+    // `tp` (--split layer): this process is one rank of a layer split; it loads and runs only its own layers
+    Qwen35Engine(const std::string & path, const std::string & tokpath, uint32_t ctx, int slots, const EngineOptions & o,
+                 std::shared_ptr<TpComm> tp = nullptr)
+        : opt(o), context_(ctx), tp_(std::move(tp)) {
         glru.set_cap(size_t(std::max(1, opt.graph_cache)));
         graph_keep = size_t(std::max(0L, opt.graph_keep_mb)) << 20;
         if (slots < 1 || slots > 64) throw std::invalid_argument("slots must be in 1..64");
@@ -93,11 +106,21 @@ public:
         } else {
             cfg = read_config(path);
         }
+        lr_ = tp_ ? layer_range(cfg.layers, tp_->rank(), tp_->world(), opt.split_at) : LayerRange{0, cfg.layers};
+        if (tp_) {
+            if (!gguf || cfg.moe) throw std::invalid_argument("--split layer needs a dense qwen35 GGUF model");
+            if (opt.kv_host > 0 || opt.kv_compact)
+                throw std::invalid_argument("--split layer: --kv-host and --kv-compact are single-GPU only so far");
+            if (cfg.hidden % 256) throw std::invalid_argument("--split layer: hidden size must be a multiple of 256");
+            std::fprintf(stderr, "tqllm: --split layer: rank %d of %d runs layers %u..%u of %u\n", tp_->rank(), tp_->world(),
+                         lr_.lo, lr_.hi - 1, cfg.layers);
+        }
         ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         set_rope();
         try {
             tokenizer.load(tokpath);
             eos_ = tokenizer.eos_id();
+            im_start_ = tokenizer.special_id("<|im_start|>");
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
@@ -116,14 +139,17 @@ public:
             else load_safetensors(path);
             memlog("weights");
             nslots = slots;
+            load_lora();
             allocate();
+            if (lora_n) lora_t = Buf(tqllm_cuda::lora_scratch_floats(NBUF, lora_cmax, lora_rmax) * 4);
             memlog("buffers");
             if (tqllm::drafters(opt).dflash && gguf) load_dflash(opt.draft_model.c_str());
             split_alloc_dev0();  // after the drafter: device 0 gets its own copy of the drafter features too
             memlog("drafter");
             calibrate_prefill();
+            smooth_prebuild();
             memlog("calibrate");
-            pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
+            pc_on = opt.prompt_cache || (kv_cmp && slots == 1);  // several slots: each keeps its own conversation
             if (slots > 1 && !fmt_target) throw std::runtime_error("multiple slots need a quantized GGUF model (verify path)");
             parked.resize(size_t(slots));
             for (int s = 1; s < slots; ++s) {  // allocate slot s in the members, then park it; slot 0 stays active
@@ -135,6 +161,7 @@ public:
                 swap_seq(tmp);
                 parked[size_t(s)] = std::move(tmp);
             }
+            park_init(slots);
         } catch (...) {
             release_raw();
             throw;
@@ -183,6 +210,31 @@ public:
     void pc_copy(bool save);
     // cache positions of prompt that can be kept (the recurrent state is set to match); the rest is prefilled
     uint32_t pc_match(const std::vector<uint32_t> & prompt);
+    // prompt tokens slot s would keep (no state change): the scheduler sends an agent's next turn to its slot
+    static uint32_t pc_shared(const std::vector<uint32_t> & seq, bool live, uint32_t snap, const std::vector<uint32_t> & prompt) {
+        const auto P = uint32_t(prompt.size());
+        auto shared = [&](uint32_t n) {
+            return n > 0 && n < P && n <= seq.size() && std::equal(seq.begin(), seq.begin() + n, prompt.begin());
+        };
+        if (live && shared(uint32_t(seq.size()))) return uint32_t(seq.size());
+        return shared(snap) ? snap : 0;
+    }
+    // A failed request (tqserve): its slot's prompt cache may name tokens whose K/V or recurrent state a skipped kernel
+    // never wrote, so nothing of it is reused; the slot's next request prefills from position 0
+    void spec_abort(int s) override {
+        if (s < 0 || s >= nslots) return;
+        if (s == active) { pc_drop(); pc_seq.clear(); }
+        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); }
+    }
+    int lora_count() const override { return lora_n; }
+    void set_lora(const std::vector<float> & scales) override;
+    uint32_t prefix_reuse(int s, const std::vector<uint32_t> & prompt) const override {
+        if (!pc_on || s < 0 || s >= nslots) return 0;
+        const uint32_t own = s == active ? pc_shared(pc_seq, pc_live && !opt.exact, pc_snap, prompt)
+                                         : pc_shared(parked[size_t(s)].pc_seq, parked[size_t(s)].pc_live && !opt.exact,
+                                                     parked[size_t(s)].pc_snap, prompt);
+        return std::max(own, park_best(prompt, nullptr));  // a parked state resumes in any slot
+    }
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
 
 private:
@@ -292,7 +344,14 @@ private:
     bool quantized = false;
     bool fmt_target = false;     // target matrices come from a registered weight format (src/formats)
     Basis basis_ = Basis::Plain;  // how verify/prefill matmul inputs are prepared (from the target's weight format)
-    std::vector<Layer> layer;
+    std::vector<Layer> layer;  // full size; a --split layer rank loads only lr_ (the others stay empty)
+    std::shared_ptr<TpComm> tp_;
+    LayerRange lr_;
+    // --split layer: hidden rows [n][H], their sum-of-squares partials and the drafter features cross the boundary;
+    // the last rank sends its final rows back, so every rank runs the same head and drafter on the same rows
+    void split_enter(bf16 * X, int n);
+    void split_leave(bf16 * X, int n);
+    int split_min(int v);  // the smallest of every rank's v (sizes taken from free memory must agree)
     std::unique_ptr<KvMemory> kv_mem;  // declared before every KvStore so stores return their pages first
     std::unique_ptr<KvPool> kv_pool;
     std::unique_ptr<KvStore> kv_seq;   // the active slot's KV rows; key_cache / value_cache view them per attention layer
@@ -309,7 +368,7 @@ private:
     int cmp_layer = -1, ring_used = 0, ring_end = 0;  // the ring is written at position % kRing; newest row before ring_end
     std::vector<int> cmp_r;  // per attention layer; the middle ones lose most to compaction and keep twice the rows
     int64_t cmp_pos = 0, cmp_max = 0;  // cmp_max: positions the stand-in buffers can cover
-    // Prompt reuse (one slot): the cache holds pc_seq. With pc_live the recurrent state is at pc_seq.size(); pc_host
+    // Prompt reuse (per slot, swapped with it): the cache holds pc_seq. With pc_live the recurrent state is at pc_seq.size(); pc_host
     // holds the state at pc_snap, a prefill chunk boundary kTail tokens before the last prompt's end, for a prompt that
     // shares only that much (a chat template re-renders the previous answer without its think tags).
     static constexpr uint32_t kTail = 64;
@@ -317,11 +376,57 @@ private:
     uint32_t pc_snap = 0;
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
+    uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
+    uint32_t im_start_ = ~0u;  // the chat template's message-start token (prefill chunks restart there)
+    // kept states parked outside the slots (PromptPark, the TPark rules): a slot handed to another conversation parks its
+    // kept state (KV rows [0, snap) of this rank's attention layers + the recurrent state at snap); the next turn of that
+    // conversation picks it up into whichever slot it gets
+    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0;
+                       std::vector<float> lora; };  // lora: the LoRA scales the state was built with
+    // the drafter's K/V rows that go with a kept state: its whole ring, else positions [0, snap)
+    size_t dfl_park_bytes(uint32_t snap) const {
+        if (!dfl.present || dfl_kc.empty()) return 0;
+        return size_t(dfl.ring ? uint32_t(dfl.ring) : snap) * size_t(dfl.kvheads) * dfl.hd * 2;
+    }
+    std::unique_ptr<PromptPark> park_;
+    std::vector<ParkSpace> park_sp_;
+    void park_init(int slots);
+    void park_out();
+    void park_swap(const std::vector<uint32_t> & prompt);
+    uint32_t park_best(const std::vector<uint32_t> & prompt, int * where) const;
     std::vector<Buf> q_ring, cmp_k, cmp_v, cmp_b;
     std::vector<tqllm_cuda::KvCompactSeg> cmp_seg;
     Buf d_cmp_i, d_stage_off, cmp_scratch, cmp_split;  // d_cmp_i: [start position, stand-in rows]; d_stage_off: [K, V] bytes
     cusolverDnHandle_t solver{};
     std::vector<KvRef> key_cache, value_cache;
+    // QSA (qwen35_qsa.cuh): sparse attention of verify rows past `from` keys when the file carries indexers. One slot,
+    // BF16 KV, two-part verify attention; anything else stays dense (qsa_setup logs why).
+    struct QsaLayer {
+        const __half * w = nullptr;  // [4 x 128 query | 128 key][hidden]
+        const float * q_norm = nullptr, * k_norm = nullptr, * block_norm = nullptr;
+        std::unique_ptr<HostBuf> tok;  // token keys [context][128] FP16 (pinned host memory, read by the pooling kernel)
+        Buf blocks;                    // block keys [context / 4][128]
+    };
+    struct Qsa {
+        bool on = false;
+        int file_from = 0, from = 0;  // rows whose split point is >= from are sparse
+        int max_blocks = 0;
+        std::vector<QsaLayer> layer;  // per attention layer; empty: no indexers in the file
+        Buf xu, proj, q, bits, sel, mass;
+        Buf tail_off;  // staged host KV tail: [K, V] first byte of the last evicted granule (sparse blocks stage back only that)
+        Buf mark;      // staged host KV tail: [max_blocks] block marks + 1 call tag (qsa27_stage_selected)
+        QsaPlan plan;   // token keys and block keys of the cache so far
+        int mode = 0;   // the verify block being launched: 0 dense, 1 every row sparse, 2 it crosses `from`
+        const int32_t * cur = nullptr;  // the selection of the attention layer that runs next (attn_core)
+        int mass_left = 0;              // TQLLM_DEBUG=qsa_mass: sparse steps still to report
+    } qsa;
+    void qsa_load(const GgufFile & f);
+    void qsa_setup();
+    // before a verify launch writes n positions at pos: the block's mode and the block keys its rows may pick from
+    void qsa_plan(uint32_t pos, int n);
+    // one attention layer of a verify block: token keys of its n rows; sparse blocks also get their rows' selections
+    void qsa_index(const Layer & L, uint32_t attn_i, int n, const int * dpos, const int * dep);
+    void qsa_mass_report(uint32_t attn_i);
     std::vector<Buf> conv_state, rec_state;
     Buf x, norm, resid, mix, gate, up, act, logits_buf, token, part, xq, xs, xf, part_x, part_m, amax;
     Buf t_in, t_qg, t_q, t_k, t_v, t_o, t_qkv, t_qkvc, t_z, t_a, t_b, t_core, t_gn;
@@ -560,6 +665,9 @@ private:
     // DFlash generation in progress (spec_begin / spec_advance / spec_finish).
     struct Gen {
         std::vector<uint32_t> out, hist;  // hist: the prompt (prompt-lookup drafting reads hist + out)
+        // copy drafts (token tree without --lookup): prompt + the first `copied` output tokens
+        tqllm::SuffixCopy copy{tqllm::SuffixCopyOptions{4, tqllm::kCopyFirstMatch, 64, 64}};
+        size_t copied = 0;
         std::vector<uint32_t> mtp_draft;
         bool native_mtp = false;
         uint32_t P = 0, count = 0, pos = 0, pending = 0;
@@ -581,6 +689,11 @@ private:
         SamplingParams samp;
         std::mt19937_64 rng{0};
         Gen gen;
+        bool pc_live = false;
+        uint32_t pc_snap = 0;
+        std::vector<uint32_t> pc_seq;
+        std::unique_ptr<HostBuf> pc_host;
+        uint64_t pc_conv = 0;
     };
     std::vector<SeqState> parked;  // parked[s] holds slot s while it is not active
     int active = 0, nslots = 1, NB = NVER;
@@ -628,6 +741,18 @@ private:
     std::unique_ptr<tqllm_cuda::Fp8Gemm> fp8;  // --prefill-fp8 on (sm_89+): FP8 prefill GEMMs
     std::unique_ptr<tqllm_cuda::Int8Gemm> i8;  // --prefill-int8 on (Ampere): int8 prefill GEMMs into gemm_c as int32
     bool i8_used = false;
+    // int8 SmoothQuant (the int8 path's default; TQLLM_DEBUG=i8_nosmooth for plain per-token activations): per gemm_rows
+    // call, x / s and w * s with s from the column abs-max of x (sm_ax) and of w (sm_aw, built once per matrix)
+    Buf sm_ax, sm_s;
+    std::map<const void *, Buf> sm_aw;
+    bool sm_on = false;
+    bool smooth_setup(const Mat & m, int n);
+    const float * smooth_aw(const Mat & m);  // nullptr: no smoothing for this matrix
+    void smooth_prebuild();
+    // TQLLM_DEBUG=calib_dump (calib_dump.hpp): the prefill inputs of chosen layers to disk, for weight quantisers
+    void calib_dump(const Mat & m, int n, Basis in);
+    bool cd_pause = false, cd_inner = false;  // load-time prefill calibration; inside mm_h (already written)
+    std::map<std::string, long long> cd_tok;
     Buf fp8_sw;                     // row scales of the current gemm_rows output, [ldo]
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
@@ -660,13 +785,60 @@ private:
         if (dbg_graphs) {
             size_t fr = 0, tot = 0;
             cudaMemGetInfo(&fr, &tot);
-            std::fprintf(stderr, "graph miss family %d key %016llx (cached %zu, evictions %zu, free %zu MB)\n", family,
-                         (unsigned long long) key, glru.size(), glru.evictions(), fr >> 20);
+            // graph-owned memory (allocations made inside captures) stays reserved by the driver after its execs are
+            // destroyed until cudaDeviceGraphMemTrim; the stream-ordered pool keeps freed blocks until trimmed
+            int dev = 0; cudaGetDevice(&dev);
+            unsigned long long g_res = 0, g_used = 0; size_t p_res = 0; cudaMemPool_t pool = nullptr;
+            cudaDeviceGetGraphMemAttribute(dev, cudaGraphMemAttrReservedMemCurrent, &g_res);
+            cudaDeviceGetGraphMemAttribute(dev, cudaGraphMemAttrUsedMemCurrent, &g_used);
+            if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+                uint64_t r = 0; cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &r); p_res = size_t(r);
+            }
+            std::fprintf(stderr, "graph miss family %d key %016llx (cached %zu, evictions %zu, free %zu MB; graph memory "
+                         "reserved %llu / used %llu MB, pool reserved %zu MB)\n", family, (unsigned long long) key, glru.size(),
+                         glru.evictions(), fr >> 20, g_res >> 20, g_used >> 20, p_res >> 20);
         }
         return glru.insert(
             family, key, [&] { return tqllm::instantiate_graph(tqllm::capture_graph(stream, body)); },
             [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
-            [&] { cudaStreamSynchronize(stream); }, [](cudaGraphExec_t g) { cudaGraphExecDestroy(g); });
+            [&] { cudaStreamSynchronize(stream); }, [this](cudaGraphExec_t g) { drop_graph(g); });
+    }
+    // verify graphs with the host KV tail: captured once, the staging copies' memcpy nodes kept and updated in place
+    template <class Body>
+    cudaGraphExec_t cached_verify_graph(int family, uint64_t key, Body && body) {
+        if (lora_now()) key ^= uint64_t(1) << 48;  // free in verify keys (n < 256); batch keys are hashes
+        if (!kv_staged) return cached_graph(family, key, std::forward<Body>(body));
+        key = (key ^ tqllm::qwen35::stage_graph_kind(stage_plan())) * 1099511628211ull;
+        cudaGraphExec_t e = glru.find(family, key);
+        if (!e)
+            e = glru.insert(
+                family, key,
+                [&] {
+                    stage_capture.clear();
+                    cudaGraph_t g = tqllm::capture_graph(stream, body);
+                    cudaGraphExec_t x = nullptr;
+                    if (const cudaError_t r = cudaGraphInstantiate(&x, g, 0); r != cudaSuccess) {
+                        cudaGraphDestroy(g);
+                        throw std::runtime_error(std::string("graph instantiate: ") + cudaGetErrorString(r));
+                    }
+                    stage_graphs[x] = {g, stage_capture, stage_plan()};
+                    return x;
+                },
+                [&] { size_t fr = 0, tot = 0; return graph_keep && cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < graph_keep; },
+                [&] { cudaStreamSynchronize(stream); }, [this](cudaGraphExec_t g) { drop_graph(g); });
+        if (auto it = stage_graphs.find(e); it != stage_graphs.end()) {
+            const auto s = stage_plan();
+            if (s != it->second.plan) {
+                for (const auto & sn : it->second.nodes) {
+                    void * d = nullptr; const void * src = nullptr; size_t n = 0;
+                    stage_copy(s, sn.layer, sn.key, &d, &src, &n);
+                    ck(cudaGraphExecMemcpyNodeSetParams1D(e, sn.node, d, src, n, cudaMemcpyHostToDevice));
+                }
+                it->second.plan = s;
+                ++stage_updates;
+            }
+        }
+        return e;
     }
     // TQLLM_DEBUG=stageprof: verify blocks run eagerly with a stream sync after every stage; per-stage wall time (kernel +
     // its launch latency in isolation) is printed with the per-step profile. Perturbs the step; for attribution only.
@@ -682,9 +854,34 @@ private:
     double last_prefill_ms = 0;
     std::chrono::steady_clock::time_point dec_log_tp;  // last TQLLM_DEBUG=decode progress print
 
-    // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own)
+    // v_xh holds the input prepared in `in` (the model's basis unless a caller prepared its own); + the matrix's LoRA
     void mm_h(const Mat & m, bf16 * out, int n) { mm_h(m, out, n, basis_); }
-    void mm_h(const Mat & m, bf16 * out, int n, Basis in);
+    void mm_h(const Mat & m, bf16 * out, int n, Basis in) {
+        mm_h_base(m, out, n, in);
+        if (!lora_of.empty()) lora_mm(m, out, n);
+    }
+    void mm_h_base(const Mat & m, bf16 * out, int n, Basis in);
+    // Runtime LoRA (--lora, lora.hpp): per adapted layer matrix, each adapter's A (stored in the matrix's input basis, so
+    // it reads the same prepared v_xh) and B (alpha / rank folded in). Scales live on the device per slot and adapter
+    // (d_lscale [nslots][lora_n]); captured graphs read them at run time, so a new scale needs no recapture. Whether the
+    // adapter kernels run at all (some scale of the verify's slots nonzero) is part of the graph key (lora_now).
+    struct LoraPiece { int adapter = 0, rank = 0; Buf a, b; };
+    std::unordered_map<const Mat *, std::vector<LoraPiece>> lora_of;
+    int lora_n = 0, lora_rmax = 0, lora_cmax = 0;
+    std::vector<std::vector<float>> lora_slot;  // [slot][adapter]: host copy of d_lscale
+    Buf d_lscale, lora_t;                       // lora_t: A x partials of one matrix (lora_scratch_floats)
+    void load_lora();
+    bool lora_on(int slot) const {
+        for (float v : lora_slot[size_t(slot)]) if (v != 0.f) return true;
+        return false;
+    }
+    bool lora_now() const {  // the verify being built (segs, else the active slot) runs any adapter
+        if (lora_of.empty()) return false;
+        if (segs.empty()) return lora_on(active);
+        for (const auto & g : segs) if (lora_on(g.slot)) return true;
+        return false;
+    }
+    void lora_mm(const Mat & m, bf16 * out, int n);
     // Prefill dispatch by memory traffic (prefill_path.hpp): short chunks of formats without a native GEMM no longer pay
     // the per-chunk FP16 dequantisation of every weight.
     std::map<const WeightFormat *, PrefillCross> pf_cross;  // measured per format at load (calibrate_prefill)
@@ -760,6 +957,23 @@ public:
     // every KV write of n positions at pos: staging window (host tail) or the device-resident TqCache bookkeeping
     void kv_track(uint32_t pos, int n);
     void kv_prefetch(uint32_t a);
+    std::array<int64_t, 4> stage_plan() const;
+    // one staging copy (layer a's K or V) of a plan: a range of the host copy into the same range of the staging buffer, or a
+    // 16-byte copy into a scratch pair when nothing is staged (a captured memcpy node exists for every layer either way)
+    void stage_copy(const std::array<int64_t, 4> & s, uint32_t a, bool key, void ** dst, const void ** src, size_t * n) const;
+    // host KV tail staged by the copy engine inside captured verify graphs: each graph keeps its memcpy nodes, updated in
+    // place (cudaGraphExecMemcpyNodeSetParams1D) when the plan changes (every few tokens as the device window slides)
+    struct StageNode { cudaGraphNode_t node; uint32_t layer; bool key; };
+    struct StageGraph { cudaGraph_t graph = nullptr; std::vector<StageNode> nodes; std::array<int64_t, 4> plan{}; };
+    std::unordered_map<cudaGraphExec_t, StageGraph> stage_graphs;
+    std::vector<StageNode> stage_capture;  // kv_prefetch's nodes during a capture
+    Buf stage_dummy_dev;
+    void * stage_dummy_host = nullptr;
+    uint64_t stage_updates = 0;
+    void drop_graph(cudaGraphExec_t g) {
+        if (auto it = stage_graphs.find(g); it != stage_graphs.end()) { cudaGraphDestroy(it->second.graph); stage_graphs.erase(it); }
+        cudaGraphExecDestroy(g);
+    }
 
     void verify_async(const uint32_t * tokens, const int * pos_host, int n, uint32_t pos,
                       uint32_t * next, bool copy_all) {
@@ -788,9 +1002,11 @@ public:
         // captured graphs bake in the slot's cache and state pointers, so the slot is part of the key
         const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > NVER && prefill_final) << 63) |
                              (uint64_t(sampling()) << 62) | (uint64_t(active) << 54) | (uint64_t(tree_step) << 53) |
-                             (uint64_t(sp) << 52);
+                             (uint64_t(sp) << 52) | (uint64_t(qsa.mode) << 50);
         if (tp) {  // tensor parallel (fork addition): eager, both GPUs interleaved
             verify_body_tp(n, int(bucket));
+        } else if (qsa.mode && qsa.mass_left > 0) {
+            verify_body(n, int(bucket));
         } else if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
             ck(cudaStreamSynchronize(stream));
             stage_on = true;
@@ -815,7 +1031,7 @@ public:
             ck(cudaGraphLaunch(cached_graph(kGraphVerify, key | (uint64_t(2) << 58), [&] { verify_body(n, int(bucket), 1); }),
                                stream));
         } else {
-            ck(cudaGraphLaunch(cached_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
+            ck(cudaGraphLaunch(cached_verify_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
         }
         if (next) {
             const auto * src = v_tok.as<uint32_t>() + (copy_all || n > NVER ? 0 : n - 1);
@@ -924,8 +1140,10 @@ public:
         if (!part) part = v_part.as<float>();
         const bool cmp = kv_cmp && cmp_layer >= 0;
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
-        kvf->write_and_attend({K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
-                               1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr});
+        KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
+                    1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr};
+        if (qsa.cur && (par || kvf->qsa_one_part())) step.qsa_sel = qsa.cur, step.qsa_from = qsa.from, step.qsa_mixed = qsa.mode == 2;
+        kvf->write_and_attend(step);
         if (!cfg.gated_attention) return;
         if (xh && basis_ == Basis::Tq4Rot128) tqllm_cuda::tq4_sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);
         else if (xh) tqllm_cuda::sigmoid_gate_rot_h(O, T, rows, n, nh, hd, xh, stream);  // + the wo input rotation
@@ -1006,6 +1224,9 @@ public:
     // Verify rescoring reads 16 candidate rows per column, and the drafter uses head4 / its subset: the full int8 head
     // (1.27 GB for Qwen3.8) can live in pinned host memory the device reads over PCIe (~0.6 MB per 8-column round).
     void head8_host_alloc();
+    static constexpr int kHead8Chunk = 16384;  // rows per device staging chunk of the host int8 head (84 MB at 5,120 columns)
+    void head8_to_host();
+    void head8_rows_from_host(int8_t * w, __half * sc, int n);
     int L_conv_rows() const { return dfl.L.empty() ? 0 : dfl.L[0].conv_attn.rows; }
 
     // generic TQ3 matvec on n rows of a BF16 input (rotates into v_xh first)
@@ -1388,9 +1609,10 @@ public:
         ck(cudaMemcpyAsync(v_pos.p, h_pos, 2 * segs.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
         upload_rpos(int(segs.size()), [&](int i) { return rdelta_of(rq[size_t(i)].slot); });
         for (const auto & g : segs) kv_track(g.pos, g.n);
-        uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40);
+        uint64_t key = 0x9E3779B97F4A7C15ull ^ (uint64_t(sp) << 40) ^ (uint64_t(qsa.mode) << 44);
         for (const auto & g : segs) key = (key ^ uint64_t((g.slot * 64 + g.n) * 4 + cur_of(g.slot) % NSLOT)) * 1099511628211ull;
-        ck(cudaGraphLaunch(cached_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
+        if (qsa.mode && qsa.mass_left > 0) verify_body(col, int(context_));  // TQLLM_DEBUG=qsa_mass reads back per layer
+        else ck(cudaGraphLaunch(cached_verify_graph(kGraphBatch, key, [&] { verify_body(col, int(context_)); }), stream));
         const size_t ncol = static_cast<size_t>(col);
         std::vector<uint32_t> res(ncol, 0u), in(ncol, 0u);
         std::vector<int> tpar(ncol, 0);
@@ -1434,9 +1656,14 @@ public:
                 std::vector<tqllm_cuda::PathGather> gd;
                 uint32_t lin_i = 0, attn_i = 0;
                 for (uint32_t l = 0; l < cfg.layers; ++l) {
+                    if (!lr_.owns(l)) {
+                        ++(cfg.full[l] ? attn_i : lin_i);
+                        continue;
+                    }
                     if (cfg.full[l]) {
                         gd.push_back({kc_of(g.slot)[attn_i].p, kv_row_bytes(true), 1});
                         gd.push_back({vc_of(g.slot)[attn_i].p, kv_row_bytes(false), 1});
+                        if (qsa.on) gd.push_back({qsa.layer[attn_i].tok->p, int64_t(tqllm_cuda::kQsa27Dim) * 2, 1});
                         ++attn_i;
                     } else {
                         const int64_t rb = int64_t(mix_rows(layer[l])) * 2;

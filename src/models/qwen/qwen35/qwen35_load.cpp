@@ -2,6 +2,7 @@
 // Modified in the multi-GPU fork: per-layer device placement, a KV pool per GPU, portable host embeddings for the
 // layer split (TQLLM_SPLIT; see qwen35_split.cpp).
 #include "qwen35_engine.hpp"
+#include "cuda_compat.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -210,6 +211,7 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         const auto p = "blk." + std::to_string(l) + ".";
         auto & L = layer[l];
         L = {};
+        if (!lr_.owns(l)) continue;  // --split layer: another rank's layer
         L.in_norm = g_f32(f, p + "attn_norm.weight", H);
         L.post_norm = g_f32(f, p + (cfg.gated_attention ? "post_attention_norm.weight" : "ffn_norm.weight"), H);
         if (cfg.moe) {
@@ -259,6 +261,165 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
         }
     }
     use_dev(1);  // layer split: buffers, head and drafter are set up on the last device
+    qsa_load(f);
+}
+
+// Runtime LoRA adapters (--lora): A in each matrix's input basis (a rotated format reads x rotated per block, so A x =
+// (A R^T)(R x): the rows of A take the same rotation as an activation), B with alpha / rank folded in
+void Qwen35Engine::load_lora() {
+    if (opt.lora.empty()) return;
+    if (!fmt_target) throw std::invalid_argument("--lora needs a quantized GGUF model (the verify path)");
+    if (cfg.moe || tp_) throw std::invalid_argument("--lora: dense single-GPU Qwen3.5 / 3.8 models only so far");
+    lora_n = int(opt.lora.size());
+    auto upload = [&](const void * h, size_t bytes) {
+        Buf d(bytes);
+        ck(cudaMemcpy(d.p, h, bytes, cudaMemcpyHostToDevice));
+        return d;
+    };
+    for (int i = 0; i < lora_n; ++i) {
+        const std::string & path = opt.lora[size_t(i)];
+        const LoraFile lf = lora_read(path);
+        int rlo = 1 << 30, rhi = 0, rotated = 0;
+        for (const auto & [name, t] : lf.tensors) {
+            int l = -1;
+            char kind[64] = {};
+            if (std::sscanf(name.c_str(), "blk.%d.%63[^.].weight", &l, kind) != 2 || l < 0 || l >= int(cfg.layers) ||
+                name != "blk." + std::to_string(l) + "." + kind + ".weight")
+                throw std::invalid_argument("--lora " + path + ": " + name + " is not a layer matrix of this model");
+            Layer & L = layer[size_t(l)];
+            const std::string k = kind;
+            Mat * m = k == "attn_output" ? &L.wo : k == "ssm_out" ? &L.w_out : k == "ffn_down" ? &L.w_down : nullptr;
+            if (!m)
+                throw std::invalid_argument("--lora " + path + ": " + name +
+                                            ": only attn_output, ssm_out and ffn_down adapters are supported so far");
+            if (!m->p) throw std::invalid_argument("--lora " + path + ": the model has no " + name);
+            if (t.rows != m->rows || t.cols != m->cols)
+                throw std::invalid_argument("--lora " + path + ": " + name + " is " + std::to_string(t.rows) + " x " +
+                                            std::to_string(t.cols) + ", the model's " + std::to_string(m->rows) + " x " +
+                                            std::to_string(m->cols));
+            if (t.rank > tqllm_cuda::kLoraMaxRank || t.cols % 2)
+                throw std::invalid_argument("--lora " + path + ": " + name + ": rank above " +
+                                            std::to_string(tqllm_cuda::kLoraMaxRank) + " or odd column count");
+            const Basis bs = m->fmt ? m->fmt->basis() : Basis::Plain;
+            std::vector<float> a = t.a, b = t.b;
+            const float f = lora_factor(lf.alpha, t.rank);
+            for (float & v : b) v *= f;
+            if (bs != Basis::Plain) {  // the engine's own input rotation on the rows of A (BF16 in, FP16 out), power-of-2 scaled
+                float mx = 0.f;
+                for (float v : a) mx = std::max(mx, std::fabs(v));
+                if (mx > 0.f) {
+                    int e = 0;
+                    std::frexp(mx, &e);
+                    const float up = std::ldexp(1.f, 8 - e), down = 1.f / up;  // max |a| x up in [128, 256)
+                    std::vector<bf16> hb(a.size());
+                    for (size_t j = 0; j < a.size(); ++j) hb[j] = __float2bfloat16(a[j] * up);
+                    Buf db = upload(hb.data(), hb.size() * 2), dh(a.size() * 2);
+                    prep_input(bs, db.as<bf16>(), dh.as<__half>(), t.cols, t.rank);
+                    std::vector<__half> hh(a.size());
+                    ck(cudaMemcpyAsync(hh.data(), dh.p, hh.size() * 2, cudaMemcpyDeviceToHost, stream));
+                    sync_ck();
+                    for (size_t j = 0; j < a.size(); ++j) a[j] = __half2float(hh[j]) * down;
+                }
+                ++rotated;
+            }
+            LoraPiece p;
+            p.adapter = i;
+            p.rank = t.rank;
+            p.a = upload(a.data(), a.size() * 4);
+            p.b = upload(b.data(), b.size() * 4);
+            lora_of[m].push_back(std::move(p));
+            rlo = std::min(rlo, t.rank), rhi = std::max(rhi, t.rank);
+            lora_cmax = std::max(lora_cmax, t.cols);
+        }
+        lora_rmax = std::max(lora_rmax, rhi);
+        std::fprintf(stderr, "tqllm: LoRA %d: %s, %zu matrices (%d in a rotated basis), rank %d%s%s, alpha %g, scale %g%s\n", i,
+                     path.c_str(), lf.tensors.size(), rotated, rlo, rlo == rhi ? "" : "..", rlo == rhi ? "" : std::to_string(rhi).c_str(),
+                     double(lf.alpha), double(opt.lora_init(size_t(i))), opt.lora_init_without_apply ? " (until a request sets it)" : "");
+    }
+    std::vector<float> init(static_cast<size_t>(lora_n));
+    for (int i = 0; i < lora_n; ++i) init[size_t(i)] = opt.lora_init(size_t(i));
+    lora_slot.assign(size_t(nslots), init);
+    std::vector<float> all;
+    for (int s = 0; s < nslots; ++s) all.insert(all.end(), init.begin(), init.end());
+    d_lscale = upload(all.data(), all.size() * 4);
+}
+
+// QSA indexers (tools/qsa_indexer_gguf.py + gguf_add.py): all full-attention layers or none
+void Qwen35Engine::qsa_load(const GgufFile & f) {
+    using namespace tqllm_cuda;
+    const int H = int(cfg.hidden);
+    if (!cfg.gated_attention || cfg.moe || H % 256) return;
+    for (uint32_t l = 0; l < cfg.layers; ++l) {
+        if (!cfg.full[l]) continue;
+        const auto p = "blk." + std::to_string(l) + ".";
+        if (!f.tensors.count(p + "qsa_q.weight")) {
+            qsa.layer.clear();
+            return;
+        }
+        std::vector<char> w;
+        for (const auto & [name, rows] : {std::pair<const char *, int>{"qsa_q.weight", kQsa27Heads * kQsa27Dim}, {"qsa_k.weight", kQsa27Dim}}) {
+            const auto & t = gt(f, p + name);
+            if (t.type != GGML_F16 || t.ne.size() != 2 || t.ne[0] != uint64_t(H) || t.ne[1] != uint64_t(rows))
+                throw std::runtime_error(p + name + ": expected F16 [" + std::to_string(rows) + ", " + std::to_string(H) + "]");
+            const auto raw = f.read(t);
+            w.insert(w.end(), raw.begin(), raw.end());
+        }
+        QsaLayer q;
+        q.w = static_cast<const __half *>(put(w.data(), w.size()));
+        q.q_norm = g_f32(f, p + "qsa_q_norm.weight", kQsa27Dim);
+        q.k_norm = g_f32(f, p + "qsa_k_norm.weight", kQsa27Dim);
+        q.block_norm = g_f32(f, p + "qsa_k_block_norm.weight", kQsa27Dim);
+        qsa.layer.push_back(std::move(q));
+    }
+    qsa.file_from = int(f.num("qwen35.qsa.sparse_from", 0));
+}
+
+void Qwen35Engine::qsa_setup() {
+    using namespace tqllm_cuda;
+    if (const char * note = qsa_missing_note(opt.qsa_from, !qsa.layer.empty())) std::fprintf(stderr, "tqllm: WARN: %s\n", note);
+    if (qsa.layer.empty()) return;
+    qsa.from = qsa_cuda_from(opt.qsa_from);
+    const char * why = nullptr;
+    ensure_mq_split();
+    if (opt.qsa_from < 0) why = "QSA is opt-in on CUDA (--qsa-from N, e.g. 49152)";
+    else if (qsa.from == 0) why = "--qsa-from off";
+    else if (nslots != 1) why = "more than one slot";
+    else if (tp_) why = "--split layer";
+    else if (!kvf->qsa_ok() || !(kvf->qsa_one_part() || chain2) || cfg.head_dim != 256 || cfg.heads / cfg.kvheads > 8)
+        why = "this KV format has no QSA rows";
+    else if (kv_staged && !kvf->qsa_host_ok()) why = "this KV format cannot read its staged host KV tail in place";
+    else if (opt.kv_compact > 0) why = "--kv-compact";
+    else if (int64_t(context_) <= qsa.from + 64) why = nullptr;  // no row can reach `from`: nothing to say
+    if (why || int64_t(context_) <= qsa.from + 64) {
+        if (why) std::fprintf(stderr, "tqllm: QSA indexers in the file, attention stays dense: %s\n", why);
+        return;
+    }
+    qsa.max_blocks = int(context_ / kQsa27Block);
+    const size_t H = cfg.hidden;
+    for (auto & q : qsa.layer) {
+        q.tok = std::make_unique<HostBuf>(size_t(context_) * kQsa27Dim * 2);
+        q.blocks = Buf(size_t(qsa.max_blocks) * kQsa27Dim * 4);
+    }
+    qsa.xu = Buf(size_t(std::max(NBUF, NVER)) * H * 2);
+    qsa.proj = Buf(std::max(size_t(NBUF) * kQsa27Dim, size_t(NVER) * kQsa27Rows) * 4);
+    qsa.q = Buf(size_t(NVER) * kQsa27Heads * kQsa27Dim * 4);
+    qsa.bits = Buf(size_t(NVER) * qsa.max_blocks * 4);
+    qsa.sel = Buf(size_t(NVER) * kQsa27Pick * 4);
+    qsa.mass = Buf(size_t(cfg.heads) * 3 * 4);
+    if (kv_staged) {
+        qsa.tail_off = Buf(2 * sizeof(int64_t)), ck(cudaMemset(qsa.tail_off.p, 0, 2 * sizeof(int64_t)));
+        qsa.mark = Buf((size_t(qsa.max_blocks) + 1) * sizeof(int));
+        ck(cudaMemset(qsa.mark.p, 0xff, size_t(qsa.max_blocks) * sizeof(int)));
+        ck(cudaMemset(static_cast<int *>(qsa.mark.p) + qsa.max_blocks, 0, sizeof(int)));
+    }
+    qsa.mass_left = kvf->compressed() ? 0 : tqllm::debug_int("qsa_mass");  // the report reads BF16 keys
+    qsa.on = true;
+    if (opt.exact)
+        std::fprintf(stderr, "tqllm: WARN: --exact on with a QSA file: rows past %d keys attend sparsely, so the text differs from dense "
+                     "attention (spec output still equals plain decoding); --qsa-from off keeps attention dense\n", qsa.from);
+    std::fprintf(stderr, "tqllm: QSA: verify rows past %d keys attend to their top %d key blocks + the recent keys "
+                 "(%.2f GB of block keys on the device, %.2f GB of token keys in host memory)\n", qsa.from, kQsa27Pick,
+                 double(qsa.layer.size()) * qsa.max_blocks * kQsa27Dim * 4 / 1e9, double(qsa.layer.size()) * context_ * kQsa27Dim * 2 / 1e9);
 }
 
 void Qwen35Engine::alloc_seq_state() {
@@ -269,13 +430,15 @@ void Qwen35Engine::alloc_seq_state() {
     if (!kv_pool) {  // first slot: one pool for every slot
         if (std::string(kvs->name()) != "flat")
             throw std::runtime_error(std::string("--kv-store ") + kvs->name() + ": the attention kernels read flat KV only so far");
-        const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true)) - attn0;
+        int attn_layers = 0;  // --split layer: only this rank's attention layers get pool pages
+        for (uint32_t l = lr_.lo; l < lr_.hi; ++l) attn_layers += cfg.full[l] ? 1 : 0;
         if (split_at) {  // all KV on the GPUs (split_setup refuses --kv-host): whole pages, nothing staged
             use_dev(0);
             kv_mem0 = make_cuda_kv_memory(stream);
             const KvGeometry g0{attn0, size_t(kv_row_bytes(true)), size_t(kv_row_bytes(false)), kvs->page(context_), -1, false};
             kv_pool0 = std::make_unique<KvPool>(*kv_mem0, g0, nslots, 0);
             use_dev(1);
+            attn_layers -= attn0;  // layer split: device 0's attention layers use kv_pool0
         }
         kv_mem = make_cuda_kv_memory(stream);
         const int64_t host = std::min<int64_t>(std::max(0L, opt.kv_host), context_);
@@ -290,6 +453,8 @@ void Qwen35Engine::alloc_seq_state() {
         if (kv_staged) {
             d_stage_bytes = Buf(2 * sizeof(int64_t));
             ck(cudaMemsetAsync(d_stage_bytes.p, 0, 2 * sizeof(int64_t), stream));
+            stage_dummy_dev = Buf(16);
+            if (!stage_dummy_host) ck(cudaHostAlloc(&stage_dummy_host, 16, cudaHostAllocDefault));
             ck(cudaStreamCreateWithFlags(&kv_side, cudaStreamNonBlocking));
             ck(cudaEventCreateWithFlags(&kv_fork, cudaEventDisableTiming));
             for (auto * e : {&kv_ready[0], &kv_ready[1], &kv_done[0], &kv_done[1]})
@@ -352,21 +517,23 @@ void Qwen35Engine::alloc_seq_state() {
         if (!kv_seq0->reserve(context_)) throw std::runtime_error("out of memory (GPU 0 KV)");
     }
     lin_dev.clear();
+    // indexed by every attention / recurrent layer; another rank's layers (--split layer) get empty entries
     for (uint32_t l = 0, a = 0; l < cfg.layers; ++l) {
+        const bool own = lr_.owns(l);
         if (cfg.full[l]) {
             // layer split: device 0's attention layers index its own store from 0
             const bool d0 = split_at && int(l) < split_at;
             const KvStore & s = d0 ? *kv_seq0 : *kv_seq;
             const int ia = d0 ? int(a) : int(a) - attn0;
-            key_cache.push_back({s.base(ia, true)});
-            value_cache.push_back({s.base(ia, false)});
-            ++a;
+            key_cache.push_back({own ? s.base(ia, true) : nullptr});
+            value_cache.push_back({own ? s.base(ia, false) : nullptr});
+            a += own ? 1 : 0;
         } else {
             use_dev(dev_of(l));  // layer split: the recurrent state on the layer's device
             lin_dev.push_back(dev_of(l));
             for (int sl = 0; sl < NSLOT; ++sl) {
-                conv_state.emplace_back(size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2);
-                rec_state.emplace_back(size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4);
+                conv_state.emplace_back(own ? size_t(cfg.conv_k - 1) * (2 * lk + lv) * 2 : 0);
+                rec_state.emplace_back(own ? size_t(cfg.lin_vheads) * cfg.lin_dk * cfg.lin_dv * 4 : 0);
             }
         }
     }
@@ -391,7 +558,7 @@ void Qwen35Engine::allocate() {
         const int attn_layers = int(std::count(cfg.full.begin(), cfg.full.end(), true));
         const int64_t dev_pos = int64_t(context_) - std::min<int64_t>(std::max(0L, opt.kv_host), context_);
         const size_t kv_dev = size_t(attn_layers) * size_t(dev_pos) * size_t(kv_row_bytes(true) + kv_row_bytes(false));
-        NPF = NBUF = prefill_chunk(int64_t(context_), tot, fr, kv_dev);  // GB10 prefill 8K: 650 -> 1135 tok/s
+        NPF = NBUF = split_min(prefill_chunk(int64_t(context_), tot, fr, kv_dev));  // GB10 prefill 8K: 650 -> 1135 tok/s
         prefill_room = fr > kv_dev ? fr - kv_dev : 0;
     }
     // tensor parallel (fork addition): each GPU holds half the weights, room for 2048-token chunks at any context
@@ -502,7 +669,7 @@ void Qwen35Engine::allocate() {
     for (uint32_t l = 0; l < cfg.layers; ++l)
         if (!cfg.full[l]) {
             use_dev(dev_of(l));  // layer split: a layer's verify stash on its device
-            for (auto & st : v_stash2) st.emplace_back(size_t(NB) * mix_rows * 2);
+            for (auto & st : v_stash2) st.emplace_back(lr_.owns(l) ? size_t(NB) * mix_rows * 2 : 0);
         }
     use_dev(1);
     v_hid = Buf(NBUF * H * 2);
@@ -534,6 +701,7 @@ void Qwen35Engine::allocate() {
     if (opt.native_mtp && nslots != 1)  // refused at start-up, not per request
         throw std::runtime_error("--mtp drafts for one slot only for now: use --np 1 (or -md for --np > 1)");
     chain2 = cfg.gated_attention && kvf->tree_ok() && kv_row_bytes(true) % 16 == 0 && kv_row_bytes(false) % 16 == 0 && !tqllm::debug_on("attn_one_part");
+    qsa_setup();
     // tree verify: with a DFlash drafter when the KV format has tree attention (--no-tree: chain)
     if (cfg.gated_attention && opt.tree && !opt.draft_model.empty() && kvf->tree_ok()) {
         if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)
@@ -561,7 +729,8 @@ void Qwen35Engine::allocate() {
             head8 = Buf(size_t(lm_head.rows) * H);
             head8s = Buf(size_t(lm_head.rows) * H / 16 * 2);
         }
-        if (lm_head.type == GGML_Q5_K)
+        if (head_host) head8_to_host();
+        else if (lm_head.type == GGML_Q5_K)
             tqllm_cuda::q5k_to_i8(lm_head.p, const_cast<int8_t *>(w8()), const_cast<__half *>(s8()), lm_head.rows, int(H), stream);
         else tqllm_cuda::q6k_to_i8(lm_head.p, const_cast<int8_t *>(w8()), const_cast<__half *>(s8()), lm_head.rows, int(H), stream);
         sync_ck();
@@ -683,15 +852,36 @@ void Qwen35Engine::allocate() {
                     for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
                                           &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
                         if (m->p && m->fmt) mk = std::max(mk, size_t(m->cols));
+                // The int8 weight operand can live in gemm_w behind the FP16 dequant of the largest matrix whose format
+                // has no dequant_i8 (an int8 GEMM reads only one of the two, and gemm_w is otherwise free between GEMMs):
+                // no extra VRAM when those matrices are at most half the largest. cuBLAS and cuBLASLt share blas_ws.
+                size_t e_h = 0;  // elements of the largest matrix the int8 path dequantises to FP16 first
+                for (const auto & L : layer)
+                    for (const Mat * m : {&L.w_gate, &L.w_up, &L.w_down, &L.wq, &L.wk, &L.wv, &L.wo, &L.w_qkv, &L.w_z,
+                                          &L.w_a, &L.w_b, &L.w_out, &L.w_mix, &L.w_gu})
+                        if (m->p && m->fmt) {
+                            if (const auto * ps = m->fmt->parts()) {
+                                for (const auto & p : *ps)
+                                    if (!p.fmt->has_dequant_i8()) e_h = std::max(e_h, size_t(p.rows) * p.cols);
+                            } else if (!m->fmt->has_dequant_i8()) {
+                                e_h = std::max(e_h, size_t(m->rows) * m->cols);
+                            }
+                        }
+                const size_t w8_off = (e_h * 2 + 255) / 256 * 256;
+                int8_t * w8 = w8_off + mx <= mx * 2 && !tqllm::debug_on("i8_own_w8") ? static_cast<int8_t *>(gemm_w.p) + w8_off : nullptr;
+                blas_ws = Buf(size_t(32) << 20);
                 i8 = std::make_unique<tqllm_cuda::Int8Gemm>();
-                i8->init(mx, size_t(NBUF) * mk, int(mr), NBUF);
+                i8->init(mx, size_t(NBUF) * mk, int(mr), NBUF, w8, blas_ws.p, size_t(32) << 20);
                 i8_init[0] = mx, i8_init[1] = size_t(NBUF) * mk, i8_init[2] = mr, i8_init[3] = size_t(NBUF);  // split: stage 0's copy
                 if (!fp8_sw.p) fp8_sw = Buf(size_t(mr) * 4);
-                std::fprintf(stderr, "tqllm: prefill GEMMs in int8 (per-row x per-token scales; --prefill-int8 off for FP16)\n");
+                sm_ax = Buf(mk * 4);
+                sm_s = Buf(mk * 4);
+                std::fprintf(stderr, "tqllm: prefill GEMMs in int8 (per-row x per-token scales%s; --prefill-int8 off for FP16)\n",
+                             w8 ? ", int8 weights in the FP16 scratch" : "");
             }
             gemm_c_bytes = size_t(NBUF) * mr * 4;
             gemm_c = Buf(gemm_c_bytes);
-            blas_ws = Buf(size_t(32) << 20);
+            if (!blas_ws.p) blas_ws = Buf(size_t(32) << 20);
             cb(cublasSetWorkspace(blas, blas_ws.p, size_t(32) << 20));
         }
     }
@@ -937,8 +1127,11 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     } else if (!opt.draft_vocab.empty() && has_head8()) {
         const uint64_t nd = uint64_t(dsub_rows);
         Buf w8(nd * H), sc8(nd * H / 16 * 2);
-        tqllm_cuda::gather_rows(this->w8(), w8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H), stream);
-        tqllm_cuda::gather_rows(s8(), sc8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 16 * 2, stream);
+        if (h8_host) head8_rows_from_host(w8.as<int8_t>(), sc8.as<__half>(), int(nd));
+        else {
+            tqllm_cuda::gather_rows(this->w8(), w8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H), stream);
+            tqllm_cuda::gather_rows(s8(), sc8.p, dsub_ids.as<uint32_t>(), int(nd), int64_t(H) / 16 * 2, stream);
+        }
         dsub_w = Buf(nd * H / 2);
         dsub_s = Buf(nd * H / 32 * 4);
         tqllm_cuda::u4h_from_i8h(w8.as<int8_t>(), sc8.as<__half>(), dsub_w.as<uint8_t>(), dsub_s.as<__half2>(),
@@ -980,11 +1173,65 @@ void Qwen35Engine::build_head4() {
     const int64_t n = int64_t(lm_head.rows) * cfg.hidden;
     head4 = Buf(size_t(n / 2));
     head4s = Buf(size_t(n / 32) * 4);
-    tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
+    if (h8_host) {  // the int8 rows come back a chunk at a time by the copy engine: no kernel reads host memory
+        const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
+        Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
+        const auto * hw = static_cast<const int8_t *>(h8_host);
+        const auto * hs = reinterpret_cast<const char *>(hw + size_t(rows) * H);
+        for (int r0 = 0; r0 < rows; r0 += chunk) {
+            const int nr = std::min(chunk, rows - r0);
+            ck(cudaMemcpyAsync(w.p, hw + size_t(r0) * H, size_t(nr) * H, cudaMemcpyHostToDevice, stream));
+            ck(cudaMemcpyAsync(s.p, hs + size_t(r0) * H / 16 * 2, size_t(nr) * H / 16 * 2, cudaMemcpyHostToDevice, stream));
+            tqllm_cuda::u4h_from_i8h(w.as<int8_t>(), s.as<__half>(), head4.as<uint8_t>() + size_t(r0) * H / 2,
+                                     head4s.as<__half2>() + size_t(r0) * H / 32, int64_t(nr) * H, stream);
+        }
+        sync_ck();  // the staging is freed with this scope
+    } else tqllm_cuda::u4h_from_i8h(w8(), s8(), head4.as<uint8_t>(), head4s.as<__half2>(), n, stream);
     tqllm_cuda::u4h_tune(head4.as<uint8_t>(), head4s.as<__half2>(), lm_head.rows, int(cfg.hidden), stream);
     h2_vals = Buf(size_t(NB) * 16 * 4);
     h2_idx = Buf(size_t(NB) * 16 * 4);
     h2_scr = Buf(size_t(NB) * 64 * 16 * 8);
+    sync_ck();
+}
+
+
+// head in host memory: the int8 copy is built on the device a row chunk at a time and copied to host memory by the copy
+// engine (no kernel touches host memory: zero-copy beside the copy engine's DMA faults PCIe GPUs); the load peak is one chunk
+void Qwen35Engine::head8_to_host() {
+    const int H = int(cfg.hidden), rows = lm_head.rows, chunk = std::min(rows, kHead8Chunk);
+    const bool q5 = lm_head.type == GGML_Q5_K;
+    const size_t qrow = size_t(H) / 256 * (q5 ? 176 : 210);
+    Buf w(size_t(chunk) * H), s(size_t(chunk) * H / 16 * 2);
+    auto * hw = static_cast<int8_t *>(h8_host);
+    auto * hs = reinterpret_cast<char *>(hw + size_t(rows) * H);
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+        const int nr = std::min(chunk, rows - r0);
+        const char * src = static_cast<const char *>(lm_head.p) + size_t(r0) * qrow;
+        if (q5) tqllm_cuda::q5k_to_i8(src, w.as<int8_t>(), s.as<__half>(), nr, H, stream);
+        else tqllm_cuda::q6k_to_i8(src, w.as<int8_t>(), s.as<__half>(), nr, H, stream);
+        ck(cudaMemcpyAsync(hw + size_t(r0) * H, w.p, size_t(nr) * H, cudaMemcpyDeviceToHost, stream));
+        ck(cudaMemcpyAsync(hs + size_t(r0) * H / 16 * 2, s.p, size_t(nr) * H / 16 * 2, cudaMemcpyDeviceToHost, stream));
+    }
+    sync_ck();
+}
+
+// the int8 head rows of dsub_ids (host memory) into w [n][H] / sc [n][H / 16] by the copy engine
+void Qwen35Engine::head8_rows_from_host(int8_t * w, __half * sc, int n) {
+    const size_t H = cfg.hidden, sb = H / 16 * 2;
+    std::vector<uint32_t> ids(static_cast<size_t>(n));
+    ck(cudaMemcpyAsync(ids.data(), dsub_ids.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+    sync_ck();
+    const auto * hw = static_cast<const char *>(h8_host);
+    const char * hs = hw + size_t(lm_head.rows) * H;
+    std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
+    for (int i = 0; i < n; ++i) {
+        dst.push_back(reinterpret_cast<char *>(w) + size_t(i) * H); src.push_back(hw + size_t(ids[size_t(i)]) * H); bytes.push_back(H);
+        dst.push_back(reinterpret_cast<char *>(sc) + size_t(i) * sb); src.push_back(hs + size_t(ids[size_t(i)]) * sb); bytes.push_back(sb);
+    }
+    for (size_t at = 0; at < dst.size(); at += 8192) {
+        const size_t cnt = std::min<size_t>(8192, dst.size() - at);
+        ck(tqllm_cuda::memcpy_batch_async(dst.data() + at, src.data() + at, bytes.data() + at, cnt, stream));
+    }
     sync_ck();
 }
 

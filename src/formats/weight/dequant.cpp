@@ -407,6 +407,53 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         }
+        case GGML_TQV12: {  // docs/reference/formats.md "TQV-12", in TQ4's rotated basis (the values the TQV kernels decode)
+            if (n < 0 || n % 128) break;
+            static const uint32_t table[4096] = {
+#include "tqv12_codebook.inc"
+            };
+            for (int64_t b = 0; b < n / 128; ++b) {
+                const uint8_t * blk = s + b * 66;
+                uint16_t h; std::memcpy(&h, blk, 2);
+                const float d = half_to_float(h);
+                for (int j = 0; j < 4; ++j) {
+                    uint32_t q[4]; std::memcpy(q, blk + 2 + 16 * j, 16);
+                    const uint64_t lo = uint64_t(q[0]) | (uint64_t(q[1]) << 32);  // index bits 0-63; q[2] = bits 64-95
+                    for (int u = 0; u < 8; ++u) {
+                        const int p = 12 * u;
+                        const uint64_t f = p >= 64 ? uint64_t(q[2]) >> (p - 64) : (lo >> p) | (p > 32 ? uint64_t(q[2]) << (64 - p) : 0);
+                        const uint32_t e4 = table[uint32_t(f) & 0xFFFu];
+                        static const int sb[4] = {15, 31, 7, 23};  // sign of weight 4u + e at bit sb[e] - u
+                        for (int e = 0; e < 4; ++e) {
+                            const float v = float((e4 >> (8 * e)) & 0xFFu) * d;
+                            dst[b * 128 + 32 * j + 4 * u + e] = (q[3] >> (sb[e] - u)) & 1u ? -v : v;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        case GGML_TQT: {  // docs/reference/formats.md "TQT" (tqt-c2-v1), in TQ4's rotated basis (the values the TQT kernels decode)
+            if (n < 0 || n % 128) break;
+            auto h16 = [](uint32_t v) { return half_to_float(uint16_t(v)); };
+            for (int64_t b = 0; b < n / 128; ++b) {
+                const uint8_t * blk = s + b * 66;
+                uint16_t hs; std::memcpy(&hs, blk, 2);
+                const float d = half_to_float(hs);
+                const uint8_t * B = blk + 2;
+                for (int p = 0; p < 64; ++p) {
+                    const uint32_t w = (uint32_t(B[p]) | uint32_t(B[(p + 1) % 64]) << 8 | uint32_t(B[(p + 2) % 64]) << 16) & 0x3FFFFu;
+                    const uint32_t x = (w * 0x9E3779B1u + 0x7F4A7C15u) << 14, y = (x << 16) | (x >> 16);
+                    const uint32_t z = y * 0x2C1B3C6Du + 0x9E3779B9u, z2 = z * 0x297A2D39u + 0x7F4A7C15u;
+                    const uint32_t h1 = (z & 0x8FFF8FFFu) ^ 0x3B603B60u, h2 = (z2 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+                    for (int e = 0; e < 2; ++e) {  // FP16 sum (exact in FP32, one rounding) times the scale (FP32, as the matvec)
+                        const float v = half_to_float(float_to_half(h16(h1 >> (16 * e)) + h16(h2 >> (16 * e))));
+                        dst[b * 128 + 2 * p + e] = v * d;
+                    }
+                }
+            }
+            return;
+        }
         case GGML_GSQ_Q2_0:
             if (n < 0 || n % 64) break;
             for (int64_t b = 0; b < n / 64; ++b) {

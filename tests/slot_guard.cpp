@@ -27,6 +27,16 @@ int main() {
     expect("one slot is never refused", tqllm::fit_slots(1, 2048, 4096, 0, size_t(0.81 * GB), reserve) == 1);
     expect("no memory left: one slot suggested", tqllm::fit_slots(8, 65536, 4096, size_t(0.5 * GB), size_t(0.81 * GB), reserve) == 1);
 
+    // default reserve (11-11, .77 3090, 27B TQ4_L --np 16 --context 262144, no drafter): with all KV in host memory the
+    // load left 2.53 GB free; a KV position of the 16 slots costs 1 MiB on the device. 128 MiB per slot kept every position
+    // in host memory (243 tok/s); the measured need (~39 MiB per slot, inside the base margin) keeps 1,024 on the GPU (397)
+    expect("reserve: asked wins", tqllm::fit_slot_reserve_mb(64, false) == 64 && tqllm::fit_slot_reserve_mb(0, true) == 0);
+    expect("reserve: drafter keeps 128", tqllm::fit_slot_reserve_mb(-1, true) == 128);
+    const size_t m16 = size_t(0.81 * GB) + 16 * (size_t(tqllm::fit_slot_reserve_mb(-1, false)) * MB);
+    expect("np 16 without a drafter: KV head back on the GPU", tqllm::fit_host_return(16384, size_t(2.53 * GB), m16, MB) <= 15360);
+    expect("np 16 at the old 128 MiB: nothing back (the cliff)",
+           tqllm::fit_host_return(16384, size_t(2.53 * GB), size_t(0.81 * GB) + 16 * 128 * MB, MB) == 16384);
+
     // GraphLru: fake handles; destroy records what was freed, quiesce must run before any destroy
     std::vector<int> freed;
     int quiesced = 0, destroyed_before_quiesce = 0;
@@ -35,6 +45,7 @@ int main() {
     bool low = false;
     auto low_memory = [&] { return low; };
     tqllm::GraphLru<int> lru(3);
+    lru.set_floor(0);  // the policy below: low memory empties the cache
     for (int k = 1; k <= 3; ++k) lru.insert(0, uint64_t(k), [&] { return 100 + k; }, low_memory, quiesce, destroy);
     expect("hit returns the graph", lru.find(0, 1) == 101);  // 1 is now the most recent
     expect("family is part of the key", lru.find(1, 1) == 0);
@@ -58,6 +69,18 @@ int main() {
     expect("other errors propagate", rethrown && lru.size() == 1);
     lru.clear(destroy);
     expect("clear frees everything", lru.size() == 0 && lru.evictions() == freed.size());
+    // a step's working set under constant low memory (16 GB host-tail fit, free < graph_keep): with a floor the 3 graphs are
+    // captured once; with floor 0 (low memory empties the cache) every use is a capture
+    for (const size_t floor : {size_t(4), size_t(0)}) {
+        tqllm::GraphLru<int> w(8, floor); low = true; int makes = 0;
+        for (int round = 0; round < 10; ++round)
+            for (int k = 1; k <= 3; ++k)
+                if (!w.find(3, uint64_t(k))) w.insert(3, uint64_t(k), [&] { ++makes; return 200 + k; }, low_memory, quiesce, destroy);
+        if (floor) expect("low memory keeps the working set (floor 4): 3 captures in 10 rounds", makes == 3 && w.size() == 3);
+        else expect("floor 0: every use recaptures", makes == 30);
+        w.clear(destroy);
+    }
+    low = false;
 
     // result-changing fit steps are reported (tqserve refuses them without -fitl on); placement-only loads report nothing.
     // .77 3090, 27B TQ4_L --np 8 --context 262144 (10-13): the fit switched the KV cache to t4k-turbo3v (2 of 8 answers
