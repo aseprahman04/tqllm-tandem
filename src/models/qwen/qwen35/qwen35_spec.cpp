@@ -751,6 +751,7 @@ bool Qwen35Engine::dflash_advance() {
                         if (here) g.push_back({v_stash2[sp][lin_i].p, int64_t(mix_rows(layer[l])) * 2, 0});
                         ++lin_i;
                     }
+                }
                 if (d == 1) g.push_back({v_feat.p, int64_t(nf) * H * 2, 0});
                 ck(cudaMemcpyAsync(d_gdesc.p, g.data(), g.size() * sizeof(g[0]), cudaMemcpyHostToDevice, stream));
                 ck(cudaMemcpyAsync(d_tcols.p, path.data(), path.size() * 4, cudaMemcpyHostToDevice, stream));
