@@ -436,11 +436,14 @@ void tqv12_dequant_h(const uint8_t * w, const __half * sc, __half * out, int row
 void tqv12_gemm_h(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
                   cudaStream_t s) {
     if (k % 128 || n < 1 || rows < 1) throw std::invalid_argument("tqv12_gemm_h: k % 128 == 0, n >= 1");
-    static const bool attr = [] {
+    // The attribute is per device: set it once on every GPU that launches (two-GPU split/TP), not once per process.
+    static bool attr_set[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16 && !attr_set[dev]) {
         cudaFuncSetAttribute(tqv12_gemm_h_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tqvg::kSmem));
-        return true;
-    }();
-    (void)attr;
+        attr_set[dev] = true;
+    }
     const dim3 grid(unsigned((rows + tqvg::BM - 1) / tqvg::BM), unsigned((n + tqvg::BN - 1) / tqvg::BN));
     tqv12_gemm_h_k<<<grid, 256, tqvg::kSmem, s>>>(reinterpret_cast<const uint4 *>(w), sc, xh, y, rows, k, n, ldy);
 }
