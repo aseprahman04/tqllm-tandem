@@ -253,8 +253,8 @@ void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __n
                   int k, int ncols, cudaStream_t);
 // ggml NVFP4 (GGUF type 40, block_nvfp4: 4 UE4M3 + 32 B E2M1 per 64 weights) expert matvec, decode in-register.
 // w: [experts * rows][k / 2] block_nvfp4 rows (k a multiple of 64); sc: [experts] F32 per-expert scale (1.0 if null);
-// ids: [n][topk] expert ids; x: [n][k] BF16; y: [n * topk][rows] BF16. Reference kernel (one warp per row, FP32 accumulate).
-void nvfp4_gguf_expert_matvec(const uint8_t * w, const float * sc, const __nv_bfloat16 * x, __nv_bfloat16 * y, int rows,
+// ids: [n][topk] expert ids; x: [n][k] FP16; y: [n * topk][rows] BF16. Reference kernel (one warp per row, FP32 accumulate).
+void nvfp4_gguf_expert_matvec(const uint8_t * w, const float * sc, const __half * x, __nv_bfloat16 * y, int rows,
                               int k, const int * ids, int n, int topk, cudaStream_t);
 void tq4_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t);
 // Fused op + TQ4 rotation (identical to the op followed by tq4_rotate_h): swiglu of gu [n][2F]; attention sigmoid gate.

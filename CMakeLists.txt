@@ -57,7 +57,7 @@ target_sources(tqllm PRIVATE src/core/tokenizer.cpp src/core/options.cpp src/kv/
 target_include_directories(tqllm PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(tqllm PRIVATE ${CMAKE_DL_LIBS})
 if(MSVC)
-  target_compile_options(tqllm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3 /utf-8 /permissive- /Zc:__cplusplus>)
+  target_compile_options(tqllm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3 /utf-8 /Zc:__cplusplus>)
   target_compile_definitions(tqllm PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
 else()
   target_compile_options(tqllm PRIVATE -Wall -Wextra -Wpedantic)
@@ -195,11 +195,12 @@ if(TQLLM_CUDA)
     target_sources(tqllm PRIVATE src/models/glm/glm5next/glm5next.cpp src/models/glm/glm5next/glm5next.cu src/models/glm/glm5next/glm5next_dsa.cu)
     # MiniMax-M3.1-Flash (src/models/minimax/m3, GGUF arch minimax-m3 from tools/minimax_convert.cpp); reuses the GLM kernels
     target_sources(tqllm PRIVATE src/models/minimax/m3/minimax.cpp src/models/minimax/m3/minimax.cu)
-    # Inkling-2-Mini (src/models/inkling2, GGUF arch inkling2, the looped 26B MoE); its own kernels
-    target_sources(tqllm PRIVATE src/models/inkling2/inkling2.cpp src/models/inkling2/inkling2.cu)
   else()
     target_sources(tqllm PRIVATE src/backends/cuda/moe_unsupported.cpp)
   endif()
+  # Inkling-2-Mini (src/models/inkling2, GGUF arch inkling2, the looped 26B MoE); its own kernels. Always built: it is
+  # self-contained (no MoE-engine symbols) and the native Windows build must serve it.
+  target_sources(tqllm PRIVATE src/models/inkling2/inkling2.cpp src/models/inkling2/inkling2.cu)
   # two linked boxes (tensor parallel): NCCL over RoCE, e.g. -DTQLLM_NCCL_DIR=<venv>/site-packages/nvidia/nccl
   set(TQLLM_NCCL_DIR "" CACHE PATH "NCCL root (include/nccl.h, lib/libnccl.so.2) for multi-box tensor parallelism")
   if(TQLLM_NCCL_DIR)

@@ -47,7 +47,7 @@ struct Nvfp4Gguf final : WeightFormat {
                        bool per_expert_input, cudaStream_t s) const override {
         (void) per_expert_input;
         tqllm_cuda::nvfp4_gguf_expert_matvec(static_cast<const uint8_t *>(m.p), static_cast<const float *>(m.aux),
-                                             static_cast<const __nv_bfloat16 *>(x), y, rows, m.cols, ids, n, topk, s);
+                                             x, y, rows, m.cols, ids, n, topk, s);
     }
 };
 

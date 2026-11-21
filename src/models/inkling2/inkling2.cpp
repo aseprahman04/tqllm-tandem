@@ -874,13 +874,17 @@ private:
     }
 };
 
+std::unique_ptr<Engine> make_inkling2_engine_impl(const std::string & path, uint32_t context) {
+    return std::make_unique<Inkling2Engine>(path, context);
+}
+}  // namespace
+
 bool is_inkling2_gguf(const std::string & path) {
     try { return gguf_architecture(path) == "inkling2"; } catch (...) { return false; }
 }
 
 std::unique_ptr<Engine> make_inkling2_engine(const std::string & path, uint32_t context) {
-    return std::make_unique<Inkling2Engine>(path, context);
+    return make_inkling2_engine_impl(path, context);
 }
 
-}  // namespace
 }  // namespace tqllm
