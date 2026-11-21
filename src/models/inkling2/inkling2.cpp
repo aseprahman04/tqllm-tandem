@@ -207,6 +207,14 @@ private:
 
     double num(const std::string & k) const { return meta_.num("inkling2." + k); }
     double num(const std::string & k, double fb) const { return meta_.num("inkling2." + k, fb); }
+    // First element of an array-valued KV (the root layout stores per-visit scalars as arrays);
+    // falls back to the scalar value when the key holds a number.
+    double arr0(const std::string & full_key) const {
+        if (!meta_.has(full_key)) return 0.0;
+        const auto & v = meta_.kv.at(full_key);
+        if (!v.arr.empty()) return v.arr[0];
+        return v.num;
+    }
 
     // 2-GPU layer split: TQLLM_SPLIT=K puts layers [0,K) on GPU 1, [K,n) + head on GPU 0.
     // The loop (core layers) must stay on one GPU so the 3 passes never cross PCIe: with the
@@ -262,8 +270,10 @@ private:
         n_pass_ = int(num("num_loops", 1));
         core0_ = int(num("loop.core_start", 0));
         core1_ = int(num("loop.core_end", 0));
-        n_head_ = int(meta_.num("inkling2.attention.head_count"));
-        n_kv_ = int(meta_.num("inkling2.attention.head_count_kv"));
+        // head_count / head_count_kv are stored as arrays (one value per visit) in the root layout;
+        // GgufFile::num returns 0 for an array, so read the first element explicitly.
+        n_head_ = int(arr0("inkling2.attention.head_count"));
+        n_kv_ = int(arr0("inkling2.attention.head_count_kv"));
         hd_ = int(num("attention.key_length"));
         d_rel_ = int(num("attention.relative_length"));
         extent_ = int(num("attention.relative_extent"));
@@ -293,7 +303,18 @@ private:
             else if (v < core0_ + n_pass_ * n_core) phys_[v] = core0_ + (v - core0_) % n_core;
             else phys_[v] = v - (n_pass_ - 1) * n_core;
         }
+        // sliding_window_pattern: one bool per visit (48). A physical layer is "full" (not sliding)
+        // if any of its visits has pattern=false. The root layout stores this as the only source of
+        // the sliding/full distinction; full layers carry attn_{q,k,v}_inp_norm instead of attn_norm.
         sliding_.resize(n_layers_, true);
+        if (meta_.has("inkling2.attention.sliding_window_pattern")) {
+            const auto & v = meta_.kv.at("inkling2.attention.sliding_window_pattern");
+            for (size_t vi = 0; vi < v.arr.size(); ++vi) {
+                const int visit = int(vi);
+                const int p = phys_[visit];
+                if (p >= 0 && p < n_layers_ && v.arr[vi] == 0.0) sliding_[p] = false;
+            }
+        }
     }
 
     // ---- tensor access ----
