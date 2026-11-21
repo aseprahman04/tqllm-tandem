@@ -243,6 +243,23 @@ __global__ void softcap_k(float * __restrict__ logits, int unpadded, float cap) 
     logits[i] = cap * tanhf(logits[i] / cap);
 }
 
+// ---- device-resident residual ops (the forward must not touch activations on the host) ----
+// y[i] = a[i] + b[i]
+__global__ void hadd_k(const __half * __restrict__ a, const __half * __restrict__ b, __half * __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __hadd(a[i], b[i]);
+}
+// y[i] = a[i] (device copy)
+__global__ void hcopy_k(const __half * __restrict__ a, __half * __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i];
+}
+// y[i] = a[i] * s (in place)
+__global__ void hscale_k(__half * __restrict__ y, float s, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half(__half2float(y[i]) * s);
+}
+
 }  // namespace
 
 void ik2_rms_norm(const __half * x, const float * w, float eps, int C, __half * y, cudaStream_t s) {
@@ -289,6 +306,18 @@ void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s) {
 
 void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s) {
     conv_hist_update_k<<<(C + 255) / 256, 256, 0, s>>>(hist, cur, taps, C);
+}
+
+void ik2_hadd(const __half * a, const __half * b, __half * y, int n, cudaStream_t s) {
+    hadd_k<<<(n + 255) / 256, 256, 0, s>>>(a, b, y, n);
+}
+
+void ik2_hcopy(const __half * a, __half * y, int n, cudaStream_t s) {
+    hcopy_k<<<(n + 255) / 256, 256, 0, s>>>(a, y, n);
+}
+
+void ik2_hscale(__half * y, float s, int n, cudaStream_t st) {
+    hscale_k<<<(n + 255) / 256, 256, 0, st>>>(y, s, n);
 }
 
 }  // namespace tqllm_cuda

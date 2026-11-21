@@ -42,4 +42,10 @@ void ik2_attention_core(const Ik2AttnCore & a, __half * out, cudaStream_t s);
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s);
 // hist [taps-1][C] <- shift + append cur [C]
 void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s);
+// y[i] = a[i] + b[i]  (device-resident residual add)
+void ik2_hadd(const __half * a, const __half * b, __half * y, int n, cudaStream_t s);
+// y[i] = a[i]  (device copy)
+void ik2_hcopy(const __half * a, __half * y, int n, cudaStream_t s);
+// y[i] *= s  (in place, device-resident scalar scale)
+void ik2_hscale(__half * y, float scale, int n, cudaStream_t s);
 }  // namespace tqllm_cuda
