@@ -7,8 +7,22 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <stdexcept>
+#include <string>
+
 namespace tqllm_cuda {
 namespace {
+
+// A launch the runtime refuses (a stream of another device, a bad launch configuration) leaves its error in the
+// thread's CUDA error state and nowhere else. Every launcher below reads it right after its launch, so the message
+// names this file and the launcher's line. (An earlier kernel that faulted while running can surface here as well:
+// TQLLM_INKLING2_SYNC=1 in inkling2.cpp pins those to the group that launched them.)
+void launched_at(int line) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string("inkling2: ") + cudaGetErrorString(e) + " (inkling2.cu:" + std::to_string(line) + ")");
+}
+#define launched() launched_at(__LINE__)
 
 constexpr float kResEps = 1e-6f;  // the attention residual's norm (transformers' Inkling2UnweightedRMSNorm default)
 
@@ -270,59 +284,72 @@ __global__ void hscale_k(__half * __restrict__ y, float s, int n) {
 void ik2_rms_norm(const __half * x, const float * w, float eps, int C, __half * y, cudaStream_t s) {
     int threads = std::min(1024, C < 32 ? 32 : 256);
     rms_norm_k<<<1, threads, 0, s>>>(x, w, eps, C, y);
+    launched();
 }
 
 void ik2_attn_res(const __half * blocks, int n_blocks, const __half * x, const float * q, int nq, int C, __half * out, cudaStream_t s) {
     int threads = std::min(1024, C < 32 ? 32 : 256);
     attn_res_k<<<nq, threads, 0, s>>>(blocks, n_blocks, x, q, nq, C, out);
+    launched();
 }
 
 void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, const __half * hist, cudaStream_t s) {
     const int total = T * C;
     shortconv_k<<<(total + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, T, hist);
+    launched();
 }
 
 void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, int D, const float * dyn, const __half * hist, cudaStream_t s) {
     shortconv_dyn_k<<<(C + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, D, dyn, hist);
+    launched();
 }
 
 void ik2_control(const __half * x, const __half * msg, const float * down, const float * forget, const float * gain,
                  int C, __half * out, cudaStream_t s) {
     control_k<<<1, std::max(64, C < 32 ? 32 : 256), 0, s>>>(x, msg, down, forget, gain, C, out);
+    launched();
 }
 
 void ik2_l2clip(const __half * x, const float * clip, float cap, int H, int D, __half * y, cudaStream_t s) {
     int threads = std::min(256, D);
     l2clip_k<<<H, threads, 0, s>>>(x, clip, cap, H, D, y);
+    launched();
 }
 
 void ik2_rms_weightless(const __half * x, int KV, int D, __half * y, cudaStream_t s) {
     int threads = std::min(256, D);
     rms_wl_k<<<KV, threads, 0, s>>>(x, KV, D, y);
+    launched();
 }
 
 void ik2_attention_core(const Ik2AttnCore & a, __half * out, cudaStream_t s) {
     attn_core_k<<<a.H, std::min(256, a.D), 0, s>>>(a, out);
+    launched();
 }
 
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s) {
     softcap_k<<<(unpadded + 255) / 256, 256, 0, s>>>(logits, unpadded, cap);
+    launched();
 }
 
 void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s) {
     conv_hist_update_k<<<(C + 255) / 256, 256, 0, s>>>(hist, cur, taps, C);
+    launched();
 }
 
 void ik2_hadd(const __half * a, const __half * b, __half * y, int n, cudaStream_t s) {
     hadd_k<<<(n + 255) / 256, 256, 0, s>>>(a, b, y, n);
+    launched();
 }
 
 void ik2_hcopy(const __half * a, __half * y, int n, cudaStream_t s) {
     hcopy_k<<<(n + 255) / 256, 256, 0, s>>>(a, y, n);
+    launched();
 }
 
 void ik2_hscale(__half * y, float s, int n, cudaStream_t st) {
     hscale_k<<<(n + 255) / 256, 256, 0, st>>>(y, s, n);
+    launched();
 }
 
 }  // namespace tqllm_cuda

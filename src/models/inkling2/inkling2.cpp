@@ -64,6 +64,16 @@ void ck_at(cudaError_t e, int line) {
 // CUDA_API_PER_THREAD_DEFAULT_STREAM), so a plain cudaMemcpy runs on the calling thread's own stream and does not wait
 // for the kernels still queued on a stage's stream: a host read through it can see the buffer before they wrote it.
 #define copy_sync(dst, src, n, kind, s) do { ck(cudaMemcpyAsync((dst), (src), (n), (kind), (s))); ck(cudaStreamSynchronize(s)); } while (0)
+// A cuBLAS failure with its status and the line that asked for the operation.
+void cb_at(cublasStatus_t s, const char * what, int line) {
+    if (s != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(std::string("inkling2: cuBLAS ") + what + ": " + cublasGetStatusString(s) + " (inkling2.cpp:" + std::to_string(line) + ")");
+}
+#define cb(e, what) cb_at((e), (what), __LINE__)
+// gemm_h(...) reports a failure at the line that called it
+#define gemm_h(...) gemm_h_at(__VA_ARGS__, __LINE__)
+// A checkpoint of the TQLLM_INKLING2_SYNC diagnostic mode (Inkling2Engine::sync_check_at); nothing when it is off.
+#define sync_check(what) do { if (sync_) sync_check_at((what), __LINE__); } while (0)
 
 struct Buf {
     void * p = nullptr;
@@ -124,6 +134,9 @@ class Inkling2Engine final : public Engine {
 public:
     Inkling2Engine(const std::string & path, uint32_t context)
         : context_(context ? context : 32768) {
+        const char * sync = std::getenv("TQLLM_INKLING2_SYNC");
+        sync_ = sync && *sync ? std::atoi(sync) : 0;
+        if (sync_) std::fprintf(stderr, "inkling2: TQLLM_INKLING2_SYNC=%d: device sync + error check after every group of operations (diagnostic, slow)\n", sync_);
         meta_ = gguf_open(path);
         configure();
         split_setup();
@@ -183,6 +196,27 @@ private:
     const float * embd_norm_ = nullptr, * out_norm_ = nullptr, * out_res_q_ = nullptr;
     const float * loop_res_q_ = nullptr;    // [2 * n_core][C]
     const float * loop_kv_res_q_ = nullptr; // [2 * n_core][C]
+
+    // TQLLM_INKLING2_SYNC=1: after every group of operations wait for the stage's device and read the CUDA error state,
+    // so a failing kernel is reported with the group that launched it instead of at some later, unrelated call.
+    // =2 also prints every checkpoint before waiting on it: the last line names a group that never returns.
+    int sync_ = 0;
+    std::string where_;  // the token / visit the checkpoints belong to (kept in the diagnostic mode only)
+    void sync_check_at(const char * what, int line) {
+        int dev = -1;
+        ck_at(cudaGetDevice(&dev), line);
+        if (sync_ >= 2) {
+            std::fprintf(stderr, "inkling2: sync %s%s, stage %d = CUDA device %d (inkling2.cpp:%d)\n", what, where_.c_str(), cur_dev_, dev, line);
+            std::fflush(stderr);
+        }
+        cudaError_t e = cudaDeviceSynchronize();      // every stream of the thread's current device
+        const cudaError_t last = cudaGetLastError();  // a launch the runtime refused leaves its error only here
+        if (e == cudaSuccess) e = last;
+        if (e == cudaSuccess && dev == cuda_of_[cur_dev_]) return;
+        throw std::runtime_error(std::string("inkling2: ") + (e != cudaSuccess ? cudaGetErrorString(e) : "the thread's CUDA device is not the stage's") +
+                                 " after " + what + where_ + ", stage " + std::to_string(cur_dev_) + " = CUDA device " + std::to_string(cuda_of_[cur_dev_]) +
+                                 ", current device " + std::to_string(dev) + " (inkling2.cpp:" + std::to_string(line) + ")");
+    }
 
     int n_blocks_ = 0;
     int prev_nb_ = 0; // previous pass's n_blocks (bank start)
@@ -253,8 +287,8 @@ private:
             ck(cudaSetDevice(cuda_of_[d]));
             ck(cudaStreamCreate(&stream_[d]));
             if (!cublas_[d]) {
-                if (cublasCreate(&cublas_[d]) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("inkling2: cuBLAS init failed");
-                cublasSetStream(cublas_[d], stream_[d]);
+                cb(cublasCreate(&cublas_[d]), "init");
+                cb(cublasSetStream(cublas_[d], stream_[d]), "set stream");
             }
         }
     }
@@ -484,8 +518,8 @@ private:
         }
         for (int d = 0; d < 2; ++d) {
             if (!cublas_[d]) {
-                if (cublasCreate(&cublas_[d]) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("inkling2: cuBLAS init failed");
-                cublasSetStream(cublas_[d], stream_[d]);
+                cb(cublasCreate(&cublas_[d]), "init");
+                cb(cublasSetStream(cublas_[d], stream_[d]), "set stream");
             }
         }
     }
@@ -538,16 +572,15 @@ private:
     }
 
     // y[n][rows] = W x[n][cols] via cuBLAS (W BF16 or F32)
-    void gemm_h(const M & w, const __half * x, float * y, int n) {
+    // (called through the gemm_h macro, which passes the caller's line for the error message)
+    void gemm_h_at(const M & w, const __half * x, float * y, int n, int line) {
         const float one = 1.f, zero = 0.f;
         if (w.f32) {
-            if (cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.f32, CUDA_R_32F, w.cols, x, CUDA_R_16F, w.cols,
-                             &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-                throw std::runtime_error("inkling2: cuBLAS GEMM failed");
+            cb_at(cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.f32, CUDA_R_32F, w.cols, x, CUDA_R_16F, w.cols,
+                               &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "GEMM", line);
         } else {
-            if (cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.m.p, CUDA_R_16F, w.cols, x, CUDA_R_16F, w.cols,
-                             &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
-                throw std::runtime_error("inkling2: cuBLAS GEMM failed");
+            cb_at(cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.m.p, CUDA_R_16F, w.cols, x, CUDA_R_16F, w.cols,
+                               &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "GEMM", line);
         }
     }
     // y[n][rows] = W x[n][cols] -> BF16 (for a format matvec input)
@@ -565,7 +598,9 @@ private:
     void run_token(uint32_t tok, uint32_t pos) {
         // The embedding lives on stage 1 (GPU 0); the first layers run on stage 0 (GPU 1) when split.
         // Compute the embedding on stage 1, then hop the vector to stage 0 if the first layer is there.
+        if (sync_) where_ = " [pos " + std::to_string(pos) + "]";
         use_dev(1);
+        sync_check("switch to the head's stage");
         {
             const auto & t = tensor("token_embd.weight");
             const int64_t row_bytes = int64_t(H_) * (t.type == 30 ? 2 : 4);
@@ -583,12 +618,14 @@ private:
             ck(cudaMemcpyAsync(S1.h_.p, e.data(), H_ * 2, cudaMemcpyHostToDevice, stream()));
             tqllm_cuda::ik2_rms_norm(S1.h_.as<__half>(), embd_norm_, eps_, H_, S1.h_.as<__half>(), stream());
         }
+        sync_check("embedding upload + norm");
         n_blocks_ = 0;
         // The first layer's device: stage 0 if split and layer 0 < split_at_, else stage 1.
         const int first_dev = dev_of(0);
         if (first_dev != cur_dev_) {
             hop_to(first_dev);  // move the embedding vector across
             use_dev(first_dev);
+            sync_check("hop of the embedding to the first layer's stage");
         }
         // pre-core layers
         for (int l = 0; l < core0_; ++l) {
@@ -606,11 +643,13 @@ private:
             // (these device copies go on the stage's stream, after the visits that produce what they read)
             ck(cudaMemcpyAsync(pre_h.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
             ck(cudaMemcpyAsync(pre_blk.p, S.blocks_.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice, stream()));
+            sync_check("loop: snapshot of the pre-core state");
             for (int p = 0; p < n_pass_; ++p) {
                 if (p > 0) {
                     ck(cudaMemcpyAsync(S.h_.p, pre_h.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     ck(cudaMemcpyAsync(S.blocks_.p, pre_blk.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     n_blocks_ = pre_nb;
+                    sync_check("loop: restore of the pre-core state");
                 }
                 for (int l = core0_; l < core1_; ++l) {
                     int v = core0_ + p * (core1_ - core0_) + (l - core0_);
@@ -619,6 +658,7 @@ private:
                 if (p < n_pass_ - 1) {
                     ck(cudaMemcpyAsync(S.prev_h_.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     prev_nb_ = n_blocks_;
+                    sync_check("loop: copy of the pass's final stream");
                 }
             }
             ck(cudaStreamSynchronize(stream()));  // pre_h / pre_blk are freed here: nothing queued may still read them
@@ -628,6 +668,7 @@ private:
             if (split_at_ && dev_of(l) != cur_dev_) {
                 hop_to(dev_of(l));  // move h_ + blocks_ to the next stage
                 use_dev(dev_of(l));
+                sync_check("hop of the stream and the blocks to the next stage");
             }
             visit(l, l, 0, pos, nullptr, 0);
         }
@@ -665,6 +706,7 @@ private:
         auto & Y = L_[l];
         const int C = H_;
         __half * h = S.h_.as<__half>();
+        if (sync_) where_ = " [layer " + std::to_string(l) + ", visit " + std::to_string(v) + ", pass " + std::to_string(pass) + ", pos " + std::to_string(pos) + "]";
 
         // h_in = attn_res(blocks, h) (layer 0: (h,h,h))
         Buf insbuf(3 * C * 2);
@@ -680,12 +722,14 @@ private:
             if (Y.attn_res_nq == 1) { for (int j = 0; j < 3; ++j) ins[j] = o; }
             else { ins[0] = o; ins[1] = o + C; ins[2] = o + 2 * C; }
         }
+        sync_check("visit: residual mix of the attention inputs");
         if (pass > 0) {
             Buf msgs(4 * C * 2);
             loop_messages(l, prev_last, prev_nblocks, static_cast<__half *>(msgs.p));
             tqllm_cuda::ik2_control(ins[0], static_cast<__half *>(msgs.p), Y.loop_attn_down, Y.loop_attn_forget, Y.loop_attn_gain, C, ins[0], stream());
             tqllm_cuda::ik2_control(ins[1], static_cast<__half *>(msgs.p) + C, Y.loop_k_down, Y.loop_k_forget, Y.loop_k_gain, C, ins[1], stream());
             tqllm_cuda::ik2_control(ins[2], static_cast<__half *>(msgs.p) + 2 * C, Y.loop_v_down, Y.loop_v_forget, Y.loop_v_gain, C, ins[2], stream());
+            sync_check("visit: loop control of the attention inputs");
             ck(cudaStreamSynchronize(stream()));  // msgs is freed here: nothing queued may still read it
         }
         // norm the inputs
@@ -696,6 +740,7 @@ private:
             if (sliding_[l]) tqllm_cuda::ik2_rms_norm(ins[j], Y.attn_norm, eps_, C, xs[j], stream());
             else tqllm_cuda::ik2_rms_norm(ins[j], (j == 0 ? Y.q_inp_norm : j == 1 ? Y.k_inp_norm : Y.v_inp_norm), eps_, C, xs[j], stream());
         }
+        sync_check("visit: norm of the attention inputs");
         // attention
         __half * attn_out = S.s1_.as<__half>();
         __half * pre_kh = S.s2_.as<__half>();  // [kd]
@@ -705,6 +750,7 @@ private:
         __half * a = S.g_.as<__half>();  // g_ is free after attention
         const __half * phist = Y.conv_pos > 0 ? Y.post_hist.as<__half>() : nullptr;
         tqllm_cuda::ik2_shortconv(Y.post_conv, taps_, attn_out, a, C, 1, phist, stream());
+        sync_check("visit: short conv after the attention");
         // block boundary (device-resident): at a boundary, push h onto the block bank and r = a;
         // otherwise r = h + a.
         __half * r;
@@ -719,25 +765,31 @@ private:
             tqllm_cuda::ik2_hadd(h, a, rbuf.as<__half>(), C, stream());
             r = rbuf.as<__half>();
         }
+        sync_check("visit: block bank push / residual add after the attention");
         // m_in = attn_res(blocks, r) with ffn_res_q
         __half * m_in = S.s3_.as<__half>();
         tqllm_cuda::ik2_attn_res(S.blocks_.as<__half>(), n_blocks_, r, Y.ffn_res_q, 1, C, m_in, stream());
+        sync_check("visit: residual mix of the MoE input");
         if (pass > 0) {
             Buf msgs(4 * C * 2);
             loop_messages(l, prev_last, prev_nblocks, static_cast<__half *>(msgs.p));
             tqllm_cuda::ik2_control(m_in, static_cast<__half *>(msgs.p) + 3 * C, Y.loop_mlp_down, Y.loop_mlp_forget, Y.loop_mlp_gain, C, m_in, stream());
+            sync_check("visit: loop control of the MoE input");
             ck(cudaStreamSynchronize(stream()));  // msgs is freed here: nothing queued may still read it
         }
         // m = moe(rms(m_in, ffn_norm))
         __half * mnorm = S.s4_.as<__half>();
         tqllm_cuda::ik2_rms_norm(m_in, Y.ffn_norm, eps_, C, mnorm, stream());
+        sync_check("visit: norm of the MoE input");
         __half * m = S.g_.as<__half>();  // g_ is free after post_conv
         moe(Y, mnorm, m);
         // m = shortconv_mlp(m)
         const __half * mhist = Y.conv_pos > 0 ? Y.mlp_hist.as<__half>() : nullptr;
         tqllm_cuda::ik2_shortconv(Y.mlp_conv, taps_, m, m, C, 1, mhist, stream());
+        sync_check("visit: short conv after the MoE");
         // h = r + m (device-resident)
         tqllm_cuda::ik2_hadd(r, m, h, C, stream());
+        sync_check("visit: residual add after the MoE");
         // update conv histories: shift and append current token's pre-conv inputs
         const int kd = n_kv_ * hd_;
         tqllm_cuda::ik2_conv_hist_update(Y.k_hist.as<__half>(), pre_kh, taps_, kd, stream());
@@ -745,7 +797,9 @@ private:
         tqllm_cuda::ik2_conv_hist_update(Y.post_hist.as<__half>(), attn_out, taps_, C, stream());
         tqllm_cuda::ik2_conv_hist_update(Y.mlp_hist.as<__half>(), m, taps_, C, stream());
         ++Y.conv_pos;
+        sync_check("visit: conv history update");
         ck(cudaStreamSynchronize(stream()));  // insbuf, xsbuf and rbuf are freed here: nothing queued may still use them
+        if (sync_) where_ = " [pos " + std::to_string(pos) + "]";
     }
 
     // The four loop messages (m_q, m_k, m_v, m_mlp) of core layer l: attn_res(bank, last) with the loop_res_query /
@@ -759,12 +813,14 @@ private:
         // m_q, m_mlp from loop_res_query rows [2i, 2i+1]; m_k, m_v from loop_kv_res_query rows [2i, 2i+1]
         tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_res_q_ + 2 * i * C, 2, C, out, stream());          // m_q, m_mlp
         tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_kv_res_q_ + 2 * i * C, 2, C, out + 2 * C, stream());  // m_k, m_v
+        sync_check("loop messages: residual mixes over the previous pass");
         // reorder: out = [m_q, m_k, m_v, m_mlp] (currently [m_q, m_mlp, m_k, m_v]); device copies.
         Buf tmp(C * 2);
         tqllm_cuda::ik2_hcopy(out + C, tmp.as<__half>(), C, stream());      // tmp = m_mlp
         tqllm_cuda::ik2_hcopy(out + 2 * C, out + C, C, stream());            // out[1] = m_k
         tqllm_cuda::ik2_hcopy(tmp.as<__half>(), out + 2 * C, C, stream());   // out[2] = m_v
         tqllm_cuda::ik2_hcopy(tmp.as<__half>(), out + 3 * C, C, stream());   // out[3] = m_mlp
+        sync_check("loop messages: reorder");
         ck(cudaStreamSynchronize(stream()));  // tmp is freed here: nothing queued may still use it
     }
 
@@ -789,6 +845,7 @@ private:
         gemm_h(Y.wgate, xq, gate, 1);
         float * sink = S.f_.as<float>();  // [H]
         gemm_h(Y.wsink, xq, sink, 1);
+        sync_check("attention: q / k / v / r / gate / sink projections");
         // to half (device-resident conversion)
         __half * qh = S.a_.as<__half>();  // [qd]
         tqllm_cuda::common::f32_to_half(qf, qh, qd, stream());
@@ -806,6 +863,7 @@ private:
         // save pre-conv k/v for conv history (device copy)
         tqllm_cuda::ik2_hcopy(kh, pre_kh, kd, stream());
         tqllm_cuda::ik2_hcopy(vh, pre_vh, kd, stream());
+        sync_check("attention: conversion to half + pre-conv copies");
         // k/v short conv (with history)
         const __half * khist = Y.conv_pos > 0 ? Y.k_hist.as<__half>() : nullptr;
         const __half * vhist = Y.conv_pos > 0 ? Y.v_hist.as<__half>() : nullptr;
@@ -822,6 +880,7 @@ private:
             tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, hd_, dynk, khist, stream());
             tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, hd_, dynv, vhist, stream());
         }
+        sync_check("attention: k / v short conv");
         // clip q, k; norm v; clip r
         tqllm_cuda::ik2_l2clip(qh, Y.q_clip, qk_clip_, H, D, qh, stream());
         tqllm_cuda::ik2_l2clip(kh, Y.q_clip, qk_clip_, KV, D, kh, stream());  // k uses qk_clip (no per-head clip weight)
@@ -833,6 +892,7 @@ private:
             tqllm_cuda::ik2_hscale(qh, tau, qd, stream());
             tqllm_cuda::ik2_hscale(rh, tau, H * d_rel_, stream());
         }
+        sync_check("attention: q / k / r clip, v norm, tau");
         // write the current token's k/v into the cache at row pos (device-to-device)
         {
             __half * krow = Y.kc.as<__half>() + size_t(pos) * KV * D;
@@ -840,6 +900,7 @@ private:
             ck(cudaMemcpyAsync(krow, kh, kd * 2, cudaMemcpyDeviceToDevice, stream()));
             ck(cudaMemcpyAsync(vrow, vh, kd * 2, cudaMemcpyDeviceToDevice, stream()));
         }
+        sync_check("attention: KV cache write");
         // attention core
         tqllm_cuda::Ik2AttnCore ac{};
         ac.q = qh; ac.k = kh; ac.v = vh; ac.r = rh; ac.gate = gateh; ac.sink = sinkh;
@@ -849,10 +910,12 @@ private:
         ac.kc = Y.kc.as<const __half>(); ac.vc = Y.vc.as<const __half>();
         __half * att = S.g_.as<__half>();  // [qd]
         tqllm_cuda::ik2_attention_core(ac, att, stream());
+        sync_check("attention: core (scores, softmax, gate)");
         // out = att @ wo^T [C] (F32 scratch -> half, device-resident)
         float * of = S.a_.as<float>();  // [C]
         gemm_h(Y.wo, att, of, 1);
         tqllm_cuda::common::f32_to_half(of, out, C, stream());
+        sync_check("attention: output projection");
     }
 
     // The MoE: sigmoid router, top-k, routed experts. x [C], out [C].
@@ -865,6 +928,7 @@ private:
         // router logits = x @ router^T [E]
         float * logits = S.s1_.as<float>();
         gemm_h(Y.router, x, logits, 1);
+        sync_check("moe: router projection");
         // sigmoid + top-k + weights (host: E is small)
         std::vector<float> sc(E);
         copy_sync(sc.data(), logits, E * 4, cudaMemcpyDeviceToHost, stream());
@@ -890,6 +954,8 @@ private:
         ck(cudaMemcpyAsync(S.moe_scales_.p, sds.data(), K * 4, cudaMemcpyHostToDevice, stream()));
         // gate+up: e_gu is [E * 2 * FF][C]; expert_matvec with rows=2*FF gives [K][2*FF] BF16
         Y.e_gu.fmt->expert_matvec(Y.e_gu, x, S.moe_gu_.as<bf16>(), 2 * FF, S.moe_ids_.as<int>(), 1, K, false, stream());
+        ck(cudaGetLastError());  // the format's launcher does not check its launch: a refused one shows only here
+        sync_check("moe: routing upload + gate / up expert matvec");
         // activation: h = tanh(g/gate_cap)*gate_cap*sigmoid(g)*tanh(u/up_cap)*up_cap
         {
             std::vector<bf16> gu(size_t(K) * 2 * FF);
@@ -907,6 +973,8 @@ private:
         }
         // down: e_down is [E * C][FF]; expert_matvec with rows=C gives [K][C] BF16
         Y.e_down.fmt->expert_matvec(Y.e_down, S.moe_act_.as<__half>(), S.moe_dn_.as<bf16>(), C, S.moe_ids_.as<int>(), 1, K, true, stream());
+        ck(cudaGetLastError());  // (as above)
+        sync_check("moe: activation upload + down expert matvec");
         // out = sum_i wts[i] * sds[i] * moe_dn_[i]  (host: K is small; out is a device pointer,
         // so accumulate on the host and upload)
         std::vector<bf16> dn(size_t(K) * C);
@@ -918,6 +986,7 @@ private:
             o[j] = __float2half(acc);
         }
         ck(cudaMemcpyAsync(out, o.data(), C * 2, cudaMemcpyHostToDevice, stream()));
+        sync_check("moe: output upload");
     }
 
     int e_ff_ = 0;  // expert feed-forward width (set in load)
@@ -931,8 +1000,10 @@ private:
         tqllm_cuda::ik2_attn_res(S.blocks_.as<__half>(), n_blocks_, h, out_res_q_, 1, H_, hres, stream());
         __half * hnorm = S.s2_.as<__half>();
         tqllm_cuda::ik2_rms_norm(hres, out_norm_, eps_, H_, hnorm, stream());
+        sync_check("head: residual mix + output norm");
         gemm_h(out_, hnorm, S.logits_.as<float>(), 1);
         tqllm_cuda::ik2_softcap(S.logits_.as<float>(), vocab_unpadded_, logit_cap_, stream());
+        sync_check("head: output projection + softcap");
     }
 
     uint32_t greedy_token() {
