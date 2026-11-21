@@ -318,6 +318,12 @@ void bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t);
 void fp_matvec(bool bf16, const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t,
                int ldy = 0);  // ldy: output column stride (0 = rows)
 void fp_dequant_h(bool bf16, const void * w, __half * out, size_t n, cudaStream_t);
+// Grouped-expert matvec for dense BF16 / F16 stacked weights [experts * rows][k]; same semantics as
+// nvfp4_gguf_expert_matvec: y [n * topk][rows] BF16, ids [n * topk], x [n][k] (or [n * topk][k] when per_expert_input).
+void bf16_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                        const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
+void f16_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
 // MXFP8: rows of k E4M3 bytes then the row's k / 32 E8M0 scales (k % 512 == 0); ldy 0 = rows
 void mxfp8_matvec(const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t, int ldy);
 void mxfp8_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t);

@@ -18,14 +18,17 @@ constexpr int kCore1 = 18;  // core_end (exclusive)
 constexpr int kNCore = kCore1 - kCore0;  // 12
 constexpr int kLayers = kVisits - (kPass - 1) * kNCore;  // 24
 
-// Per-layer weight bytes (from the GGUF dump). Layers 0-19 are NVFP4 experts (~0.73 GB each);
-// layers 20-23 are BF16 experts (~2.4 GB each, 3.3x larger). The attention/conv/norm tensors are
-// small (~5 MB) and are folded into the per-layer figure below.
-// These are the dominant terms; the exact figures come from the GGUF tensor dump.
-constexpr double kLayerBytesSmall = 0.73 * 1024 * 1024 * 1024;  // layers 0-19 (NVFP4)
-constexpr double kLayerBytesBig = 2.40 * 1024 * 1024 * 1024;    // layers 20-23 (BF16)
-// Head (output proj + norm + loop queries + embedding tail) ~ 0.5 GB, lives on GPU 0.
-constexpr double kHeadBytes = 0.5 * 1024 * 1024 * 1024;
+// Per-layer weight bytes (from the GGUF dump, computed from tensor shapes).
+// Small layers (0-19, NVFP4 experts): attention 0.050 GB + conv/norm/router 0.001 GB
+//   + NVFP4 experts (gate_up [2304,2304,128] + down [1152,2304,128], 36 B per 64 weights) 0.534 GB
+//   = 0.585 GB per layer.
+// Big layers (20-23, BF16 experts): same attention/conv/norm/router
+//   + BF16 experts (gate_up [2304,2304,128] + down [1152,2304,128], 2 B per element) 1.898 GB
+//   = 1.949 GB per layer.
+constexpr double kLayerBytesSmall = 0.585 * 1024 * 1024 * 1024;  // layers 0-19 (NVFP4)
+constexpr double kLayerBytesBig = 1.949 * 1024 * 1024 * 1024;    // layers 20-23 (BF16)
+// Head: token_embd [2304, 201024] BF16 + output [2304, 201024] BF16 + norms ~ 1.725 GB, lives on GPU 0.
+constexpr double kHeadBytes = 1.725 * 1024 * 1024 * 1024;
 // GPU 0 also reserves ~2 GB for the monitor.
 constexpr double kMonitorBytes = 2.0 * 1024 * 1024 * 1024;
 constexpr double kGpuBytes = 16.0 * 1024 * 1024 * 1024;  // 16 GB per RTX 5060 Ti

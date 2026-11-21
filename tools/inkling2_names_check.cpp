@@ -287,14 +287,81 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // ---- 5. Print report ----
+    // ---- 5. Kernel coverage: for every expected tensor, report whether a kernel path exists for its dtype ----
+    // The engine's kernel paths per tensor role:
+    //   - load_mat (projections, router): needs matvec (dense) or matvec_f32. Fp (BF16/F16/F32) has matvec.
+    //     NVFP4 (40) has NO dense matvec (expert-only format) -> would fail if used in load_mat.
+    //   - load_experts (expert stacks): needs has_expert_matvec(). NVFP4 (40) has it. Fp (BF16/F16/F32) now has it.
+    //   - vec / host_f32 (norms, biases, convs, clips): dequantize_host_rows -> any type works (CPU dequant).
+    //   - fold_conv_vec: same as vec.
+    // So the only dtype that can lack a kernel path is one that has neither matvec nor expert_matvec nor host dequant.
+    // In practice: all types 0,1,30,40,8,12,321 have host dequant. The question is whether the ENGINE PATH used
+    // for each tensor role has a GPU kernel for that dtype.
+    //
+    // For each expected tensor, determine its role and the required kernel:
+    //   - name ends with ".weight" and is an expert stack (ffn_gate_up_exps / ffn_down_exps) -> needs expert_matvec
+    //   - name ends with ".weight" and is a projection (attn_*, output, token_embd, router) -> needs matvec
+    //   - name ends with ".bias" or is a norm/conv/clip/rel_bias -> host path (always OK)
+    //   - name ends with ".scale" -> host path (always OK)
+    std::fprintf(stderr, "\n=== KERNEL COVERAGE REPORT ===\n");
+    int n_no_kernel = 0;
+    for (const auto & e : exp) {
+        auto it = f.tensors.find(e.name);
+        if (it == f.tensors.end()) continue;  // already reported as MISSING
+        const GgufTensor & t = it->second;
+        const uint32_t dtype = t.type;
+        const std::string & name = e.name;
+        // Determine role
+        bool is_expert_stack = name.find("ffn_gate_up_exps") != std::string::npos ||
+                               name.find("ffn_down_exps") != std::string::npos;
+        bool is_projection = name.find("attn_") != std::string::npos && name.find(".weight") != std::string::npos &&
+                             !is_expert_stack && name.find("conv") == std::string::npos &&
+                             name.find("clip") == std::string::npos && name.find("rel_bias") == std::string::npos &&
+                             name.find("res_query") == std::string::npos;
+        is_projection = is_projection || name == "token_embd.weight" || name == "output.weight" ||
+                        name.find("ffn_gate_inp") != std::string::npos;  // router
+        bool is_host = !is_expert_stack && !is_projection;  // norms, biases, convs, clips, scales, res_query
+        // Check kernel availability
+        bool has_kernel = true;
+        std::string kernel_path;
+        if (is_expert_stack) {
+            // Needs has_expert_matvec()
+            // NVFP4 (40): yes. BF16 (30) / F16 (1) / F32 (0): yes (after our fix).
+            // Q8_0 (8): yes (I8H). Others: check.
+            if (dtype == 40) { has_kernel = true; kernel_path = "NVFP4 expert_matvec"; }
+            else if (dtype == 30 || dtype == 1 || dtype == 0) { has_kernel = true; kernel_path = "Fp expert_matvec (BF16/F16)"; }
+            else if (dtype == 8) { has_kernel = true; kernel_path = "I8H expert_matvec"; }
+            else { has_kernel = false; kernel_path = "NO expert_matvec kernel for type " + std::to_string(dtype); }
+        } else if (is_projection) {
+            // Needs matvec (dense) or matvec_f32
+            if (dtype == 40) { has_kernel = false; kernel_path = "NVFP4 has NO dense matvec (expert-only format)"; }
+            else if (dtype == 30 || dtype == 1 || dtype == 0) { has_kernel = true; kernel_path = "Fp matvec (BF16/F16/F32)"; }
+            else if (dtype == 8) { has_kernel = true; kernel_path = "I8H matvec"; }
+            else { has_kernel = false; kernel_path = "NO matvec kernel for type " + std::to_string(dtype); }
+        } else {
+            // Host path: always OK (dequantize_host_rows handles all types)
+            has_kernel = true;
+            kernel_path = "host dequant (always OK)";
+        }
+        if (!has_kernel) {
+            ++n_no_kernel;
+            report.push_back("NO-KERNEL: " + name + " " + type_name(dtype) + " " + shape_str(t.ne) + " -> " + kernel_path);
+        }
+    }
+    std::fprintf(stderr, "tensors without a kernel path: %d\n", n_no_kernel);
+    for (const auto & line : report) {
+        if (line.rfind("NO-KERNEL:", 0) == 0) std::fprintf(stderr, "  %s\n", line.c_str());
+    }
+
+    // ---- 6. Print report ----
     std::fprintf(stderr, "\n=== MISMATCH REPORT ===\n");
     std::fprintf(stderr, "missing(required): %d\n", n_missing);
     std::fprintf(stderr, "shape mismatch:    %d\n", n_shape);
     std::fprintf(stderr, "type mismatch:     %d\n", n_type);
     std::fprintf(stderr, "unused (in GGUF, not expected): %d\n", n_unused);
+    std::fprintf(stderr, "no kernel path:    %d\n", n_no_kernel);
     for (const auto & line : report) std::fprintf(stderr, "  %s\n", line.c_str());
-    const int total = n_missing + n_shape + n_type + n_unused;
+    const int total = n_missing + n_shape + n_type + n_unused + n_no_kernel;
     std::fprintf(stderr, "TOTAL mismatches: %d\n", total);
     std::fprintf(stderr, "dump written to: %s\n", dump_path.c_str());
     return total == 0 ? 0 : 1;
