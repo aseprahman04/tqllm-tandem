@@ -78,7 +78,7 @@ void Tokenizer::load_gguf(const std::string & path) {
         return it->second;
     };
     const auto & pre = key("tokenizer.ggml.pre").str;
-    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35" && pre != "minimax-m3" && pre != "glm4"))
+    if (key("tokenizer.ggml.model").str != "gpt2" || (pre != "qwen2" && pre != "qwen35" && pre != "minimax-m3" && pre != "glm4" && pre != "inkling2"))
         throw std::runtime_error("GGUF tokenizer differs from the implemented Qwen byte-level BPE (pre " + pre + "); pass --tokenizer");
     const auto & tokens = key("tokenizer.ggml.tokens").strs;
     const auto & types = key("tokenizer.ggml.token_type").arr;
@@ -87,10 +87,16 @@ void Tokenizer::load_gguf(const std::string & path) {
     id_to_piece_.clear(); piece_to_id_.clear(); special_to_id_.clear(); merges_.clear(); merge_rank_.clear();
     id_to_piece_.resize(std::max<size_t>(300000, tokens.size()));
     // token_type: 1 normal, 3 control, 4 user-defined (both matched atomically, as HF added tokens), 5 unused padding
+    // inkling2: only <|...|> tokens are special; other type-3/4 tokens are normal BPE pieces
+    const bool inkling2 = pre == "inkling2";
     for (size_t i = 0; i < tokens.size(); ++i) {
         const int t = int(types[i]);
         if (t == 1) { id_to_piece_[i] = tokens[i]; piece_to_id_.emplace(tokens[i], uint32_t(i)); }
-        else if (t == 3 || t == 4) special_to_id_.emplace(tokens[i], uint32_t(i));
+        else if (t == 3 || t == 4) {
+            if (inkling2 && !(tokens[i].size() > 6 && tokens[i].compare(0, 2, "<|") == 0 && tokens[i].compare(tokens[i].size() - 2, 2, "|>") == 0))
+                { id_to_piece_[i] = tokens[i]; piece_to_id_.emplace(tokens[i], uint32_t(i)); }
+            else special_to_id_.emplace(tokens[i], uint32_t(i));
+        }
     }
     merges_.reserve(merges.size());
     for (size_t i = 0; i < merges.size(); ++i) {
@@ -104,7 +110,7 @@ void Tokenizer::load_gguf(const std::string & path) {
     if (g.has("tokenizer.ggml.eom_token_id")) eom_id_ = uint32_t(g.num("tokenizer.ggml.eom_token_id"));
     unicode_ranges_.assign(std::begin(ranges), std::end(ranges));
     marks_in_letters_ = pre == "qwen35";
-    o200k_ = pre == "minimax-m3";
+    o200k_ = pre == "minimax-m3" || pre == "inkling2";
     digits3_ = pre == "glm4";
     static const std::tuple<uint32_t, uint32_t, uint8_t> cases[] = {
 #include "unicode_case_ranges.inc"
