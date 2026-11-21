@@ -19,7 +19,7 @@ include(GNUInstallDirs)
 include(CTest)
 # Source layout (AGENTS.md): one folder per component and per model architecture, host and device code together.
 # Includes name the file only; these folders are the search path.
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/engine ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/experts ${CMAKE_CURRENT_SOURCE_DIR}/src/spec ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen2 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp ${CMAKE_CURRENT_SOURCE_DIR}/src/models/glm/glm5next ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax/m3 ${CMAKE_CURRENT_SOURCE_DIR}/src/vision ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/core ${CMAKE_CURRENT_SOURCE_DIR}/src/core/hf ${CMAKE_CURRENT_SOURCE_DIR}/src/engine ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/weight ${CMAKE_CURRENT_SOURCE_DIR}/src/formats/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/kv ${CMAKE_CURRENT_SOURCE_DIR}/src/experts ${CMAKE_CURRENT_SOURCE_DIR}/src/spec ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen2 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen/qwen4exp ${CMAKE_CURRENT_SOURCE_DIR}/src/models/glm/glm5next ${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax/m3 ${CMAKE_CURRENT_SOURCE_DIR}/src/models/inkling2 ${CMAKE_CURRENT_SOURCE_DIR}/src/vision ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 find_package(Threads REQUIRED)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS tools/serve/monitor.html tools/serve/monitor_panels.js)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/tools/serve/monitor_panels.js" TQLLM_MONITOR_PANELS)
@@ -195,6 +195,8 @@ if(TQLLM_CUDA)
     target_sources(tqllm PRIVATE src/models/glm/glm5next/glm5next.cpp src/models/glm/glm5next/glm5next.cu src/models/glm/glm5next/glm5next_dsa.cu)
     # MiniMax-M3.1-Flash (src/models/minimax/m3, GGUF arch minimax-m3 from tools/minimax_convert.cpp); reuses the GLM kernels
     target_sources(tqllm PRIVATE src/models/minimax/m3/minimax.cpp src/models/minimax/m3/minimax.cu)
+    # Inkling-2-Mini (src/models/inkling2, GGUF arch inkling2, the looped 26B MoE); its own kernels
+    target_sources(tqllm PRIVATE src/models/inkling2/inkling2.cpp src/models/inkling2/inkling2.cu)
   else()
     target_sources(tqllm PRIVATE src/backends/cuda/moe_unsupported.cpp)
   endif()

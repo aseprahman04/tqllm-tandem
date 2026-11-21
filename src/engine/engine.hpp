@@ -115,6 +115,9 @@ struct Engine {
 bool is_glm5next_gguf(const std::string & path);
 std::unique_ptr<Engine> make_glm5next_engine(const std::string & path, uint32_t context);
 bool is_minimax_gguf(const std::string & path);
+// Inkling-2-Mini (GGUF arch inkling2, the looped 26B MoE), src/models/inkling2
+bool is_inkling2_gguf(const std::string & path);
+std::unique_ptr<Engine> make_inkling2_engine(const std::string & path, uint32_t context);
 // tensor parallelism over linked boxes: world ranks, rank 0 at peer:port (rank 0 listens there for the others)
 struct TpConfig { int rank = 0, world = 1; std::string peer; int port = 29600; };
 std::unique_ptr<Engine> make_minimax_engine(const std::string & path, uint32_t context, const std::string & draft = "",

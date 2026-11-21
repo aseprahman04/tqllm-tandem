@@ -47,6 +47,12 @@ void register_builtin_engines() {
                          return make_glm5next_engine(m, c);
                      },
                      false});
+    register_engine({"inkling2", [](const std::filesystem::path & p) { return gguf_like(p) && is_inkling2_gguf(p.string()); },
+                     [](const std::string & m, const std::string &, uint32_t c, int slots, const EngineOptions &) {
+                         one_slot(slots, "Inkling-2-Mini");
+                         return make_inkling2_engine(m, c);
+                     },
+                     false});
     register_engine({"qwen3-gguf", [](const std::filesystem::path& p) {
                          return p.extension() == ".gguf" && gguf_architecture(p.string()) == "qwen3";
                      }, [](const std::string& m, const std::string& t, uint32_t c, int slots, const EngineOptions& o) {
