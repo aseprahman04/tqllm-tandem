@@ -57,4 +57,56 @@ void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __n
                 nvfp4_matvec_k<1><<<grid, 256, 0, s>>>(w, sc, gscale, x + int64_t(c0) * k, y + int64_t(c0) * rows, rows, k);
     }
 }
+
+// ggml NVFP4 (block_nvfp4: d[4] UE4M3 + qs[32] E2M1 nibbles per 64 weights) expert matvec, decode in-register.
+// 2-D grid: x = rows / 8 (8 rows per block), y = n * topk (assignments). 256 threads = 8 warps, one warp per row.
+// w: [experts * rows][k / 64] block_nvfp4 (each block 36 bytes: d[4] then qs[32]); sc: [experts] F32 (null: 1.0);
+// x: [n][k] BF16; ids: [n * topk] expert ids; y: [n * topk][rows] BF16.
+namespace {
+__device__ __forceinline__ float ue4m3_f(uint8_t b) {  // ggml's UE4M3 (unsigned E4M3, finite)
+    if (b == 0 || (b == 0x7f && b != 0xff)) return 0.f;
+    const int e = (b >> 3) & 15, m = b & 7;
+    return e == 0 ? ldexpf(m, -9) : ldexpf(1.f + m / 8.f, e - 7);
+}
+__global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, const __nv_bfloat16 * x,
+                                           __nv_bfloat16 * y, int rows, int k, const int * ids, int topk) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;  // output row within the expert
+    if (row >= rows) return;
+    const int a = blockIdx.y;  // assignment [0, n * topk)
+    const int tok = a / topk, e = ids[a];
+    const float scale = sc ? sc[e] : 1.f;
+    const int nb = k / 64;  // block_nvfp4 per row
+    const uint8_t * wr = w + (int64_t(e) * rows + row) * int64_t(nb) * 36;  // this expert's row
+    const __nv_bfloat16 * xr = x + int64_t(tok) * k;
+    float acc = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const uint8_t * blk = wr + b * 36;
+        const uint8_t * d = blk, * qs = blk + 4;
+        // 4 sub-blocks of 16 weights; sub-block s uses scale d[s]
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const float scs = ue4m3_f(d[s]);
+            const uint8_t * q = qs + s * 16;  // 16 bytes = 32 nibbles = 32 weights? No: 16 bytes = 32 nibbles
+            // sub-block s covers weights [s*16, s*16+16): 16 weights = 8 bytes of nibbles
+            const int base = b * 64 + s * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const uint8_t qbyte = q[i >> 1];
+                const int nib = (i & 1) ? (qbyte >> 4) : (qbyte & 15);
+                const float wv = E2M1[nib] * scs;
+                acc += wv * __bfloat162float(xr[base + i]);
+            }
+        }
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[int64_t(a) * rows + row] = __float2bfloat16(acc * scale);
+}
+}  // namespace
+void nvfp4_gguf_expert_matvec(const uint8_t * w, const float * sc, const __nv_bfloat16 * x, __nv_bfloat16 * y, int rows,
+                              int k, const int * ids, int n, int topk, cudaStream_t s) {
+    const dim3 grid((rows + 7) / 8, n * topk);
+    nvfp4_gguf_expert_matvec_k<<<grid, 256, 0, s>>>(w, sc, x, y, rows, k, ids, topk);
+}
 }  // namespace tqllm_cuda

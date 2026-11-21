@@ -407,6 +407,28 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
             }
             return;
         }
+        case GGML_TYPE_NVFP4: {  // ggml block_nvfp4: per 64 weights, d[4] UE4M3 (one per 16-weight sub-block) + qs[32] E2M1 nibbles
+            if (n < 0 || n % 64) break;
+            static const float e2m1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+            auto ue4m3 = [](uint8_t b) -> float {
+                if (b == 0 || (b == 0x7f && b != 0xff)) return 0.f;
+                const int e = (b >> 3) & 15, m = b & 7;
+                return e == 0 ? std::ldexpf(m, -9) : std::ldexpf(1.f + m / 8.f, e - 7);
+            };
+            for (int64_t b = 0; b < n / 64; ++b) {
+                const uint8_t * blk = s + b * 36;
+                const uint8_t * d = blk, * qs = blk + 4;
+                for (int sub = 0; sub < 4; ++sub) {  // 4 sub-blocks of 16 weights
+                    const float sc = ue4m3(d[sub]);
+                    for (int i = 0; i < 16; ++i) {  // 16 weights = 8 bytes of nibbles
+                        const uint8_t q = qs[sub * 8 + (i >> 1)];
+                        const int nib = (i & 1) ? (q >> 4) : (q & 15);
+                        dst[b * 64 + sub * 16 + i] = e2m1[nib] * sc;
+                    }
+                }
+            }
+            return;
+        }
         case GGML_GSQ_Q2_0:
             if (n < 0 || n % 64) break;
             for (int64_t b = 0; b < n / 64; ++b) {
