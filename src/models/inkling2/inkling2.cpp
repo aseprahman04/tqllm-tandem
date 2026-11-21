@@ -131,7 +131,8 @@ public:
             if (cublas_[d]) cublasDestroy(cublas_[d]);
             if (stream_[d]) cudaStreamDestroy(stream_[d]);
         }
-        if (hop_ev_) cudaEventDestroy(hop_ev_);
+        for (int d = 0; d < 2; ++d)
+            if (hop_ev_[d]) cudaEventDestroy(hop_ev_[d]);
     }
 
     void synchronize() override { ck(cudaStreamSynchronize(stream())); }
@@ -181,7 +182,7 @@ private:
     int load_dev_ = 0;  // device the next put()/load targets (set per layer during load())
     cudaStream_t stream_[2] = {nullptr, nullptr};
     cublasHandle_t cublas_[2] = {nullptr, nullptr};
-    cudaEvent_t hop_ev_ = nullptr;
+    cudaEvent_t hop_ev_[2] = {nullptr, nullptr};
     int cuda_of_[2] = {0, 1};  // stage 0 -> cuda dev 1, stage 1 -> cuda dev 0
     // Per-stage scratch: each GPU owns its own activations so a stage's buffers never alias the other's.
     struct Stage {
@@ -251,11 +252,13 @@ private:
     // (which reads the hopped activation) is ordered after the old stage finished producing it.
     void use_dev(int d) {
         if (!split_at_ || d == cur_dev_) return;
-        if (!hop_ev_) ck(cudaEventCreateWithFlags(&hop_ev_, cudaEventDisableTiming));
-        ck(cudaEventRecord(hop_ev_, stream_[cur_dev_]));
+        // CUDA: an event and the stream it is recorded on must live on the same device, so one event per device.
+        ck(cudaSetDevice(cuda_of_[cur_dev_]));
+        if (!hop_ev_[cur_dev_]) ck(cudaEventCreateWithFlags(&hop_ev_[cur_dev_], cudaEventDisableTiming));
+        ck(cudaEventRecord(hop_ev_[cur_dev_], stream_[cur_dev_]));
         ensure_dev(d);
         ck(cudaSetDevice(cuda_of_[d]));
-        ck(cudaStreamWaitEvent(stream_[d], hop_ev_, 0));
+        ck(cudaStreamWaitEvent(stream_[d], hop_ev_[cur_dev_], 0));
         cur_dev_ = d;
     }
     cudaStream_t stream() const { return stream_[cur_dev_]; }
