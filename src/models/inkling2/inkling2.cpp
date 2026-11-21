@@ -770,6 +770,11 @@ private:
         tqllm_cuda::common::f32_to_half(vf, vh, kd, stream());
         __half * rh = S.d_.as<__half>();  // [H*d_rel]
         tqllm_cuda::common::f32_to_half(rf, rh, H * d_rel_, stream());
+        // gate/sink to half NOW (before the dynamic conv overwrites S.e_/S.f_ on full layers)
+        __half * gateh = S.e_.as<__half>();
+        __half * sinkh = S.f_.as<__half>();
+        tqllm_cuda::common::f32_to_half(gate, gateh, H, stream());
+        tqllm_cuda::common::f32_to_half(sink, sinkh, H, stream());
         // save pre-conv k/v for conv history (device copy)
         tqllm_cuda::ik2_hcopy(kh, pre_kh, kd, stream());
         tqllm_cuda::ik2_hcopy(vh, pre_vh, kd, stream());
@@ -782,7 +787,7 @@ private:
         } else {
             // full layer: dynamic conv (static + dynamic taps from input)
             // dyn = x @ conv_proj^T -> [kd] (per-channel, per-lag)
-            float * dynk = S.e_.as<float>();  // [kd] = [KV*D]
+            float * dynk = S.e_.as<float>();  // [kd] = [KV*D] — overwrites gateh, but gateh is already converted
             gemm_h(Y.k_conv_proj, xk, dynk, 1);
             float * dynv = S.f_.as<float>();  // [kd]
             gemm_h(Y.v_conv_proj, xv, dynv, 1);
@@ -807,11 +812,6 @@ private:
             ck(cudaMemcpyAsync(krow, kh, kd * 2, cudaMemcpyDeviceToDevice, stream()));
             ck(cudaMemcpyAsync(vrow, vh, kd * 2, cudaMemcpyDeviceToDevice, stream()));
         }
-        // gate/sink to half (device-resident conversion)
-        __half * gateh = S.e_.as<__half>();
-        __half * sinkh = S.f_.as<__half>();
-        tqllm_cuda::common::f32_to_half(gate, gateh, H, stream());
-        tqllm_cuda::common::f32_to_half(sink, sinkh, H, stream());
         // attention core
         tqllm_cuda::Ik2AttnCore ac{};
         ac.q = qh; ac.k = kh; ac.v = vh; ac.r = rh; ac.gate = gateh; ac.sink = sinkh;
