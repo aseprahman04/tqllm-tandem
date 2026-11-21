@@ -56,9 +56,10 @@ namespace {
 
 using bf16 = __nv_bfloat16;
 
-void ck(cudaError_t e) {
-    if (e != cudaSuccess) throw std::runtime_error(std::string("inkling2: ") + cudaGetErrorString(e));
+void ck_at(cudaError_t e, int line) {
+    if (e != cudaSuccess) throw std::runtime_error(std::string("inkling2: ") + cudaGetErrorString(e) + " (inkling2.cpp:" + std::to_string(line) + ")");
 }
+#define ck(e) ck_at((e), __LINE__)
 
 struct Buf {
     void * p = nullptr;
@@ -369,11 +370,12 @@ private:
         const auto v = host_f32(n);
         return static_cast<const float *>(put(v.data(), v.size() * 4));
     }
-    // Fold a short-conv weight [C][taps] (master layout: unfolded): w *= sc; w[:, -1] += sc, sc = 1/sqrt(taps+1).
+    // Fold a short-conv weight [C][taps] (master layout: unfolded): w *= sc; w[:, -1] += sc.
+    // sc = 1/3 for full layers (dynamic taps add extra weight), 1/sqrt(taps+1) for sliding.
     // Returns a device pointer to the folded weight.
-    const float * fold_conv_vec(const std::string & n, int C, int taps) {
+    const float * fold_conv_vec(const std::string & n, int C, int taps, bool full) {
         auto v = host_f32(n);
-        const float sc = 1.f / std::sqrt(float(taps + 1));
+        const float sc = full ? 1.f / 3.f : 1.f / std::sqrt(float(taps + 1));
         for (int c = 0; c < C; ++c)
             for (int j = 0; j < taps; ++j) v[size_t(c) * taps + j] *= sc;
         for (int c = 0; c < C; ++c) v[size_t(c) * taps + (taps - 1)] += sc;
@@ -434,10 +436,10 @@ private:
             Y.wgate = load_mat(p + "attn_gate.weight");
             Y.wsink = load_mat(p + "attn_sink_proj.weight");
             Y.wo = load_mat(p + "attn_output.weight");
-            Y.k_conv = fold_conv_vec(p + "attn_k_conv.weight", n_kv_ * hd_, taps_);
-            Y.v_conv = fold_conv_vec(p + "attn_v_conv.weight", n_kv_ * hd_, taps_);
-            Y.post_conv = fold_conv_vec(p + "attn_post_conv.weight", H_, taps_);
-            Y.mlp_conv = fold_conv_vec(p + "ffn_post_conv.weight", H_, taps_);
+            Y.k_conv = fold_conv_vec(p + "attn_k_conv.weight", n_kv_ * hd_, taps_, !sliding_[l]);
+            Y.v_conv = fold_conv_vec(p + "attn_v_conv.weight", n_kv_ * hd_, taps_, !sliding_[l]);
+            Y.post_conv = fold_conv_vec(p + "attn_post_conv.weight", H_, taps_, !sliding_[l]);
+            Y.mlp_conv = fold_conv_vec(p + "ffn_post_conv.weight", H_, taps_, !sliding_[l]);
             Y.q_clip = vec(p + "attn_q_clip.weight");
             Y.r_clip = vec(p + "attn_rel_clip.weight");
             Y.rel_bias = vec(p + "attn_rel_bias.weight");
@@ -488,7 +490,7 @@ private:
             S.prev_h_ = Buf(size_t(H_) * 2);
             S.s1_ = Buf(w * 2); S.s2_ = Buf(w * 2); S.s3_ = Buf(w * 2); S.s4_ = Buf(w * 2);
             S.a_ = Buf(w * 4); S.b_ = Buf(w * 4); S.c_ = Buf(w * 4); S.d_ = Buf(w * 4);
-            S.e_ = Buf(size_t(n_head_) * 4); S.f_ = Buf(size_t(n_head_) * 4); S.g_ = Buf(w * 2);
+            S.e_ = Buf(std::max(size_t(n_head_), size_t(n_kv_) * hd_) * 4); S.f_ = Buf(std::max(size_t(n_head_), size_t(n_kv_) * hd_) * 4); S.g_ = Buf(w * 2);
             S.moe_ids_ = Buf(size_t(k_exp_) * 4);
             S.moe_gu_ = Buf(size_t(k_exp_) * 2 * e_ff_ * 2);  // BF16
             S.moe_act_ = Buf(size_t(k_exp_) * e_ff_ * 2);     // half
@@ -602,19 +604,35 @@ private:
         }
         // post-core layers
         for (int l = core1_; l < n_layers_; ++l) {
-            if (split_at_ && dev_of(l) != cur_dev_) use_dev(dev_of(l));
+            if (split_at_ && dev_of(l) != cur_dev_) {
+                hop_to(dev_of(l));  // move h_ + blocks_ to the next stage
+                use_dev(dev_of(l));
+            }
             visit(l, l, 0, pos, nullptr, 0);
         }
     }
     // Move the residual vector (and block states) from the current stage to stage d across PCIe.
     // Only the small activation crosses (hidden 2304 half + up to 64 blocks), never the weights.
+    // Host-staged: consumer GPUs (RTX 5060 Ti) have no P2P, so cudaMemcpyPeerAsync would fail.
+    // The data is tiny (2304 half + up to 64 blocks), so the host round-trip is cheap.
     void hop_to(int d) {
         if (!split_at_ || d == cur_dev_) return;
         Stage & from = st_[cur_dev_], & to = st_[d];
         const int from_c = cuda_of_[cur_dev_], to_c = cuda_of_[d];
-        ck(cudaMemcpyPeerAsync(to.h_.p, to_c, from.h_.p, from_c, H_ * 2, stream_[cur_dev_]));
-        if (n_blocks_)
-            ck(cudaMemcpyPeerAsync(to.blocks_.p, to_c, from.blocks_.p, from_c, size_t(n_blocks_) * H_ * 2, stream_[cur_dev_]));
+        // h_ : device(from) -> host -> device(to)
+        std::vector<__half> hbuf(H_);
+        ck(cudaSetDevice(from_c));
+        ck(cudaMemcpy(hbuf.data(), from.h_.p, H_ * 2, cudaMemcpyDeviceToHost));
+        ck(cudaSetDevice(to_c));
+        ck(cudaMemcpy(to.h_.p, hbuf.data(), H_ * 2, cudaMemcpyHostToDevice));
+        // blocks_ : same pattern
+        if (n_blocks_) {
+            std::vector<__half> bbuf(size_t(n_blocks_) * H_);
+            ck(cudaSetDevice(from_c));
+            ck(cudaMemcpy(bbuf.data(), from.blocks_.p, bbuf.size() * 2, cudaMemcpyDeviceToHost));
+            ck(cudaSetDevice(to_c));
+            ck(cudaMemcpy(to.blocks_.p, bbuf.data(), bbuf.size() * 2, cudaMemcpyHostToDevice));
+        }
     }
 
     void visit(int l, int v, int pass, uint32_t pos, const __half * prev_last, int prev_nblocks) {
@@ -768,8 +786,8 @@ private:
             gemm_h(Y.k_conv_proj, xk, dynk, 1);
             float * dynv = S.f_.as<float>();  // [kd]
             gemm_h(Y.v_conv_proj, xv, dynv, 1);
-            tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, dynk, khist, stream());
-            tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, dynv, vhist, stream());
+            tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, hd_, dynk, khist, stream());
+            tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, hd_, dynv, vhist, stream());
         }
         // clip q, k; norm v; clip r
         tqllm_cuda::ik2_l2clip(qh, Y.q_clip, qk_clip_, H, D, qh, stream());

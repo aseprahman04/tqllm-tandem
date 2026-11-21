@@ -101,11 +101,13 @@ __global__ void shortconv_k(const float * __restrict__ w, int taps, const __half
 }
 
 // ---- full-layer dynamic conv ----
-// w [C][taps] folded (static), dyn [C][taps] (dynamic, per-channel per-lag, lag 0 = current token)
+// w [C][taps] folded (static), dyn [KV][taps] (dynamic taps: per kv-head, per lag; lag 0 = current token).
+// Each channel c belongs to kv-head c/D; its dynamic taps are dyn[kvh*taps + lag].
 __global__ void shortconv_dyn_k(const float * __restrict__ w, int taps, const __half * __restrict__ x, __half * __restrict__ y,
-                                int C, const float * __restrict__ dyn, const __half * __restrict__ hist) {
+                                int C, int D, const float * __restrict__ dyn, const __half * __restrict__ hist) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
+    const int kvh = c / D;
     float acc = 0.f;
     for (int j = 0; j < taps; ++j) {
         const int lag = taps - 1 - j;
@@ -118,7 +120,7 @@ __global__ void shortconv_dyn_k(const float * __restrict__ w, int taps, const __
         float xv;
         if (lag == 0) xv = __half2float(x[c]);
         else { if (!hist) continue; xv = __half2float(hist[size_t(lag - 1) * C + c]); }
-        acc += dyn[c * taps + lag] * xv;
+        acc += dyn[kvh * taps + lag] * xv;
     }
     y[c] = __float2half(acc);
 }
@@ -277,8 +279,8 @@ void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int 
     shortconv_k<<<(total + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, T, hist);
 }
 
-void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, const float * dyn, const __half * hist, cudaStream_t s) {
-    shortconv_dyn_k<<<(C + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, dyn, hist);
+void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, int D, const float * dyn, const __half * hist, cudaStream_t s) {
+    shortconv_dyn_k<<<(C + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, D, dyn, hist);
 }
 
 void ik2_control(const __half * x, const __half * msg, const float * down, const float * forget, const float * gain,

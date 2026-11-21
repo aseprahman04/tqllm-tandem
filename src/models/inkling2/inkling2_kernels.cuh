@@ -14,9 +14,9 @@ void ik2_attn_res(const __half * blocks, int n_blocks, const __half * x, const f
 // y[t][c] = sum_j w[j][c] x[t - (taps-1-j)]  (w [C][taps] folded, j = taps-1 the current token; x[k<0] = 0)
 // hist [taps-1][C] holds the previous taps-1 tokens (hist[0] = oldest); nullptr for the first token.
 void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, const __half * hist, cudaStream_t s);
-// Full-layer dynamic conv: y[t][c] = sum_j w[j][c] x[t-(taps-1-j)] + sum_lag dyn[t][c][lag] x[t-lag]
-// w [C][taps] folded, dyn [C][taps] (per-channel, per-lag), hist [taps-1][C]
-void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, const float * dyn, const __half * hist, cudaStream_t s);
+// Full-layer dynamic conv: y[c] = sum_j w[c][j] x[c-(taps-1-j)] + sum_lag dyn[kvh(c)][lag] x[c-lag]
+// w [C][taps] folded, dyn [KV][taps] (per kv-head, per lag), hist [taps-1][C]
+void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, int D, const float * dyn, const __half * hist, cudaStream_t s);
 // out = (1 - tanh(forget g)) x + tanh(gain g) msg,  g = down @ [rms(x); rms(msg)]  (down [64][2C], forget/gain [C][64])
 void ik2_control(const __half * x, const __half * msg, const float * down, const float * forget, const float * gain,
                  int C, __half * out, cudaStream_t s);
