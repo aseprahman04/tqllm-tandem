@@ -108,6 +108,9 @@ struct Layer {
     bool experts_nvfp4 = false;
     Buf kc, vc;  // [context][kv heads][hd] FP16
     bool sliding = true;
+    // conv history: [taps-1][C] half, per conv (k, v, post, mlp)
+    Buf k_hist, v_hist, post_hist, mlp_hist;
+    int conv_pos = 0;  // number of tokens processed through this layer's convs
 };
 
 class Inkling2Engine final : public Engine {
@@ -172,6 +175,8 @@ private:
     Buf h_;          // [C] current stream
     Buf blocks_;     // [n_blocks][C] block states
     int n_blocks_ = 0;
+    Buf prev_h_;     // [C] previous pass's final stream (for loop messages)
+    int prev_nb_ = 0; // previous pass's n_blocks (bank start)
     Buf logits_;     // [vocab] F32
     // scratch (sized to the widest of [C] and [H*D])
     Buf s1_, s2_, s3_, s4_;
@@ -370,6 +375,7 @@ private:
     void alloc_state() {
         h_ = Buf(size_t(H_) * 2);
         blocks_ = Buf(size_t(64) * H_ * 2);
+        prev_h_ = Buf(size_t(H_) * 2);
         logits_ = Buf(size_t(vocab_) * 4);
         const size_t qd = size_t(n_head_) * hd_;
         const size_t w = std::max(qd, size_t(H_));
@@ -382,9 +388,14 @@ private:
         moe_dn_ = Buf(size_t(k_exp_) * H_ * 2);         // BF16
         moe_wts_ = Buf(size_t(k_exp_) * 4);
         moe_scales_ = Buf(size_t(k_exp_) * 4);
+        const size_t chist = size_t(taps_ - 1) * H_ * 2;  // [taps-1][C] half
         for (auto & Y : L_) {
             Y.kc = Buf(size_t(context_) * n_kv_ * hd_ * 2);
             Y.vc = Buf(size_t(context_) * n_kv_ * hd_ * 2);
+            Y.k_hist = Buf(chist);
+            Y.v_hist = Buf(chist);
+            Y.post_hist = Buf(chist);
+            Y.mlp_hist = Buf(chist);
         }
     }
 
@@ -429,33 +440,39 @@ private:
             tqllm_cuda::ik2_rms_norm(e.data(), embd_norm_, eps_, H_, h_.as<__half>(), stream_);
         }
         n_blocks_ = 0;
-        Buf pre_h_buf(H_ * 2), pre_blocks_buf(size_t(64) * H_ * 2), prev_last_buf(H_ * 2);
-        int pre_nblocks = 0, prev_nblocks = 0;
-        bool have_prev = false, captured = false;
-        for (int v = 0; v < n_visits_; ++v) {
-            const int l = phys_[v];
-            const int pass = (l >= core0_ && l < core1_) ? (v - core0_) / (core1_ - core0_) : 0;
-            if (!captured && v == core0_) {
-                std::memcpy(pre_h_buf.p, h_.as<__half>(), H_ * 2);
-                std::memcpy(pre_blocks_buf.p, blocks_.p, size_t(n_blocks_) * H_ * 2);
-                pre_nblocks = n_blocks_;
-                captured = true;
+        // pre-core layers
+        for (int l = 0; l < core0_; ++l) visit(l, l, 0, pos, nullptr, 0);
+        if (n_pass_ > 1) {
+            // capture pre-core state
+            Buf pre_h(H_ * 2), pre_blk(size_t(64) * H_ * 2);
+            int pre_nb = n_blocks_;
+            ck(cudaMemcpy(pre_h.p, h_.as<__half>(), H_ * 2, cudaMemcpyDeviceToDevice));
+            ck(cudaMemcpy(pre_blk.p, blocks_.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice));
+            for (int p = 0; p < n_pass_; ++p) {
+                if (p > 0) {
+                    // reset to pre-core state
+                    ck(cudaMemcpy(h_.p, pre_h.p, H_ * 2, cudaMemcpyDeviceToDevice));
+                    ck(cudaMemcpy(blocks_.p, pre_blk.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice));
+                    n_blocks_ = pre_nb;
+                }
+                // run core layers
+                for (int l = core0_; l < core1_; ++l) {
+                    int v = core0_ + p * (core1_ - core0_) + (l - core0_);
+                    visit(l, v, p, pos, nullptr, 0);
+                }
+                // save this pass's final state for the next pass's messages
+                if (p < n_pass_ - 1) {
+                    ck(cudaMemcpy(prev_h_.p, h_.p, H_ * 2, cudaMemcpyDeviceToDevice));
+                    prev_nb_ = n_blocks_;
+                }
             }
-            if (pass > 0 && v == core0_) {
-                std::memcpy(h_.p, pre_h_buf.p, H_ * 2);
-                std::memcpy(blocks_.p, pre_blocks_buf.p, size_t(pre_nblocks) * H_ * 2);
-                n_blocks_ = pre_nblocks;
-            }
-            if (pass > 0 && l == core0_) {
-                std::memcpy(prev_last_buf.p, pre_h_buf.p, H_ * 2);
-                prev_nblocks = pre_nblocks;
-                have_prev = true;
-            }
-            visit(l, v, pass, pos, have_prev ? prev_last_buf.as<__half>() : nullptr, prev_nblocks);
         }
+        // post-core layers
+        for (int l = core1_; l < n_layers_; ++l) visit(l, l, 0, pos, nullptr, 0);
     }
 
     void visit(int l, int v, int pass, uint32_t pos, const __half * prev_last, int prev_nblocks) {
+        if (prev_last == nullptr && pass > 0) { prev_last = prev_h_.as<__half>(); prev_nblocks = prev_nb_; }
         auto & Y = L_[l];
         const int C = H_;
         __half * h = h_.as<__half>();
@@ -488,10 +505,13 @@ private:
         }
         // attention
         __half * attn_out = s1_.as<__half>();
-        attention(Y, pos, xs[0], xs[1], xs[2], attn_out);
+        __half * pre_kh = s2_.as<__half>();  // [kd]
+        __half * pre_vh = s3_.as<__half>();  // [kd]
+        attention(Y, pos, xs[0], xs[1], xs[2], attn_out, pre_kh, pre_vh);
         // a = shortconv_attn(attn_out)
-        __half * a = s2_.as<__half>();
-        tqllm_cuda::ik2_shortconv(Y.post_conv, taps_, attn_out, a, C, 1, stream_);
+        __half * a = g_.as<__half>();  // g_ is free after attention
+        const __half * phist = Y.conv_pos > 0 ? Y.post_hist.as<__half>() : nullptr;
+        tqllm_cuda::ik2_shortconv(Y.post_conv, taps_, attn_out, a, C, 1, phist, stream_);
         // block boundary
         __half * r;
         Buf rbuf(C * 2);
@@ -515,12 +535,20 @@ private:
         // m = moe(rms(m_in, ffn_norm))
         __half * mnorm = s4_.as<__half>();
         tqllm_cuda::ik2_rms_norm(m_in, Y.ffn_norm, eps_, C, mnorm, stream_);
-        __half * m = s1_.as<__half>();
+        __half * m = g_.as<__half>();  // g_ is free after post_conv
         moe(Y, mnorm, m);
         // m = shortconv_mlp(m)
-        tqllm_cuda::ik2_shortconv(Y.mlp_conv, taps_, m, m, C, 1, stream_);
+        const __half * mhist = Y.conv_pos > 0 ? Y.mlp_hist.as<__half>() : nullptr;
+        tqllm_cuda::ik2_shortconv(Y.mlp_conv, taps_, m, m, C, 1, mhist, stream_);
         // h = r + m
         for (int i = 0; i < C; ++i) h[i] = __hadd(r[i], m[i]);
+        // update conv histories: shift and append current token's pre-conv inputs
+        const int kd = n_kv_ * hd_;
+        tqllm_cuda::ik2_conv_hist_update(Y.k_hist.as<__half>(), pre_kh, taps_, kd, stream_);
+        tqllm_cuda::ik2_conv_hist_update(Y.v_hist.as<__half>(), pre_vh, taps_, kd, stream_);
+        tqllm_cuda::ik2_conv_hist_update(Y.post_hist.as<__half>(), attn_out, taps_, C, stream_);
+        tqllm_cuda::ik2_conv_hist_update(Y.mlp_hist.as<__half>(), m, taps_, C, stream_);
+        ++Y.conv_pos;
     }
 
     // The four loop messages (m_q, m_k, m_v, m_mlp) of core layer l: attn_res(bank, last) with the loop_res_query /
@@ -545,7 +573,9 @@ private:
 
     // The attention of one layer at position pos: project q,k,v,r,gate,sink; conv k,v; clip; relative bias; softmax;
     // gate; output projection. Writes out [C]. Uses dedicated scratch buffers (a..g) to avoid aliasing.
-    void attention(Layer & Y, uint32_t pos, const __half * xq, const __half * xk, const __half * xv, __half * out) {
+    // pre_kh/pre_vh: scratch for the pre-conv k/v (for conv history).
+    void attention(Layer & Y, uint32_t pos, const __half * xq, const __half * xk, const __half * xv, __half * out,
+                   __half * pre_kh, __half * pre_vh) {
         const int C = H_, D = hd_, H = n_head_, KV = n_kv_;
         const int qd = H * D, kd = KV * D;
         // projections (F32 scratch)
@@ -570,16 +600,36 @@ private:
         for (int i = 0; i < kd; ++i) vh[i] = __float2half(vf[i]);
         __half * rh = d_.as<__half>();  // [H*d_rel]
         for (int i = 0; i < H * d_rel_; ++i) rh[i] = __float2half(rf[i]);
-        // k/v short conv (single token: the last tap only, no history)
+        // save pre-conv k/v for conv history
+        for (int i = 0; i < kd; ++i) { pre_kh[i] = kh[i]; pre_vh[i] = vh[i]; }
+        // k/v short conv (with history)
+        const __half * khist = Y.conv_pos > 0 ? Y.k_hist.as<__half>() : nullptr;
+        const __half * vhist = Y.conv_pos > 0 ? Y.v_hist.as<__half>() : nullptr;
         if (Y.sliding) {
-            tqllm_cuda::ik2_shortconv(Y.k_conv, taps_, kh, kh, kd, 1, stream_);
-            tqllm_cuda::ik2_shortconv(Y.v_conv, taps_, vh, vh, kd, 1, stream_);
+            tqllm_cuda::ik2_shortconv(Y.k_conv, taps_, kh, kh, kd, 1, khist, stream_);
+            tqllm_cuda::ik2_shortconv(Y.v_conv, taps_, vh, vh, kd, 1, vhist, stream_);
+        } else {
+            // full layer: dynamic conv (static + dynamic taps from input)
+            // dyn = x @ conv_proj^T -> [kd] (per-channel, per-lag)
+            float * dynk = e_.as<float>();  // [kd] = [KV*D]
+            gemm_h(Y.k_conv_proj, xk, dynk, 1);
+            float * dynv = f_.as<float>();  // [kd]
+            gemm_h(Y.v_conv_proj, xv, dynv, 1);
+            // upload dyn to device (already in scratch)
+            tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, dynk, khist, stream_);
+            tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, dynv, vhist, stream_);
         }
         // clip q, k; norm v; clip r
         tqllm_cuda::ik2_l2clip(qh, Y.q_clip, qk_clip_, H, D, qh, stream_);
         tqllm_cuda::ik2_l2clip(kh, Y.q_clip, qk_clip_, KV, D, kh, stream_);  // k uses qk_clip (no per-head clip weight)
         tqllm_cuda::ik2_rms_weightless(vh, KV, D, vh, stream_);
         tqllm_cuda::ik2_l2clip(rh, Y.r_clip, rel_clip_, H, d_rel_, rh, stream_);
+        // full layers: q, r *= tau = 1 + alpha * ln(max(1, (pos+1)/n_floor))
+        if (!Y.sliding && log_alpha_ != 0.f) {
+            const float tau = 1.f + log_alpha_ * std::log(std::max(1.f, float(pos + 1) / n_floor_));
+            for (int i = 0; i < qd; ++i) qh[i] = __float2half(__half2float(qh[i]) * tau);
+            for (int i = 0; i < H * d_rel_; ++i) rh[i] = __float2half(__half2float(rh[i]) * tau);
+        }
         // write the current token's k/v into the cache at row pos
         {
             __half * krow = Y.kc.as<__half>() + size_t(pos) * KV * D;

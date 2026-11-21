@@ -77,19 +77,50 @@ __global__ void attn_res_k(const __half * __restrict__ blocks, int n_blocks, con
     out[qi * C + c] = __float2half(acc);
 }
 
-// ---- short conv ----
-__global__ void shortconv_k(const float * __restrict__ w, int taps, const __half * __restrict__ x, __half * __restrict__ y, int C, int T) {
+// ---- short conv with history ----
+// w [C][taps] folded; hist [taps-1][C] (hist[0] = oldest, hist[taps-2] = most recent); nullptr = first token.
+__global__ void shortconv_k(const float * __restrict__ w, int taps, const __half * __restrict__ x, __half * __restrict__ y,
+                            int C, int T, const __half * __restrict__ hist) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = T * C;
     if (idx >= total) return;
     const int t = idx / C, c = idx % C;
     float acc = 0.f;
     for (int j = 0; j < taps; ++j) {
-        const int src = t - (taps - 1 - j);
-        if (src < 0) continue;
-        acc += w[c * taps + j] * __half2float(x[size_t(src) * C + c]);
+        const int lag = taps - 1 - j;  // 0 = current token, 1 = previous, ...
+        float xv;
+        if (lag == 0) {
+            xv = __half2float(x[size_t(t) * C + c]);
+        } else {
+            if (!hist) continue;
+            xv = __half2float(hist[size_t(lag - 1) * C + c]);
+        }
+        acc += w[c * taps + j] * xv;
     }
     y[idx] = __float2half(acc);
+}
+
+// ---- full-layer dynamic conv ----
+// w [C][taps] folded (static), dyn [C][taps] (dynamic, per-channel per-lag, lag 0 = current token)
+__global__ void shortconv_dyn_k(const float * __restrict__ w, int taps, const __half * __restrict__ x, __half * __restrict__ y,
+                                int C, const float * __restrict__ dyn, const __half * __restrict__ hist) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float acc = 0.f;
+    for (int j = 0; j < taps; ++j) {
+        const int lag = taps - 1 - j;
+        float xv;
+        if (lag == 0) xv = __half2float(x[c]);
+        else { if (!hist) continue; xv = __half2float(hist[size_t(lag - 1) * C + c]); }
+        acc += w[c * taps + j] * xv;
+    }
+    for (int lag = 0; lag < taps; ++lag) {
+        float xv;
+        if (lag == 0) xv = __half2float(x[c]);
+        else { if (!hist) continue; xv = __half2float(hist[size_t(lag - 1) * C + c]); }
+        acc += dyn[c * taps + lag] * xv;
+    }
+    y[c] = __float2half(acc);
 }
 
 // ---- control: g = down @ [rms(x); rms(msg)]; out = (1 - tanh(forget g)) x + tanh(gain g) msg ----
@@ -194,6 +225,17 @@ __global__ void attn_core_k(Ik2AttnCore a, __half * __restrict__ out) {
     out[h * D + d] = __float2half(acc * __expf(__half2float(a.gate[h])) / (1.f + __expf(__half2float(a.gate[h]))));  // sigmoid(gate)
 }
 
+// ---- conv history update: shift and append ----
+// hist [taps-1][C] half; cur [C] half (current token's input to the conv)
+// After: hist[0] = cur, hist[i] = old hist[i-1] (i >= 1)
+__global__ void conv_hist_update_k(__half * __restrict__ hist, const __half * __restrict__ cur, int taps, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    for (int i = taps - 2; i > 0; --i)
+        hist[size_t(i) * C + c] = hist[size_t(i - 1) * C + c];
+    hist[c] = cur[c];
+}
+
 // ---- softcap ----
 __global__ void softcap_k(float * __restrict__ logits, int unpadded, float cap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -213,9 +255,13 @@ void ik2_attn_res(const __half * blocks, int n_blocks, const __half * x, const f
     attn_res_k<<<nq, threads, 0, s>>>(blocks, n_blocks, x, q, nq, C, out);
 }
 
-void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, cudaStream_t s) {
+void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, const __half * hist, cudaStream_t s) {
     const int total = T * C;
-    shortconv_k<<<(total + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, T);
+    shortconv_k<<<(total + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, T, hist);
+}
+
+void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, const float * dyn, const __half * hist, cudaStream_t s) {
+    shortconv_dyn_k<<<(C + 255) / 256, 256, 0, s>>>(w, taps, x, y, C, dyn, hist);
 }
 
 void ik2_control(const __half * x, const __half * msg, const float * down, const float * forget, const float * gain,
@@ -239,6 +285,10 @@ void ik2_attention_core(const Ik2AttnCore & a, __half * out, cudaStream_t s) {
 
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s) {
     softcap_k<<<(unpadded + 255) / 256, 256, 0, s>>>(logits, unpadded, cap);
+}
+
+void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s) {
+    conv_hist_update_k<<<(C + 255) / 256, 256, 0, s>>>(hist, cur, taps, C);
 }
 
 }  // namespace tqllm_cuda

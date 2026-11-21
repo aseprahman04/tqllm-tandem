@@ -11,8 +11,12 @@ void ik2_rms_norm(const __half * x, const float * w, float eps, int C, __half * 
 // out[nq][C] = softmax(q . s / sqrt(C)) over the normed states [blocks..., x], weighted sum of the normed states
 // (states RMS-normed weightless, eps 1e-6)
 void ik2_attn_res(const __half * blocks, int n_blocks, const __half * x, const float * q, int nq, int C, __half * out, cudaStream_t s);
-// y[t][c] = sum_j w[j][c] x[t - (taps-1-j)]  (w [taps][C] folded, j = taps-1 the current token; x[k<0] = 0)
-void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, cudaStream_t s);
+// y[t][c] = sum_j w[j][c] x[t - (taps-1-j)]  (w [C][taps] folded, j = taps-1 the current token; x[k<0] = 0)
+// hist [taps-1][C] holds the previous taps-1 tokens (hist[0] = oldest); nullptr for the first token.
+void ik2_shortconv(const float * w, int taps, const __half * x, __half * y, int C, int T, const __half * hist, cudaStream_t s);
+// Full-layer dynamic conv: y[t][c] = sum_j w[j][c] x[t-(taps-1-j)] + sum_lag dyn[t][c][lag] x[t-lag]
+// w [C][taps] folded, dyn [C][taps] (per-channel, per-lag), hist [taps-1][C]
+void ik2_shortconv_dyn(const float * w, int taps, const __half * x, __half * y, int C, const float * dyn, const __half * hist, cudaStream_t s);
 // out = (1 - tanh(forget g)) x + tanh(gain g) msg,  g = down @ [rms(x); rms(msg)]  (down [64][2C], forget/gain [C][64])
 void ik2_control(const __half * x, const __half * msg, const float * down, const float * forget, const float * gain,
                  int C, __half * out, cudaStream_t s);
@@ -36,4 +40,6 @@ struct Ik2AttnCore {
 void ik2_attention_core(const Ik2AttnCore & a, __half * out, cudaStream_t s);
 // logits[i] = cap * tanh(logits[i] / cap) for i < unpadded
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s);
+// hist [taps-1][C] <- shift + append cur [C]
+void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s);
 }  // namespace tqllm_cuda
