@@ -117,9 +117,9 @@ class Inkling2Engine final : public Engine {
 public:
     Inkling2Engine(const std::string & path, uint32_t context)
         : context_(context ? context : 32768) {
-        ck(cudaStreamCreate(&stream_));
         meta_ = gguf_open(path);
         configure();
+        split_setup();
         map_files(meta_);
         load();
         alloc_state();
@@ -127,11 +127,14 @@ public:
     ~Inkling2Engine() override {
         L_.clear();
         owned_.clear();
-        if (cublas_) cublasDestroy(cublas_);
-        if (stream_) cudaStreamDestroy(stream_);
+        for (int d = 0; d < 2; ++d) {
+            if (cublas_[d]) cublasDestroy(cublas_[d]);
+            if (stream_[d]) cudaStreamDestroy(stream_[d]);
+        }
+        if (hop_ev_) cudaEventDestroy(hop_ev_);
     }
 
-    void synchronize() override { ck(cudaStreamSynchronize(stream_)); }
+    void synchronize() override { ck(cudaStreamSynchronize(stream())); }
     uint32_t layers() const override { return uint32_t(n_layers_); }
     uint32_t hidden() const override { return uint32_t(H_); }
     uint32_t vocab() const override { return uint32_t(vocab_); }
@@ -142,7 +145,7 @@ public:
         run_token(tok, pos);
         if (sample) {
             compute_logits();
-            ck(cudaStreamSynchronize(stream_));
+            ck(cudaStreamSynchronize(stream()));
             return greedy_token();
         }
         return 0;
@@ -163,8 +166,6 @@ private:
     int vocab_ = 0, vocab_unpadded_ = 0;
     std::vector<int> phys_;
     std::vector<bool> sliding_;
-    cudaStream_t stream_ = nullptr;
-    cublasHandle_t cublas_ = nullptr;
 
     std::vector<Layer> L_;
     M embd_, out_;
@@ -177,6 +178,13 @@ private:
     int n_blocks_ = 0;
     Buf prev_h_;     // [C] previous pass's final stream (for loop messages)
     int prev_nb_ = 0; // previous pass's n_blocks (bank start)
+    // 2-GPU layer split
+    int split_at_ = 0;  // 0 = single GPU; layers [0, split_at_) on dev 1, [split_at_, n_layers_) on dev 0
+    int cur_dev_ = 0;   // 0 or 1
+    cudaStream_t stream_[2] = {nullptr, nullptr};
+    cublasHandle_t cublas_[2] = {nullptr, nullptr};
+    cudaEvent_t hop_ev_ = nullptr;
+    int cuda_of_[2] = {0, 1};  // stage 0 -> cuda dev 1, stage 1 -> cuda dev 0
     Buf logits_;     // [vocab] F32
     // scratch (sized to the widest of [C] and [H*D])
     Buf s1_, s2_, s3_, s4_;
@@ -195,6 +203,39 @@ private:
 
     double num(const std::string & k) const { return meta_.num("inkling2." + k); }
     double num(const std::string & k, double fb) const { return meta_.num("inkling2." + k, fb); }
+
+    // 2-GPU layer split: TQLLM_SPLIT=K puts layers [0,K) on GPU 1, [K,n) on GPU 0
+    void split_setup() {
+        const char * e = std::getenv("TQLLM_SPLIT");
+        if (!e || !*e) return;
+        const int k = std::atoi(e);
+        int n = 0;
+        ck(cudaGetDeviceCount(&n));
+        if (n < 2) throw std::runtime_error("TQLLM_SPLIT: needs two CUDA devices");
+        if (k <= 0 || k >= n_layers_) throw std::runtime_error("TQLLM_SPLIT: K must be in 1.." + std::to_string(n_layers_ - 1));
+        split_at_ = k;
+        cuda_of_[0] = 1;  // stage 0 (layers [0,K)) on CUDA device 1
+        cuda_of_[1] = 0;  // stage 1 (layers [K,n) + head) on CUDA device 0
+        cur_dev_ = 1;
+        std::fprintf(stderr, "inkling2: layer split: layers 0-%d on GPU 1, %d-%d on GPU 0\n", k - 1, k, n_layers_ - 1);
+    }
+    int dev_of(int l) const { return split_at_ && l >= split_at_ ? 1 : 0; }
+    void use_dev(int d) {
+        if (!split_at_ || d == cur_dev_) return;
+        if (!hop_ev_) ck(cudaEventCreateWithFlags(&hop_ev_, cudaEventDisableTiming));
+        ck(cudaEventRecord(hop_ev_, stream_[cur_dev_]));
+        cudaSetDevice(cuda_of_[d]);
+        if (!stream_[d]) {
+            ck(cudaStreamCreate(&stream_[d]));
+            if (!cublas_[d]) {
+                if (cublasCreate(&cublas_[d]) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("inkling2: cuBLAS init failed");
+                cublasSetStream(cublas_[d], stream_[d]);
+            }
+        }
+        cur_dev_ = d;
+    }
+    cudaStream_t stream() const { return stream_[cur_dev_]; }
+    cublasHandle_t cublas() const { return cublas_[cur_dev_]; }
 
     void configure() {
         if (meta_.str("general.architecture") != "inkling2") throw std::runtime_error("inkling2: wrong architecture");
@@ -260,8 +301,8 @@ private:
     }
     const void * put(const void * host, size_t n) {
         owned_.emplace_back(n);
-        ck(cudaMemcpyAsync(owned_.back().p, host, n, cudaMemcpyHostToDevice, stream_));
-        ck(cudaStreamSynchronize(stream_));
+        ck(cudaMemcpyAsync(owned_.back().p, host, n, cudaMemcpyHostToDevice, stream()));
+        ck(cudaStreamSynchronize(stream()));
         return owned_.back().p;
     }
     std::vector<float> host_f32(const std::string & n) const {
@@ -295,7 +336,7 @@ private:
         if (wf) {
             GgufBytes b = bytes(n);
             std::vector<char> raw(b.data, b.data + b.size);
-            r.m = wf->load(raw, r.rows, r.cols, [this](const void * h, size_t s) { return put(h, s); }, stream_);
+            r.m = wf->load(raw, r.rows, r.cols, [this](const void * h, size_t s) { return put(h, s); }, stream());
             if (!r.m.fmt || r.m.fmt->basis() != Basis::Plain) throw std::runtime_error("inkling2: " + n + " format");
         } else {
             auto v = host_f32(n);
@@ -310,7 +351,7 @@ private:
         if (!wf) throw std::runtime_error("inkling2: no weight format for expert type " + std::to_string(t.type));
         GgufBytes b = bytes(n);
         std::vector<char> raw(b.data, b.data + b.size);
-        Mat m = wf->load(raw, int(t.ne[1]) * n_exp_, int(t.ne[0]), [this](const void * h, size_t s) { return put(h, s); }, stream_);
+        Mat m = wf->load(raw, int(t.ne[1]) * n_exp_, int(t.ne[0]), [this](const void * h, size_t s) { return put(h, s); }, stream());
         if (!m.fmt || !m.fmt->has_expert_matvec()) throw std::runtime_error("inkling2: " + n + " has no grouped-expert kernel");
         return m;
     }
@@ -366,13 +407,26 @@ private:
             if (meta_.tensors.count(p + "ffn_gate_up_exps.scale")) Y.e_gu_scale = vec(p + "ffn_gate_up_exps.scale");
             if (meta_.tensors.count(p + "ffn_down_exps.scale")) Y.e_down_scale = vec(p + "ffn_down_exps.scale");
         }
-        if (!cublas_) {
-            if (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("inkling2: cuBLAS init failed");
-            cublasSetStream(cublas_, stream_);
+        for (int d = 0; d < 2; ++d) {
+            if (!cublas_[d]) {
+                if (cublasCreate(&cublas_[d]) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("inkling2: cuBLAS init failed");
+                cublasSetStream(cublas_[d], stream_[d]);
+            }
         }
     }
 
     void alloc_state() {
+        // create streams for both devices
+        for (int d = 0; d < 2; ++d) {
+            if (split_at_ && !stream_[d]) {
+                cudaSetDevice(cuda_of_[d]);
+                ck(cudaStreamCreate(&stream_[d]));
+            }
+        }
+        if (!split_at_) {
+            ck(cudaStreamCreate(&stream_[0]));
+            cur_dev_ = 0;
+        }
         h_ = Buf(size_t(H_) * 2);
         blocks_ = Buf(size_t(64) * H_ * 2);
         prev_h_ = Buf(size_t(H_) * 2);
@@ -403,11 +457,11 @@ private:
     void gemm_h(const M & w, const __half * x, float * y, int n) {
         const float one = 1.f, zero = 0.f;
         if (w.f32) {
-            if (cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.f32, CUDA_R_32F, w.cols, x, CUDA_R_16F, w.cols,
+            if (cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.f32, CUDA_R_32F, w.cols, x, CUDA_R_16F, w.cols,
                              &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
                 throw std::runtime_error("inkling2: cuBLAS GEMM failed");
         } else {
-            if (cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.m.p, CUDA_R_16F, w.cols, x, CUDA_R_16F, w.cols,
+            if (cublasGemmEx(cublas(), CUBLAS_OP_T, CUBLAS_OP_N, w.rows, n, w.cols, &one, w.m.p, CUDA_R_16F, w.cols, x, CUDA_R_16F, w.cols,
                              &zero, y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
                 throw std::runtime_error("inkling2: cuBLAS GEMM failed");
         }
@@ -419,7 +473,7 @@ private:
             gemm_h(w, x, tmp, n);
             for (int i = 0; i < w.rows * n; ++i) y[i] = __float2bfloat16(tmp[i]);
         } else {
-            w.m.fmt->matvec(w.m, x, y, n, stream_);
+            w.m.fmt->matvec(w.m, x, y, n, stream());
         }
     }
 
@@ -437,11 +491,15 @@ private:
                 else { std::memcpy(&v, row + i * 4, 4); }
                 e[i] = __float2half(v);
             }
-            tqllm_cuda::ik2_rms_norm(e.data(), embd_norm_, eps_, H_, h_.as<__half>(), stream_);
+            tqllm_cuda::ik2_rms_norm(e.data(), embd_norm_, eps_, H_, h_.as<__half>(), stream());
         }
         n_blocks_ = 0;
-        // pre-core layers
-        for (int l = 0; l < core0_; ++l) visit(l, l, 0, pos, nullptr, 0);
+        // pre-core layers (switch device at split point)
+        for (int l = 0; l < core0_; ++l) {
+            if (split_at_ && l == split_at_) use_dev(1);
+            visit(l, l, 0, pos, nullptr, 0);
+        }
+        if (split_at_ && core0_ >= split_at_) use_dev(1);
         if (n_pass_ > 1) {
             // capture pre-core state
             Buf pre_h(H_ * 2), pre_blk(size_t(64) * H_ * 2);
@@ -457,6 +515,7 @@ private:
                 }
                 // run core layers
                 for (int l = core0_; l < core1_; ++l) {
+                    if (split_at_ && l == split_at_) use_dev(1);
                     int v = core0_ + p * (core1_ - core0_) + (l - core0_);
                     visit(l, v, p, pos, nullptr, 0);
                 }
@@ -468,7 +527,10 @@ private:
             }
         }
         // post-core layers
-        for (int l = core1_; l < n_layers_; ++l) visit(l, l, 0, pos, nullptr, 0);
+        for (int l = core1_; l < n_layers_; ++l) {
+            if (split_at_ && l == split_at_) use_dev(1);
+            visit(l, l, 0, pos, nullptr, 0);
+        }
     }
 
     void visit(int l, int v, int pass, uint32_t pos, const __half * prev_last, int prev_nblocks) {
@@ -483,7 +545,7 @@ private:
         if (l == 0) {
             for (int j = 0; j < 3; ++j) { std::memcpy(static_cast<char *>(insbuf.p) + j * C * 2, h, C * 2); ins[j] = static_cast<__half *>(insbuf.p) + j * C; }
         } else {
-            tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, h, Y.attn_res_q, Y.attn_res_nq, C, static_cast<__half *>(insbuf.p), stream_);
+            tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, h, Y.attn_res_q, Y.attn_res_nq, C, static_cast<__half *>(insbuf.p), stream());
             auto * o = static_cast<__half *>(insbuf.p);
             if (Y.attn_res_nq == 1) { for (int j = 0; j < 3; ++j) ins[j] = o; }
             else { ins[0] = o; ins[1] = o + C; ins[2] = o + 2 * C; }
@@ -491,17 +553,17 @@ private:
         if (pass > 0) {
             Buf msgs(4 * C * 2);
             loop_messages(l, prev_last, prev_nblocks, static_cast<__half *>(msgs.p));
-            tqllm_cuda::ik2_control(ins[0], static_cast<__half *>(msgs.p), Y.loop_attn_down, Y.loop_attn_forget, Y.loop_attn_gain, C, ins[0], stream_);
-            tqllm_cuda::ik2_control(ins[1], static_cast<__half *>(msgs.p) + C, Y.loop_k_down, Y.loop_k_forget, Y.loop_k_gain, C, ins[1], stream_);
-            tqllm_cuda::ik2_control(ins[2], static_cast<__half *>(msgs.p) + 2 * C, Y.loop_v_down, Y.loop_v_forget, Y.loop_v_gain, C, ins[2], stream_);
+            tqllm_cuda::ik2_control(ins[0], static_cast<__half *>(msgs.p), Y.loop_attn_down, Y.loop_attn_forget, Y.loop_attn_gain, C, ins[0], stream());
+            tqllm_cuda::ik2_control(ins[1], static_cast<__half *>(msgs.p) + C, Y.loop_k_down, Y.loop_k_forget, Y.loop_k_gain, C, ins[1], stream());
+            tqllm_cuda::ik2_control(ins[2], static_cast<__half *>(msgs.p) + 2 * C, Y.loop_v_down, Y.loop_v_forget, Y.loop_v_gain, C, ins[2], stream());
         }
         // norm the inputs
         Buf xsbuf(3 * C * 2);
         __half * xs[3];
         for (int j = 0; j < 3; ++j) {
             xs[j] = static_cast<__half *>(xsbuf.p) + j * C;
-            if (sliding_[l]) tqllm_cuda::ik2_rms_norm(ins[j], Y.attn_norm, eps_, C, xs[j], stream_);
-            else tqllm_cuda::ik2_rms_norm(ins[j], (j == 0 ? Y.q_inp_norm : j == 1 ? Y.k_inp_norm : Y.v_inp_norm), eps_, C, xs[j], stream_);
+            if (sliding_[l]) tqllm_cuda::ik2_rms_norm(ins[j], Y.attn_norm, eps_, C, xs[j], stream());
+            else tqllm_cuda::ik2_rms_norm(ins[j], (j == 0 ? Y.q_inp_norm : j == 1 ? Y.k_inp_norm : Y.v_inp_norm), eps_, C, xs[j], stream());
         }
         // attention
         __half * attn_out = s1_.as<__half>();
@@ -511,7 +573,7 @@ private:
         // a = shortconv_attn(attn_out)
         __half * a = g_.as<__half>();  // g_ is free after attention
         const __half * phist = Y.conv_pos > 0 ? Y.post_hist.as<__half>() : nullptr;
-        tqllm_cuda::ik2_shortconv(Y.post_conv, taps_, attn_out, a, C, 1, phist, stream_);
+        tqllm_cuda::ik2_shortconv(Y.post_conv, taps_, attn_out, a, C, 1, phist, stream());
         // block boundary
         __half * r;
         Buf rbuf(C * 2);
@@ -526,28 +588,28 @@ private:
         }
         // m_in = attn_res(blocks, r) with ffn_res_q
         __half * m_in = s3_.as<__half>();
-        tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, r, Y.ffn_res_q, 1, C, m_in, stream_);
+        tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, r, Y.ffn_res_q, 1, C, m_in, stream());
         if (pass > 0) {
             Buf msgs(4 * C * 2);
             loop_messages(l, prev_last, prev_nblocks, static_cast<__half *>(msgs.p));
-            tqllm_cuda::ik2_control(m_in, static_cast<__half *>(msgs.p) + 3 * C, Y.loop_mlp_down, Y.loop_mlp_forget, Y.loop_mlp_gain, C, m_in, stream_);
+            tqllm_cuda::ik2_control(m_in, static_cast<__half *>(msgs.p) + 3 * C, Y.loop_mlp_down, Y.loop_mlp_forget, Y.loop_mlp_gain, C, m_in, stream());
         }
         // m = moe(rms(m_in, ffn_norm))
         __half * mnorm = s4_.as<__half>();
-        tqllm_cuda::ik2_rms_norm(m_in, Y.ffn_norm, eps_, C, mnorm, stream_);
+        tqllm_cuda::ik2_rms_norm(m_in, Y.ffn_norm, eps_, C, mnorm, stream());
         __half * m = g_.as<__half>();  // g_ is free after post_conv
         moe(Y, mnorm, m);
         // m = shortconv_mlp(m)
         const __half * mhist = Y.conv_pos > 0 ? Y.mlp_hist.as<__half>() : nullptr;
-        tqllm_cuda::ik2_shortconv(Y.mlp_conv, taps_, m, m, C, 1, mhist, stream_);
+        tqllm_cuda::ik2_shortconv(Y.mlp_conv, taps_, m, m, C, 1, mhist, stream());
         // h = r + m
         for (int i = 0; i < C; ++i) h[i] = __hadd(r[i], m[i]);
         // update conv histories: shift and append current token's pre-conv inputs
         const int kd = n_kv_ * hd_;
-        tqllm_cuda::ik2_conv_hist_update(Y.k_hist.as<__half>(), pre_kh, taps_, kd, stream_);
-        tqllm_cuda::ik2_conv_hist_update(Y.v_hist.as<__half>(), pre_vh, taps_, kd, stream_);
-        tqllm_cuda::ik2_conv_hist_update(Y.post_hist.as<__half>(), attn_out, taps_, C, stream_);
-        tqllm_cuda::ik2_conv_hist_update(Y.mlp_hist.as<__half>(), m, taps_, C, stream_);
+        tqllm_cuda::ik2_conv_hist_update(Y.k_hist.as<__half>(), pre_kh, taps_, kd, stream());
+        tqllm_cuda::ik2_conv_hist_update(Y.v_hist.as<__half>(), pre_vh, taps_, kd, stream());
+        tqllm_cuda::ik2_conv_hist_update(Y.post_hist.as<__half>(), attn_out, taps_, C, stream());
+        tqllm_cuda::ik2_conv_hist_update(Y.mlp_hist.as<__half>(), m, taps_, C, stream());
         ++Y.conv_pos;
     }
 
@@ -560,8 +622,8 @@ private:
         const __half * bank = blocks_.as<__half>() + size_t(prev_nblocks) * C;
         const int nbank = n_blocks_ - prev_nblocks;
         // m_q, m_mlp from loop_res_query rows [2i, 2i+1]; m_k, m_v from loop_kv_res_query rows [2i, 2i+1]
-        tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_res_q_ + 2 * i * C, 2, C, out, stream_);          // m_q, m_mlp
-        tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_kv_res_q_ + 2 * i * C, 2, C, out + 2 * C, stream_);  // m_k, m_v
+        tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_res_q_ + 2 * i * C, 2, C, out, stream());          // m_q, m_mlp
+        tqllm_cuda::ik2_attn_res(bank, nbank, prev_last, loop_kv_res_q_ + 2 * i * C, 2, C, out + 2 * C, stream());  // m_k, m_v
         // reorder: out = [m_q, m_k, m_v, m_mlp]
         // currently out = [m_q, m_mlp, m_k, m_v]; swap the middle two
         Buf tmp(C * 2);
@@ -606,8 +668,8 @@ private:
         const __half * khist = Y.conv_pos > 0 ? Y.k_hist.as<__half>() : nullptr;
         const __half * vhist = Y.conv_pos > 0 ? Y.v_hist.as<__half>() : nullptr;
         if (Y.sliding) {
-            tqllm_cuda::ik2_shortconv(Y.k_conv, taps_, kh, kh, kd, 1, khist, stream_);
-            tqllm_cuda::ik2_shortconv(Y.v_conv, taps_, vh, vh, kd, 1, vhist, stream_);
+            tqllm_cuda::ik2_shortconv(Y.k_conv, taps_, kh, kh, kd, 1, khist, stream());
+            tqllm_cuda::ik2_shortconv(Y.v_conv, taps_, vh, vh, kd, 1, vhist, stream());
         } else {
             // full layer: dynamic conv (static + dynamic taps from input)
             // dyn = x @ conv_proj^T -> [kd] (per-channel, per-lag)
@@ -616,14 +678,14 @@ private:
             float * dynv = f_.as<float>();  // [kd]
             gemm_h(Y.v_conv_proj, xv, dynv, 1);
             // upload dyn to device (already in scratch)
-            tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, dynk, khist, stream_);
-            tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, dynv, vhist, stream_);
+            tqllm_cuda::ik2_shortconv_dyn(Y.k_conv, taps_, kh, kh, kd, dynk, khist, stream());
+            tqllm_cuda::ik2_shortconv_dyn(Y.v_conv, taps_, vh, vh, kd, dynv, vhist, stream());
         }
         // clip q, k; norm v; clip r
-        tqllm_cuda::ik2_l2clip(qh, Y.q_clip, qk_clip_, H, D, qh, stream_);
-        tqllm_cuda::ik2_l2clip(kh, Y.q_clip, qk_clip_, KV, D, kh, stream_);  // k uses qk_clip (no per-head clip weight)
-        tqllm_cuda::ik2_rms_weightless(vh, KV, D, vh, stream_);
-        tqllm_cuda::ik2_l2clip(rh, Y.r_clip, rel_clip_, H, d_rel_, rh, stream_);
+        tqllm_cuda::ik2_l2clip(qh, Y.q_clip, qk_clip_, H, D, qh, stream());
+        tqllm_cuda::ik2_l2clip(kh, Y.q_clip, qk_clip_, KV, D, kh, stream());  // k uses qk_clip (no per-head clip weight)
+        tqllm_cuda::ik2_rms_weightless(vh, KV, D, vh, stream());
+        tqllm_cuda::ik2_l2clip(rh, Y.r_clip, rel_clip_, H, d_rel_, rh, stream());
         // full layers: q, r *= tau = 1 + alpha * ln(max(1, (pos+1)/n_floor))
         if (!Y.sliding && log_alpha_ != 0.f) {
             const float tau = 1.f + log_alpha_ * std::log(std::max(1.f, float(pos + 1) / n_floor_));
@@ -649,7 +711,7 @@ private:
         ac.sliding = Y.sliding; ac.pos = pos;
         ac.kc = Y.kc.as<const __half>(); ac.vc = Y.vc.as<const __half>();
         __half * att = g_.as<__half>();  // [qd]
-        tqllm_cuda::ik2_attention_core(ac, att, stream_);
+        tqllm_cuda::ik2_attention_core(ac, att, stream());
         // out = att @ wo^T [C] (F32 scratch -> half)
         float * of = a_.as<float>();  // [C]
         gemm_h(Y.wo, att, of, 1);
@@ -682,11 +744,11 @@ private:
             sds[i] = Y.e_down_scale ? Y.e_down_scale[ids[i]] : 1.f;
         }
         // upload ids, weights, scales to device
-        ck(cudaMemcpyAsync(moe_ids_.p, ids.data(), K * 4, cudaMemcpyHostToDevice, stream_));
-        ck(cudaMemcpyAsync(moe_wts_.p, wts.data(), K * 4, cudaMemcpyHostToDevice, stream_));
-        ck(cudaMemcpyAsync(moe_scales_.p, sds.data(), K * 4, cudaMemcpyHostToDevice, stream_));
+        ck(cudaMemcpyAsync(moe_ids_.p, ids.data(), K * 4, cudaMemcpyHostToDevice, stream()));
+        ck(cudaMemcpyAsync(moe_wts_.p, wts.data(), K * 4, cudaMemcpyHostToDevice, stream()));
+        ck(cudaMemcpyAsync(moe_scales_.p, sds.data(), K * 4, cudaMemcpyHostToDevice, stream()));
         // gate+up: e_gu is [E * 2 * FF][C]; expert_matvec with rows=2*FF gives [K][2*FF] BF16
-        Y.e_gu.fmt->expert_matvec(Y.e_gu, x, moe_gu_.as<bf16>(), 2 * FF, moe_ids_.as<int>(), 1, K, false, stream_);
+        Y.e_gu.fmt->expert_matvec(Y.e_gu, x, moe_gu_.as<bf16>(), 2 * FF, moe_ids_.as<int>(), 1, K, false, stream());
         // activation: h = tanh(g/gate_cap)*gate_cap*sigmoid(g)*tanh(u/up_cap)*up_cap
         // moe_gu_ is [K][2*FF] BF16; gate = first FF, up = last FF
         // Write the activation to moe_act_ [K][FF] half
@@ -702,10 +764,10 @@ private:
                     float hv = std::tanh(gv / gate_cap_) * gate_cap_ * (1.f / (1.f + std::exp(-gv))) * std::tanh(uv / up_cap_) * up_cap_;
                     act[size_t(i) * FF + j] = __float2half(hv);
                 }
-            ck(cudaMemcpyAsync(moe_act_.p, act.data(), act.size() * 2, cudaMemcpyHostToDevice, stream_));
+            ck(cudaMemcpyAsync(moe_act_.p, act.data(), act.size() * 2, cudaMemcpyHostToDevice, stream()));
         }
         // down: e_down is [E * C][FF]; expert_matvec with rows=C gives [K][C] BF16
-        Y.e_down.fmt->expert_matvec(Y.e_down, moe_act_.as<__half>(), moe_dn_.as<bf16>(), C, moe_ids_.as<int>(), 1, K, true, stream_);
+        Y.e_down.fmt->expert_matvec(Y.e_down, moe_act_.as<__half>(), moe_dn_.as<bf16>(), C, moe_ids_.as<int>(), 1, K, true, stream());
         // out = sum_i wts[i] * sds[i] * moe_dn_[i]  (host: K is small)
         std::vector<bf16> dn(size_t(K) * C);
         ck(cudaMemcpy(dn.data(), moe_dn_.p, dn.size() * 2, cudaMemcpyDeviceToHost));
@@ -721,11 +783,11 @@ private:
     void compute_logits() {
         __half * h = h_.as<__half>();
         __half * hres = s1_.as<__half>();
-        tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, h, out_res_q_, 1, H_, hres, stream_);
+        tqllm_cuda::ik2_attn_res(blocks_.as<__half>(), n_blocks_, h, out_res_q_, 1, H_, hres, stream());
         __half * hnorm = s2_.as<__half>();
-        tqllm_cuda::ik2_rms_norm(hres, out_norm_, eps_, H_, hnorm, stream_);
+        tqllm_cuda::ik2_rms_norm(hres, out_norm_, eps_, H_, hnorm, stream());
         gemm_h(out_, hnorm, logits_.as<float>(), 1);
-        tqllm_cuda::ik2_softcap(logits_.as<float>(), vocab_unpadded_, logit_cap_, stream_);
+        tqllm_cuda::ik2_softcap(logits_.as<float>(), vocab_unpadded_, logit_cap_, stream());
     }
 
     uint32_t greedy_token() {
