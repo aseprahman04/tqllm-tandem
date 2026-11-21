@@ -88,7 +88,10 @@ __global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, 
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
             const float scs = ue4m3_f(d[s]);
-            const uint8_t * q = qs + s * 16;  // 16 bytes = 32 nibbles = 32 weights? No: 16 bytes = 32 nibbles
+            // 8 bytes of nibbles per sub-block (qs is 32 bytes for the block's 64 weights), as dequant.cpp's
+            // GGML_TYPE_NVFP4 case reads them; a 16-byte step read the wrong codes from sub-block 1 on and ran 24
+            // bytes past the block (past the buffer at the last block of the last expert)
+            const uint8_t * q = qs + s * 8;
             // sub-block s covers weights [s*16, s*16+16): 16 weights = 8 bytes of nibbles
             const int base = b * 64 + s * 16;
 #pragma unroll

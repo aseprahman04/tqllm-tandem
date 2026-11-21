@@ -52,7 +52,10 @@ __global__ void attn_res_k(const __half * __restrict__ blocks, int n_blocks, con
         const float sc = rsqrtf(block_sum(ss) / C + kResEps);
         float d = 0.f;
         for (int i = threadIdx.x; i < C; i += blockDim.x) d += q[qi * C + i] * __half2float(st[i]) * sc;
-        if (threadIdx.x == 0) scores[si] = block_sum(d) / sqrtf(C);
+        // every thread takes part in the sum: block_sum shuffles and waits on barriers, and a warp shuffle or a barrier
+        // that only thread 0 reaches is undefined (the block may never finish)
+        const float dsum = block_sum(d);
+        if (threadIdx.x == 0) scores[si] = dsum / sqrtf(C);
         __syncthreads();
     }
     __shared__ float m, Z;

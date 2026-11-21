@@ -60,6 +60,10 @@ void ck_at(cudaError_t e, int line) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("inkling2: ") + cudaGetErrorString(e) + " (inkling2.cpp:" + std::to_string(line) + ")");
 }
 #define ck(e) ck_at((e), __LINE__)
+// A blocking copy on stream s. This build has no legacy default stream (CMakeLists.txt defines
+// CUDA_API_PER_THREAD_DEFAULT_STREAM), so a plain cudaMemcpy runs on the calling thread's own stream and does not wait
+// for the kernels still queued on a stage's stream: a host read through it can see the buffer before they wrote it.
+#define copy_sync(dst, src, n, kind, s) do { ck(cudaMemcpyAsync((dst), (src), (n), (kind), (s))); ck(cudaStreamSynchronize(s)); } while (0)
 
 struct Buf {
     void * p = nullptr;
@@ -102,10 +106,12 @@ struct Layer {
     const float * loop_v_down = nullptr, * loop_v_forget = nullptr, * loop_v_gain = nullptr;
     const float * loop_mlp_down = nullptr, * loop_mlp_forget = nullptr, * loop_mlp_gain = nullptr;
     M router;            // [experts][C]
-    const float * probs_bias = nullptr;  // [experts]
+    // The three per-expert vectors stay on the host: moe() routes and weights there, and a device pointer cannot be
+    // dereferenced on the host (an access violation, which ends the process without a message).
+    std::vector<float> probs_bias;  // [experts] (empty: no bias tensor)
     Mat e_gu, e_down;    // stacked NVFP4 expert weights (gate|up rows stacked)
-    const float * e_gu_scale = nullptr;  // [experts]
-    const float * e_down_scale = nullptr;
+    std::vector<float> e_gu_scale;  // [experts] (empty: no scale tensor)
+    std::vector<float> e_down_scale;
     bool experts_nvfp4 = false;
     Buf kc, vc;  // [context][kv heads][hd] FP16
     bool sliding = true;
@@ -136,7 +142,7 @@ public:
             if (hop_ev_[d]) cudaEventDestroy(hop_ev_[d]);
     }
 
-    void synchronize() override { ck(cudaStreamSynchronize(stream())); }
+    void synchronize() override { ck(cudaSetDevice(cuda_of_[cur_dev_])); ck(cudaStreamSynchronize(stream())); }
     uint32_t layers() const override { return uint32_t(n_layers_); }
     uint32_t hidden() const override { return uint32_t(H_); }
     uint32_t vocab() const override { return uint32_t(vocab_); }
@@ -144,6 +150,9 @@ public:
     uint32_t context() const override { return context_; }
 
     uint32_t step(uint32_t tok, uint32_t pos, bool sample, float *) override {
+        // tqserve runs every request on a thread of its own, and a new thread starts on CUDA device 0: make the device
+        // of the stage this engine is on current before any of that stage's streams is used.
+        ck(cudaSetDevice(cuda_of_[cur_dev_]));
         run_token(tok, pos);
         if (sample) {
             compute_logits();
@@ -370,6 +379,12 @@ private:
         const auto v = host_f32(n);
         return static_cast<const float *>(put(v.data(), v.size() * 4));
     }
+    // One value per expert, kept on the host (moe() reads it there).
+    std::vector<float> expert_vec(const std::string & n) const {
+        auto v = host_f32(n);
+        if (int(v.size()) != n_exp_) throw std::runtime_error("inkling2: " + n + " is not one value per expert");
+        return v;
+    }
     // Fold a short-conv weight [C][taps] (master layout: unfolded): w *= sc; w[:, -1] += sc.
     // sc = 1/3 for full layers (dynamic taps add extra weight), 1/sqrt(taps+1) for sliding.
     // Returns a device pointer to the folded weight.
@@ -411,13 +426,16 @@ private:
     }
 
     void load() {
-        // Head, embedding and the global loop queries live on stage 1 (GPU 0, where the head runs).
+        // Head and embedding live on stage 1 (GPU 0, where the head runs).
         set_load_dev(1);
         embd_ = load_mat("token_embd.weight");
         embd_norm_ = vec("token_embd_norm.weight");
         out_ = load_mat("output.weight");
         out_norm_ = vec("output_norm.weight");
         out_res_q_ = vec("output_res_query.weight");
+        // The global loop queries are read by the core layers' kernels (loop_messages), so they live on the core's
+        // GPU: a kernel cannot read another device's memory.
+        set_load_dev(dev_of(core0_));
         loop_res_q_ = vec("loop_res_query.weight");
         loop_kv_res_q_ = vec("loop_kv_res_query.weight");
         e_ff_ = int(num("expert_feed_forward_length", 1152));
@@ -457,12 +475,12 @@ private:
                 Y.loop_mlp_down = vec(p + "loop_mlp_down.weight"); Y.loop_mlp_forget = vec(p + "loop_mlp_forget.weight"); Y.loop_mlp_gain = vec(p + "loop_mlp_gain.weight");
             }
             Y.router = load_mat(p + "ffn_gate_inp.weight");
-            if (meta_.tensors.count(p + "exp_probs_b.bias")) Y.probs_bias = vec(p + "exp_probs_b.bias");
+            if (meta_.tensors.count(p + "exp_probs_b.bias")) Y.probs_bias = expert_vec(p + "exp_probs_b.bias");
             Y.e_gu = load_experts(p + "ffn_gate_up_exps.weight");
             Y.e_down = load_experts(p + "ffn_down_exps.weight");
             Y.experts_nvfp4 = (tensor(p + "ffn_gate_up_exps.weight").type == 40);
-            if (meta_.tensors.count(p + "ffn_gate_up_exps.scale")) Y.e_gu_scale = vec(p + "ffn_gate_up_exps.scale");
-            if (meta_.tensors.count(p + "ffn_down_exps.scale")) Y.e_down_scale = vec(p + "ffn_down_exps.scale");
+            if (meta_.tensors.count(p + "ffn_gate_up_exps.scale")) Y.e_gu_scale = expert_vec(p + "ffn_gate_up_exps.scale");
+            if (meta_.tensors.count(p + "ffn_down_exps.scale")) Y.e_down_scale = expert_vec(p + "ffn_down_exps.scale");
         }
         for (int d = 0; d < 2; ++d) {
             if (!cublas_[d]) {
@@ -490,7 +508,8 @@ private:
             S.prev_h_ = Buf(size_t(H_) * 2);
             S.s1_ = Buf(w * 2); S.s2_ = Buf(w * 2); S.s3_ = Buf(w * 2); S.s4_ = Buf(w * 2);
             S.a_ = Buf(w * 4); S.b_ = Buf(w * 4); S.c_ = Buf(w * 4); S.d_ = Buf(w * 4);
-            S.e_ = Buf(std::max(size_t(n_head_), size_t(n_kv_) * hd_) * 4); S.f_ = Buf(std::max(size_t(n_head_), size_t(n_kv_) * hd_) * 4); S.g_ = Buf(w * 2);
+            // e_ takes the gate projection, and attn_gate has one row per head x dim (qd floats), not one per head
+            S.e_ = Buf(w * 4); S.f_ = Buf(w * 4); S.g_ = Buf(w * 2);
             S.moe_ids_ = Buf(size_t(k_exp_) * 4);
             S.moe_gu_ = Buf(size_t(k_exp_) * 2 * e_ff_ * 2);  // BF16
             S.moe_act_ = Buf(size_t(k_exp_) * e_ff_ * 2);     // half
@@ -584,12 +603,13 @@ private:
             Stage & S = st();
             Buf pre_h(H_ * 2), pre_blk(size_t(64) * H_ * 2);
             int pre_nb = n_blocks_;
-            ck(cudaMemcpy(pre_h.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice));
-            ck(cudaMemcpy(pre_blk.p, S.blocks_.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice));
+            // (these device copies go on the stage's stream, after the visits that produce what they read)
+            ck(cudaMemcpyAsync(pre_h.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
+            ck(cudaMemcpyAsync(pre_blk.p, S.blocks_.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice, stream()));
             for (int p = 0; p < n_pass_; ++p) {
                 if (p > 0) {
-                    ck(cudaMemcpy(S.h_.p, pre_h.p, H_ * 2, cudaMemcpyDeviceToDevice));
-                    ck(cudaMemcpy(S.blocks_.p, pre_blk.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice));
+                    ck(cudaMemcpyAsync(S.h_.p, pre_h.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
+                    ck(cudaMemcpyAsync(S.blocks_.p, pre_blk.p, size_t(pre_nb) * H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     n_blocks_ = pre_nb;
                 }
                 for (int l = core0_; l < core1_; ++l) {
@@ -597,10 +617,11 @@ private:
                     visit(l, v, p, pos, nullptr, 0);
                 }
                 if (p < n_pass_ - 1) {
-                    ck(cudaMemcpy(S.prev_h_.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice));
+                    ck(cudaMemcpyAsync(S.prev_h_.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     prev_nb_ = n_blocks_;
                 }
             }
+            ck(cudaStreamSynchronize(stream()));  // pre_h / pre_blk are freed here: nothing queued may still read them
         }
         // post-core layers
         for (int l = core1_; l < n_layers_; ++l) {
@@ -619,19 +640,22 @@ private:
         if (!split_at_ || d == cur_dev_) return;
         Stage & from = st_[cur_dev_], & to = st_[d];
         const int from_c = cuda_of_[cur_dev_], to_c = cuda_of_[d];
+        // Each side copies on its own stage's stream: the read waits for the kernels that produce the vector, and the
+        // write lands before the next stage's kernels (queued on that same stream) read it.
+        const cudaStream_t from_s = stream_[cur_dev_], to_s = stream_[d];
         // h_ : device(from) -> host -> device(to)
         std::vector<__half> hbuf(H_);
         ck(cudaSetDevice(from_c));
-        ck(cudaMemcpy(hbuf.data(), from.h_.p, H_ * 2, cudaMemcpyDeviceToHost));
+        copy_sync(hbuf.data(), from.h_.p, H_ * 2, cudaMemcpyDeviceToHost, from_s);
         ck(cudaSetDevice(to_c));
-        ck(cudaMemcpy(to.h_.p, hbuf.data(), H_ * 2, cudaMemcpyHostToDevice));
+        copy_sync(to.h_.p, hbuf.data(), H_ * 2, cudaMemcpyHostToDevice, to_s);
         // blocks_ : same pattern
         if (n_blocks_) {
             std::vector<__half> bbuf(size_t(n_blocks_) * H_);
             ck(cudaSetDevice(from_c));
-            ck(cudaMemcpy(bbuf.data(), from.blocks_.p, bbuf.size() * 2, cudaMemcpyDeviceToHost));
+            copy_sync(bbuf.data(), from.blocks_.p, bbuf.size() * 2, cudaMemcpyDeviceToHost, from_s);
             ck(cudaSetDevice(to_c));
-            ck(cudaMemcpy(to.blocks_.p, bbuf.data(), bbuf.size() * 2, cudaMemcpyHostToDevice));
+            copy_sync(to.blocks_.p, bbuf.data(), bbuf.size() * 2, cudaMemcpyHostToDevice, to_s);
         }
     }
 
@@ -662,6 +686,7 @@ private:
             tqllm_cuda::ik2_control(ins[0], static_cast<__half *>(msgs.p), Y.loop_attn_down, Y.loop_attn_forget, Y.loop_attn_gain, C, ins[0], stream());
             tqllm_cuda::ik2_control(ins[1], static_cast<__half *>(msgs.p) + C, Y.loop_k_down, Y.loop_k_forget, Y.loop_k_gain, C, ins[1], stream());
             tqllm_cuda::ik2_control(ins[2], static_cast<__half *>(msgs.p) + 2 * C, Y.loop_v_down, Y.loop_v_forget, Y.loop_v_gain, C, ins[2], stream());
+            ck(cudaStreamSynchronize(stream()));  // msgs is freed here: nothing queued may still read it
         }
         // norm the inputs
         Buf xsbuf(3 * C * 2);
@@ -701,6 +726,7 @@ private:
             Buf msgs(4 * C * 2);
             loop_messages(l, prev_last, prev_nblocks, static_cast<__half *>(msgs.p));
             tqllm_cuda::ik2_control(m_in, static_cast<__half *>(msgs.p) + 3 * C, Y.loop_mlp_down, Y.loop_mlp_forget, Y.loop_mlp_gain, C, m_in, stream());
+            ck(cudaStreamSynchronize(stream()));  // msgs is freed here: nothing queued may still read it
         }
         // m = moe(rms(m_in, ffn_norm))
         __half * mnorm = S.s4_.as<__half>();
@@ -719,6 +745,7 @@ private:
         tqllm_cuda::ik2_conv_hist_update(Y.post_hist.as<__half>(), attn_out, taps_, C, stream());
         tqllm_cuda::ik2_conv_hist_update(Y.mlp_hist.as<__half>(), m, taps_, C, stream());
         ++Y.conv_pos;
+        ck(cudaStreamSynchronize(stream()));  // insbuf, xsbuf and rbuf are freed here: nothing queued may still use them
     }
 
     // The four loop messages (m_q, m_k, m_v, m_mlp) of core layer l: attn_res(bank, last) with the loop_res_query /
@@ -738,6 +765,7 @@ private:
         tqllm_cuda::ik2_hcopy(out + 2 * C, out + C, C, stream());            // out[1] = m_k
         tqllm_cuda::ik2_hcopy(tmp.as<__half>(), out + 2 * C, C, stream());   // out[2] = m_v
         tqllm_cuda::ik2_hcopy(tmp.as<__half>(), out + 3 * C, C, stream());   // out[3] = m_mlp
+        ck(cudaStreamSynchronize(stream()));  // tmp is freed here: nothing queued may still use it
     }
 
     // The attention of one layer at position pos: project q,k,v,r,gate,sink; conv k,v; clip; relative bias; softmax;
@@ -839,13 +867,13 @@ private:
         gemm_h(Y.router, x, logits, 1);
         // sigmoid + top-k + weights (host: E is small)
         std::vector<float> sc(E);
-        ck(cudaMemcpy(sc.data(), logits, E * 4, cudaMemcpyDeviceToHost));
+        copy_sync(sc.data(), logits, E * 4, cudaMemcpyDeviceToHost, stream());
         for (int e = 0; e < E; ++e) sc[e] = 1.f / (1.f + std::exp(-sc[e]));
         std::vector<int> order(E);
         for (int e = 0; e < E; ++e) order[e] = e;
         std::sort(order.begin(), order.end(), [&](int a, int b) {
-            float va = sc[a] + (Y.probs_bias ? Y.probs_bias[a] : 0.f);
-            float vb = sc[b] + (Y.probs_bias ? Y.probs_bias[b] : 0.f);
+            float va = sc[a] + (Y.probs_bias.empty() ? 0.f : Y.probs_bias[a]);
+            float vb = sc[b] + (Y.probs_bias.empty() ? 0.f : Y.probs_bias[b]);
             return va > vb;
         });
         std::vector<int> ids(K);
@@ -854,7 +882,7 @@ private:
         for (int i = 0; i < K; ++i) { ids[i] = order[i]; wsum += sc[ids[i]]; }
         for (int i = 0; i < K; ++i) {
             wts[i] = sc[ids[i]] / (wsum + 1e-20f) * route_scale_;
-            sds[i] = Y.e_down_scale ? Y.e_down_scale[ids[i]] : 1.f;
+            sds[i] = Y.e_down_scale.empty() ? 1.f : Y.e_down_scale[ids[i]];
         }
         // upload ids, weights, scales to device
         ck(cudaMemcpyAsync(S.moe_ids_.p, ids.data(), K * 4, cudaMemcpyHostToDevice, stream()));
@@ -865,13 +893,13 @@ private:
         // activation: h = tanh(g/gate_cap)*gate_cap*sigmoid(g)*tanh(u/up_cap)*up_cap
         {
             std::vector<bf16> gu(size_t(K) * 2 * FF);
-            ck(cudaMemcpy(gu.data(), S.moe_gu_.p, gu.size() * 2, cudaMemcpyDeviceToHost));
+            copy_sync(gu.data(), S.moe_gu_.p, gu.size() * 2, cudaMemcpyDeviceToHost, stream());
             std::vector<__half> act(size_t(K) * FF);
             for (int i = 0; i < K; ++i)
                 for (int j = 0; j < FF; ++j) {
                     float gv = __bfloat162float(gu[size_t(i) * 2 * FF + j]);
                     float uv = __bfloat162float(gu[size_t(i) * 2 * FF + FF + j]);
-                    if (Y.e_gu_scale) { gv *= Y.e_gu_scale[ids[i]]; uv *= Y.e_gu_scale[ids[i]]; }
+                    if (!Y.e_gu_scale.empty()) { gv *= Y.e_gu_scale[ids[i]]; uv *= Y.e_gu_scale[ids[i]]; }
                     float hv = std::tanh(gv / gate_cap_) * gate_cap_ * (1.f / (1.f + std::exp(-gv))) * std::tanh(uv / up_cap_) * up_cap_;
                     act[size_t(i) * FF + j] = __float2half(hv);
                 }
@@ -882,7 +910,7 @@ private:
         // out = sum_i wts[i] * sds[i] * moe_dn_[i]  (host: K is small; out is a device pointer,
         // so accumulate on the host and upload)
         std::vector<bf16> dn(size_t(K) * C);
-        ck(cudaMemcpy(dn.data(), S.moe_dn_.p, dn.size() * 2, cudaMemcpyDeviceToHost));
+        copy_sync(dn.data(), S.moe_dn_.p, dn.size() * 2, cudaMemcpyDeviceToHost, stream());
         std::vector<__half> o(C);
         for (int j = 0; j < C; ++j) {
             float acc = 0.f;
