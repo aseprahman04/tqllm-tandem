@@ -9,6 +9,7 @@
 #include "gguf.hpp"
 #include "gguf_mapped.hpp"
 #include "hf_folder.hpp"
+#include "platform/os_file.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -21,7 +22,6 @@
 #include <random>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 using namespace tqllm;
 namespace fs = std::filesystem;
@@ -128,7 +128,7 @@ void real_check(const std::string & folder, const std::string & ref) {
 }  // namespace
 
 int main() try {
-    const fs::path dir = fs::temp_directory_path() / ("tqllm-hf-qwen4exp-" + std::to_string(::getpid()));
+    const fs::path dir = fs::temp_directory_path() / ("tqllm-hf-qwen4exp-" + std::to_string(os::process_id()));
     fs::create_directories(dir);
     // a matrix, a bank of 3 experts, and a table in two shards (rows 5 + 7) of 64 columns
     const Mod mat = make_mod({}, 8, 128), bank = make_mod({3}, 4, 64), sh0 = make_mod({}, 5, 64), sh1 = make_mod({}, 7, 64);

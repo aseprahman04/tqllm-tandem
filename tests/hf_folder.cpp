@@ -4,6 +4,7 @@
 // embedding as a BF16 range of the shard, the tokenizer keys; a folder of an unmapped architecture is not a checkpoint.
 #include "gguf.hpp"
 #include "hf_folder.hpp"
+#include "platform/os_file.hpp"
 #include "x3_record.hpp"
 
 #include <cmath>
@@ -15,7 +16,6 @@
 #include <map>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
 using namespace tqllm;
 namespace fs = std::filesystem;
@@ -65,7 +65,7 @@ void trellis(std::map<std::string, T> & ts, const std::string & m, uint64_t in, 
 }  // namespace
 
 int main() try {
-    const fs::path dir = fs::temp_directory_path() / ("tqllm-hf-folder-" + std::to_string(::getpid()));
+    const fs::path dir = fs::temp_directory_path() / ("tqllm-hf-folder-" + std::to_string(os::process_id()));
     fs::create_directories(dir);
     const uint64_t H = 128, V = 128, hd = 128, ff = 128;
     {
