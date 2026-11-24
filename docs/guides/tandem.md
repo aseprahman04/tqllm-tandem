@@ -133,6 +133,8 @@ The harness reads the served model ID and context size from Basalt. Pi registers
 After a failed check it can retry in the same session with the verifier's diagnostic.
 If Pi exits partway through a turn, the harness still runs the verifier and includes the observed file or test
 failure in the next attempt. The original task and last check are attached when Pi compacts the session.
+Verified coding runs default to temperature zero so Tandem can use its fast greedy verification path.
+An explicit temperature in the client's request is preserved.
 
 ## 6. Use it with apps and coding agents
 

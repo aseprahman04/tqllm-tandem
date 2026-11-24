@@ -29,15 +29,19 @@ export default function pipelCompact(pi) {
         });
     }
     pi.registerFlag("tandem-effort", { type: "string", description: "Tandem reasoning effort for this attempt" });
+    pi.registerFlag("tandem-verify", { type: "boolean", description: "Use greedy decoding by default for a verified coding task" });
     pi.on("before_provider_request", (event, ctx) => {
         const effort = pi.getFlag("tandem-effort");
+        const verify = pi.getFlag("tandem-verify") === true;
         const payload = event.payload;
         const isTandem = ctx.model?.provider === "tql" && ctx.model?.id === "tqllm";
-        if (!effort || (!isTandem && ctx.model?.provider !== "tandem-inkling") ||
+        if ((!effort && !verify) || (!isTandem && ctx.model?.provider !== "tandem-inkling") ||
             !payload || !Array.isArray(payload.messages)) return;
+        const coding = verify && payload.temperature == null ? { ...payload, temperature: 0 } : payload;
+        if (!effort) return coding === payload ? undefined : coding;
         const budgets = { off: 0, low: 1024, medium: 3072, high: 6144, xhigh: 6144 };
         if (!Object.hasOwn(budgets, effort)) throw new Error("Unsupported Tandem reasoning effort: " + effort);
-        const { max_completion_tokens, ...wire } = payload;
+        const { max_completion_tokens, ...wire } = coding;
         const max = wire.max_tokens ?? max_completion_tokens ?? 8192;
         const budget = Math.max(0, Math.min(budgets[effort], Math.floor(max * 0.75)));
         return { ...wire, max_tokens: max, reasoning_effort: effort === "off" ? "none" : effort,
