@@ -225,7 +225,7 @@ public:
     void spec_abort(int s) override {
         if (s < 0 || s >= nslots) return;
         if (s == active) { pc_drop(); pc_seq.clear(); }
-        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_seq.clear(); }
+        else { auto & p = parked[size_t(s)]; p.pc_live = false; p.pc_snap = 0; p.pc_branch_snap = 0; p.pc_seq.clear(); }
     }
     int lora_count() const override { return lora_n; }
     void set_lora(const std::vector<float> & scales) override;
@@ -387,7 +387,7 @@ private:
     static constexpr uint32_t kTail = 64;
     bool pc_on = false, pc_live = false;
     uint32_t pc_snap = 0;
-    uint32_t pc_branch_snap = 0;  // single-slot TP checkpoint learned from two long requests that share a prefix
+    uint32_t pc_branch_snap = 0;  // TP checkpoint learned from two long requests that share a prefix
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
     uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
@@ -395,7 +395,7 @@ private:
     // kept states parked outside the slots (PromptPark, the TPark rules): a slot handed to another conversation parks its
     // kept state (KV rows [0, snap) of this rank's attention layers + the recurrent state at snap); the next turn of that
     // conversation picks it up into whichever slot it gets
-    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0;
+    struct ParkSpace { uint64_t conv = 0; std::vector<uint32_t> seq; uint32_t snap = 0, branch_snap = 0; std::unique_ptr<HostBuf> kv, state; size_t kv_cap = 0;
                        std::vector<float> lora; };  // lora: the LoRA scales the state was built with
     // the drafter's K/V rows that go with a kept state: its whole ring, else positions [0, snap)
     size_t dfl_park_bytes(uint32_t snap) const {
@@ -721,6 +721,7 @@ private:
         Gen gen;
         bool pc_live = false;
         uint32_t pc_snap = 0;
+        uint32_t pc_branch_snap = 0;
         std::vector<uint32_t> pc_seq;
         std::unique_ptr<HostBuf> pc_host;
         uint64_t pc_conv = 0;

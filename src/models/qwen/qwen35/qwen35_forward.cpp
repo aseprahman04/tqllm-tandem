@@ -536,6 +536,7 @@ void Qwen35Engine::swap_seq(SeqState & s) {
     std::swap(gen, s.gen);
     std::swap(pc_live, s.pc_live);
     std::swap(pc_snap, s.pc_snap);
+    std::swap(pc_branch_snap, s.pc_branch_snap);
     std::swap(pc_seq, s.pc_seq);
     std::swap(pc_host, s.pc_host);
     std::swap(pc_conv, s.pc_conv);
@@ -1902,6 +1903,7 @@ void Qwen35Engine::park_out() {
     sp.conv = pc_conv;
     sp.seq.assign(pc_seq.begin(), pc_seq.begin() + pc_snap);
     sp.snap = pc_snap;
+    sp.branch_snap = pc_branch_snap;
     sp.lora = lora_n ? lora_slot[size_t(active)] : std::vector<float>();
     sp.state = std::move(pc_host);
     pc_drop();
@@ -1938,6 +1940,7 @@ void Qwen35Engine::park_swap(const std::vector<uint32_t> & prompt) {
     sync_ck();
     pc_seq = std::move(sp.seq);
     pc_snap = sp.snap;
+    pc_branch_snap = sp.branch_snap;
     pc_live = false;
     pc_host = std::move(sp.state);
     pc_conv = sp.conv;

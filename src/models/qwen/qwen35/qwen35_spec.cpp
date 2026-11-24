@@ -270,10 +270,8 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         if (im_start_ != ~0u && !tf_path)
             for (uint32_t i = 1; i < P; ++i) if (prompt[i] == im_start_) starts.push_back(i);
         uint32_t snap = !pc_on || keep_branch ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
-        if (common && !tf_path) {
-            pc_branch_snap = shared_chunk_boundary(starts, common, P, uint32_t(CH));
-            if (pc_branch_snap) snap = pc_branch_snap;
-        }
+        const uint32_t branch = common && !tf_path ? shared_chunk_boundary(starts, common, P, uint32_t(CH)) : 0;
+        if (branch) snap = branch;
         const size_t chunks = (P - P0 + CH - 1) / CH + 1 + starts.size();  // + the split at snap and at each message start
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
         HostBuf staged_pos(chunks * 4 * sizeof(int));  // fork: the second half holds the --mtp prompt passes' positions
@@ -379,6 +377,8 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                 }
             }
             sync_ck();
+            // A cold prefill resets the old cache at position zero. Mark the new branch only after its state is saved.
+            if (branch && pc_snap == branch) pc_branch_snap = branch;
             mm_chunk = false;
         } catch (...) {
             cudaStreamSynchronize(stream);
