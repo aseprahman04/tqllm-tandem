@@ -3,6 +3,14 @@
 # kind: user (an override with no CLI form), debug (diagnostics), retired (removed: every tool stops and names the
 # replacement).
 flags:
+  - name: TQLLM_TP
+    kind: user
+    default: "off"
+    doc: "Tandem Qwen3.8-27B: set to 1 for tensor parallelism on two CUDA devices"
+  - name: TQLLM_SPLIT
+    kind: user
+    default: "off"
+    doc: "Tandem Qwen3.8-27B layer split: number of initial decoder layers assigned to CUDA device 1"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"
