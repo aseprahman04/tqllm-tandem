@@ -118,6 +118,8 @@ The verifier script runs in the project directory. Exit code zero accepts the re
 attempt with the verifier output in the same Pi session. `-Coba 2` permits two repairs after the first attempt.
 The bundled `pipel-compact.js` extension brings the task and latest verifier result back into context after compaction.
 For a Pi installation outside PATH, set `TANDEM_PI_BIN` to its executable.
+Use `-Pikir high` for a difficult first attempt. By default, a verifier failure enables a bounded thinking budget
+on the repair attempt. Set `-PikirUlang` to `off`, `low`, `medium`, `high`, or `xhigh` to choose its effort.
 
 ## 6. Use it with apps and coding agents
 

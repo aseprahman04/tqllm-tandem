@@ -1,7 +1,9 @@
 # pi + pelajaran relevan + verifikator luar (opsional).
 # pipel [-Cek <skrip>] [-Coba 2] [-Polos] "<tugas>"   (jalankan di direktori kerja tugas)
 # -Cek: skrip dijalankan di direktori kerja; exit 0 = lulus; keluaran = alasan gagal. Gagal -> ulang dengan alasan; kegagalan dicatat ke pelajaran-usulan.txt
-param([Parameter(Mandatory, Position=0)][string]$Tugas, [string]$Cek, [ValidateRange(0,2147483646)][int]$Coba = 2, [switch]$Polos)
+param([Parameter(Mandatory, Position=0)][string]$Tugas, [string]$Cek, [ValidateRange(0,2147483646)][int]$Coba = 2, [switch]$Polos,
+  [ValidateSet('off','low','medium','high','xhigh')][string]$Pikir,
+  [ValidateSet('off','low','medium','high','xhigh')][string]$PikirUlang = 'high')
 $ErrorActionPreference = 'Stop'
 $piExecutable = if ($env:TANDEM_PI_BIN) { $env:TANDEM_PI_BIN } else { 'pi' }
 $usul = Join-Path $PSScriptRoot 'pelajaran-usulan.txt'
@@ -19,6 +21,7 @@ if (-not $Polos -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pelajaran
   }
 }
 if (-not $Cek) {
+  if ($Pikir) { $argsPi += @('--extension',(Join-Path $PSScriptRoot 'pipel-compact.js'),'--tandem-effort',$Pikir) }
   & $piExecutable @argsPi $p
   exit $LASTEXITCODE
 }
@@ -39,7 +42,10 @@ $rule = "Setelah compaction, baca tugas awal di $brief dan hasil cek terakhir di
 $argsPi += @('--session',$session,'--append-system-prompt',$rule,'--extension',(Join-Path $PSScriptRoot 'pipel-compact.js'))
 $previous = $null
 for ($i = 0; $i -le $Coba; $i++) {
-  & $piExecutable @argsPi $p
+  $effort = if ($i -eq 0) { $Pikir } else { $PikirUlang }
+  $attemptArgs = $argsPi
+  if ($effort) { $attemptArgs += @('--tandem-effort',$effort) }
+  & $piExecutable @attemptArgs $p
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   $alasan = (& pwsh -NoProfile -File $cekPath 2>&1) -join "`n"
