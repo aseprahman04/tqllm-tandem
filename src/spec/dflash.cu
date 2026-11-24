@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include "dflash_kernels.cuh"
+#include "tree_columns.hpp"
 
 #include <math_constants.h>
 
@@ -313,6 +314,38 @@ void dflash_chain(const uint32_t * idx, const float * score, int want, uint32_t 
 void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, int B, int budget, uint32_t * tok,
                  int * par, int * dep, cudaStream_t s) {
     dflash_tree_k<<<1, 32, 0, s>>>(idx, score, anchor, B, budget, tok, par, dep, 1.f);
+}
+
+namespace {
+struct CopyProposal {
+    uint32_t token[tqllm::kGdnReplayCols - 1];
+};
+__global__ void copy_tree_k(const uint32_t * idx, const float * score, const uint32_t * anchor,
+                            CopyProposal copy, int count, uint32_t * tok, int * par, int * dep) {
+    const int col = threadIdx.x;
+    uint32_t child = 0;
+    if (!col) {
+        const float * row = score + 16 * 16;  // depth 1, conditioned on the anchor
+        int best = 0;
+        for (int k = 1; k < 16; ++k)
+            if (row[k] > row[best]) best = k;
+        child = idx[16 + best];
+        tok[0] = *anchor; par[0] = -1; dep[0] = 0;
+    }
+    child = __shfl_sync(0xffffffffu, child, 0);
+    if (!col || col > count) return;
+    const bool sibling = col == count && child != copy.token[0];
+    tok[col] = sibling ? child : copy.token[col - 1];
+    par[col] = sibling ? 0 : col - 1;
+    dep[col] = sibling ? 1 : col;
+}
+}
+void dflash_copy_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, const uint32_t * host_copy,
+                      int count, uint32_t * tok, int * par, int * dep, cudaStream_t s) {
+    if (count < 2 || count >= tqllm::kGdnReplayCols) throw std::invalid_argument("unsupported copy tree width");
+    CopyProposal copy{};
+    for (int i = 0; i < count; ++i) copy.token[i] = host_copy[i];
+    copy_tree_k<<<1, 32, 0, s>>>(idx, score, anchor, copy, count, tok, par, dep);
 }
 
 void gather_path(const PathGather * descs, int n, const int * cols, int k, int pos, cudaStream_t s) {

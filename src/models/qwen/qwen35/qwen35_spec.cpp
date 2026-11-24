@@ -641,19 +641,29 @@ bool Qwen35Engine::dflash_advance() {
             if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
         }
         int nt = tqllm::tree_cols(D, nl, lf, NV);
+        bool merge_copy = false;
         if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
             for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
             nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
-            const auto cp = gen.copy.propose(NV - nt);
+            const bool can_merge = tp && !sampling() && nt == 2;
+            const auto cp = gen.copy.propose(can_merge ? NV - 1 : NV - nt);
+            merge_copy = can_merge && int(cp.size()) == NV - 1;
             if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
-            nl = int(cp.size());
+            nl = merge_copy ? NV - nt : int(cp.size());
             std::copy(cp.begin(), cp.end(), lk);
         }
         dflash_draft(pending, pos, 0, nullptr, nullptr, true);
-        tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
-                                v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
         const int n = nt + nl;
-        if (nl) {  // lookup chain: columns nt .. n - 1, the first under the root
+        if (merge_copy) {
+            // A matching first token frees one column for the copy tail. A different neural child
+            // keeps its own branch. The target verifies every column in both layouts.
+            tqllm_cuda::dflash_copy_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), lk, NV - 1,
+                                         v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+        } else {
+            tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
+                                    v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+        }
+        if (nl && !merge_copy) {  // lookup chain: columns nt .. n - 1, the first under the root
             int lp[NVER], ld[NVER];
             for (int i = 0; i < nl; ++i) lp[i] = i ? nt + i - 1 : 0, ld[i] = i + 1;
             ck(cudaMemcpyAsync(v_tokens.as<uint32_t>() + nt, lk, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));

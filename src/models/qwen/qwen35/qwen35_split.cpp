@@ -522,32 +522,34 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     if (graphs && spin && !tp_spin_off && !noxchg) {
         auto body = [&](int r) {
             uint32_t * sh = tp_shadow[r];
-            auto sig = [&](int kind, int s) { tqllm_cuda::tp_signal(sh + kind * 2 + s, tp_flags + (kind * 2 + r) * 2 + s, stream); };
-            auto swt = [&](int kind, int s) {  // kind 0: made (lag 0), 1: used (lag 1)
-                tqllm_cuda::tp_wait(sh + 4 + kind * 2 + s, tp_flags + (kind * 2 + 1 - r) * 2 + s, uint32_t(kind), tp_flags + 8, stream);
+            // The two ranks alternate mixer and FFN slots. Publishing either partial proves that the
+            // peer has finished reading our preceding partial from the other slot. The final FFN
+            // wait and the next graph's first mixer wait preserve this ordering across replays.
+            auto signal_ready = [&](int s) {
+                tqllm_cuda::tp_signal(sh + s, tp_flags + r * 2 + s, stream);
+            };
+            auto wait_ready = [&](int s) {
+                tqllm_cuda::tp_wait(sh + 4 + s, tp_flags + (1 - r) * 2 + s, 0, tp_flags + 8, stream);
             };
             uint32_t ai = 0, li = 0;
             for (uint32_t l = 0; l < cfg.layers; ++l) {
-                if (l) swt(0, 1);
-                swt(1, 0);
-                if (l) xadd(v_x.as<bf16>(), r, 1);
+                if (l) {
+                    wait_ready(1);
+                    xadd(v_x.as<bf16>(), r, 1);
+                }
                 tp_mix(l, ai, li, n, max_seq, r);
                 xstore(v_m.as<bf16>(), r, 0);
-                if (l) sig(1, 1);
-                sig(0, 0);
+                signal_ready(0);
                 cfg.full[l] ? ++ai : ++li;
-                swt(0, 0);
-                swt(1, 1);
+                wait_ready(0);
                 xadd(v_m.as<bf16>(), r, 0);
                 tp_ffn(l, n);
                 xstore(v_x.as<bf16>(), r, 1);
-                sig(1, 0);
-                sig(0, 1);
+                signal_ready(1);
             }
-            swt(0, 1);  // the last FFN partial
+            wait_ready(1);  // the last FFN partial
             xadd(v_x.as<bf16>(), r, 1);
             tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
-            sig(1, 1);
         };
         const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
                               (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
