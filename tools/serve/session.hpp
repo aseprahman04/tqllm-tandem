@@ -39,10 +39,17 @@ struct ServeOptions {
     // think_off: what a Jinja-rendered prompt still needs when thinking is off (the MiniMax template has no
     // enable_thinking: its answer starts right after the end tag; the Qwen template closes the block itself)
     std::string think_open = "<think>", think_close = "</think>", think_off;
+    std::string budget_open, budget_transition;
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
     return o;
+}
+inline std::string resume_after_budget(const std::string & reasoning, bool closed = false, const std::string & answer = {}) {
+    const auto & o = serve_options();
+    if (!o.budget_transition.empty())
+        return o.budget_open + reasoning + o.budget_transition + answer;
+    return closed ? reasoning + "\n" + o.think_close + "\n\n" + answer : reasoning + o.think_close;
 }
 inline int draft_length(bool native_mtp = false) {
     const int d = serve_options().draft_max;
@@ -739,7 +746,7 @@ inline std::vector<uint32_t> prepare(const tqllm::Tokenizer & tokenizer, const C
 inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & output,
                             DecodeResult & result) {
     if (!req.thinking) return;
-    static const auto think_end = tokenizer.encode(serve_options().think_close);
+    const auto think_end = tokenizer.encode(serve_options().think_close);
     const auto at = think_end.size() == 1 ? std::find(output.begin(), output.end(), think_end[0]) : output.end();
     result.reasoning = trim(tokenizer.decode({output.begin(), at}));
     result.text = at == output.end() ? std::string() : trim(tokenizer.decode({at + 1, output.end()}));

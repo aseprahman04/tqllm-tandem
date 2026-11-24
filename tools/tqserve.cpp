@@ -286,6 +286,14 @@ int main(int argc, char ** argv) {
             auto & so = tqserve::serve_options();
             so.think_open = "<mm:think>"; so.think_close = "</mm:think>"; so.think_off = "</mm:think>";
         }
+        if (tokenizer.encode("<|content_thinking|>").size() == 1 && tokenizer.encode("<|content_text|>").size() == 1) {
+            auto & so = tqserve::serve_options();
+            so.think_open = "<|content_thinking|>";
+            so.think_close = "<|content_text|>";
+            so.think_off = "<|message_model|><|content_text|>";
+            so.budget_open = "<|message_model|><|content_thinking|>";
+            so.budget_transition = "<|end_message|><|message_model|><|content_text|>";
+        }
         std::string plugins_json;  // /health "plugins" (only when --plugin was given)
 #if !TQLLM_WITH_CUDA
         if (!engine.plugins.empty()) throw std::runtime_error("--plugin (weight-format plugins) needs a CUDA build");
@@ -563,7 +571,7 @@ int main(int argc, char ** argv) {
                         if (parsed.max_tokens < want) parsed.max_tokens = static_cast<uint32_t>(std::min<uint64_t>(want, 0xFFFFFFFFull));
                     }
                     if (parsed.thinking_budget == 0) {  // budget 0: end thinking immediately (llama.cpp): force message + end tag
-                        parsed.prompt_text += parsed.budget_message + tqserve::serve_options().think_close;
+                        parsed.prompt_text += tqserve::resume_after_budget(parsed.budget_message);
                         parsed.thinking = false;
                     }
                 }
@@ -614,8 +622,7 @@ int main(int argc, char ** argv) {
                             phase2.thinking = false;
                             phase2.continuation = 2;
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, first.completion_tokens);
-                            phase2.prompt_text += closed ? first.reasoning + "\n" + tqserve::serve_options().think_close + "\n\n" + first.text
-                                                         : first.reasoning + tqserve::serve_options().think_close;  // llama.cpp: message + end tag forced
+                            phase2.prompt_text += tqserve::resume_after_budget(first.reasoning, closed, first.text);
                             tqserve::StreamWriter w2(tokenizer, phase2, name, send);
                             w2.mark_role_sent();
                             auto more = phase2.max_tokens > 0 ? run_stream(phase2, w2) : tqserve::DecodeResult{};
@@ -661,8 +668,7 @@ int main(int argc, char ** argv) {
                             phase2.continuation = 2;
                             phase2.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
                             if (!closed) generated.reasoning = tqserve::trim_incomplete_utf8(generated.reasoning) + parsed.budget_message;
-                            phase2.prompt_text += generated.reasoning;
-                            phase2.prompt_text += closed ? "\n" + tqserve::serve_options().think_close + "\n\n" + generated.text : tqserve::serve_options().think_close;
+                            phase2.prompt_text += tqserve::resume_after_budget(generated.reasoning, closed, generated.text);
                             auto more = phase2.max_tokens > 0 ? run(phase2) : tqserve::DecodeResult{};
                             if (!more.error.empty()) generated.error = more.error;
                             else {

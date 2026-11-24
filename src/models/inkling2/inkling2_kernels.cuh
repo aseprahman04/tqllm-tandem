@@ -25,19 +25,26 @@ void ik2_l2clip(const __half * x, const float * clip, float cap, int H, int D, _
 // v [KV][D] -> weightless RMS norm (eps 1e-6), in place
 void ik2_rms_weightless(const __half * x, int KV, int D, __half * y, cudaStream_t s);
 // The relative-bias attention core for one query token at position pos. q [H][D] (clipped), k/v [KV][D] (clipped /
-// normed), r [H][d_rel] (clipped), gate/sink [H], rel_bias [d_rel][extent], KV cache [context][KV][D] FP16.
+// normed), r [H][d_rel] (clipped), gate [H][D], sink [H], rel_bias [extent][d_rel], KV cache [context][KV][D] FP16.
 // Writes out [H*D] = (softmax over the causal(+window) keys, with the relative bias and a per-head sink logit) v,
 // times sigmoid(gate). The KV cache row for pos is written by the caller.
 struct Ik2AttnCore {
-    const __half * q, * k, * v, * r, * gate, * sink;
+    const __half * q, * r, * gate, * sink;
     const float * rel_bias;
     int H, KV, D, d_rel, extent, window;
     bool sliding;
     uint32_t pos;
-    const __half * kc;  // [context][KV][D] FP16 (the keys before pos)
+    const __half * kc;  // [context][KV][D] FP16 (sliding visits use a window-sized ring)
     const __half * vc;  // [context][KV][D] FP16
 };
 void ik2_attention_core(const Ik2AttnCore & a, __half * out, cudaStream_t s);
+// Inkling's sigmoid router picks by biased probability and weights by the original probability.
+void ik2_route(const float * logits, const float * bias, int experts, int count, float scale,
+               int * ids, float * weights, cudaStream_t stream);
+void ik2_expert_activation(const __nv_bfloat16 * gate_up, const int * ids, const float * scales, int count,
+                           int width, float gate_cap, float up_cap, __half * activated, cudaStream_t stream);
+void ik2_expert_sum(const __nv_bfloat16 * rows, const int * ids, const float * scales, const float * weights,
+                    int count, int width, __half * output, cudaStream_t stream);
 // logits[i] = cap * tanh(logits[i] / cap) for i < unpadded
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s);
 // hist [taps-1][C] <- shift + append cur [C]

@@ -45,9 +45,8 @@ struct Nvfp4Gguf final : WeightFormat {
     // m.aux points at [experts] F32 scales. ids: [n * topk] expert ids. y: [n * topk][rows] BF16.
     void expert_matvec(const Mat & m, const __half * x, __nv_bfloat16 * y, int rows, const int * ids, int n, int topk,
                        bool per_expert_input, cudaStream_t s) const override {
-        (void) per_expert_input;
         tqllm_cuda::nvfp4_gguf_expert_matvec(static_cast<const uint8_t *>(m.p), static_cast<const float *>(m.aux),
-                                             x, y, rows, m.cols, ids, n, topk, s);
+                                             x, y, rows, m.cols, ids, n, topk, per_expert_input, s);
     }
 };
 

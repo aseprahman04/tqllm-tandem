@@ -70,7 +70,7 @@ __device__ __forceinline__ float ue4m3_f(uint8_t b) {  // ggml's UE4M3 (unsigned
     return e == 0 ? ldexpf(m, -9) : ldexpf(1.f + m / 8.f, e - 7);
 }
 __global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, const __half * x,
-                                           __nv_bfloat16 * y, int rows, int k, const int * ids, int topk) {
+                                           __nv_bfloat16 * y, int rows, int k, const int * ids, int topk, bool per_expert_input) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * 8 + warp;  // output row within the expert
     if (row >= rows) return;
@@ -79,7 +79,7 @@ __global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, 
     const float scale = sc ? sc[e] : 1.f;
     const int nb = k / 64;  // block_nvfp4 per row
     const uint8_t * wr = w + (int64_t(e) * rows + row) * int64_t(nb) * 36;  // this expert's row
-    const __half * xr = x + int64_t(tok) * k;
+    const __half * xr = x + int64_t(per_expert_input ? a : tok) * k;
     float acc = 0.f;
     for (int b = lane; b < nb; b += 32) {
         const uint8_t * blk = wr + b * 36;
@@ -96,8 +96,8 @@ __global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, 
             const int base = b * 64 + s * 16;
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
-                const uint8_t qbyte = q[i >> 1];
-                const int nib = (i & 1) ? (qbyte >> 4) : (qbyte & 15);
+                const uint8_t qbyte = q[i % 8];
+                const int nib = (i >= 8) ? (qbyte >> 4) : (qbyte & 15);
                 const float wv = E2M1[nib] * scs;
                 acc += wv * __half2float(xr[base + i]);
             }
@@ -109,8 +109,8 @@ __global__ void nvfp4_gguf_expert_matvec_k(const uint8_t * w, const float * sc, 
 }
 }  // namespace
 void nvfp4_gguf_expert_matvec(const uint8_t * w, const float * sc, const __half * x, __nv_bfloat16 * y, int rows,
-                              int k, const int * ids, int n, int topk, cudaStream_t s) {
+                              int k, const int * ids, int n, int topk, bool per_expert_input, cudaStream_t s) {
     const dim3 grid((rows + 7) / 8, n * topk);
-    nvfp4_gguf_expert_matvec_k<<<grid, 256, 0, s>>>(w, sc, x, y, rows, k, ids, topk);
+    nvfp4_gguf_expert_matvec_k<<<grid, 256, 0, s>>>(w, sc, x, y, rows, k, ids, topk, per_expert_input);
 }
 }  // namespace tqllm_cuda

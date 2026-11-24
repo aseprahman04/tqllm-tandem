@@ -421,8 +421,8 @@ void dequantize_host(uint32_t type, const void * src, float * dst, int64_t n) {
                 for (int sub = 0; sub < 4; ++sub) {  // 4 sub-blocks of 16 weights
                     const float sc = ue4m3(d[sub]);
                     for (int i = 0; i < 16; ++i) {  // 16 weights = 8 bytes of nibbles
-                        const uint8_t q = qs[sub * 8 + (i >> 1)];
-                        const int nib = (i & 1) ? (q >> 4) : (q & 15);
+                        const uint8_t q = qs[sub * 8 + i % 8];
+                        const int nib = (i >= 8) ? (q >> 4) : (q & 15);
                         dst[b * 64 + sub * 16 + i] = e2m1[nib] * sc;
                     }
                 }
