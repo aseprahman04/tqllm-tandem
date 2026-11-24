@@ -54,8 +54,11 @@ export default function pipelCompact(pi) {
         const task = excerpt(stem + ".task.txt");
         if (!task) return;
         const review = excerpt(stem + ".review.txt");
-        const evidence = { tugas_awal: task };
-        if (review) evidence.hasil_verifikator_terakhir = review;
+        const evidence = { tugas_awal: task, berkas_tugas: stem + ".task.txt" };
+        if (review) {
+            evidence.hasil_verifikator_terakhir = review;
+            evidence.berkas_verifikator = stem + ".review.txt";
+        }
         const messages = event.messages.slice();
         const summary = messages[index];
         messages[index] = { ...summary, summary: summary.summary +
