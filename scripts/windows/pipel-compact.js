@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 function excerpt(file) {
     try {
@@ -30,6 +30,18 @@ export default function pipelCompact(pi) {
     }
     pi.registerFlag("tandem-effort", { type: "string", description: "Tandem reasoning effort for this attempt" });
     pi.registerFlag("tandem-verify", { type: "boolean", description: "Use greedy decoding by default for a verified coding task" });
+    pi.registerFlag("tandem-check-on-write", { type: "string", description: "End a task when its repeatable verifier accepts the latest changes" });
+    pi.on("turn_end", async (event, ctx) => {
+        const verifier = pi.getFlag("tandem-check-on-write");
+        if (!verifier || !event.toolResults.some(result => !result.isError && (result.toolName === "write" || result.toolName === "edit"))) return;
+        const session = ctx.sessionManager.getSessionFile();
+        if (!session?.endsWith(".jsonl")) return;
+        const outcome = await pi.exec("pwsh", ["-NoProfile", "-File", verifier], { cwd: ctx.cwd, signal: ctx.signal });
+        if (outcome.code === 0 && !outcome.killed) {
+            writeFileSync(session.slice(0, -6) + ".verified", "Verifier passed after a file change.\n");
+            ctx.abort();
+        }
+    });
     pi.on("before_provider_request", (event, ctx) => {
         const effort = pi.getFlag("tandem-effort");
         const verify = pi.getFlag("tandem-verify") === true;

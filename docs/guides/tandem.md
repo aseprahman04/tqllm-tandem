@@ -135,6 +135,9 @@ If Pi exits partway through a turn, the harness still runs the verifier and incl
 failure in the next attempt. The original task and last check are attached when Pi compacts the session.
 Verified coding runs default to temperature zero so Tandem can use its fast greedy verification path.
 An explicit temperature in the client's request is preserved.
+For a task with a repeatable verifier that covers its full acceptance criteria, add `-CekSaatTulis`.
+Pi runs that verifier after turns that successfully write or edit files. A pass ends generation before another
+edit can regress the task. The launcher checks the final workspace once more before it reports success.
 
 ## 6. Use it with apps and coding agents
 
