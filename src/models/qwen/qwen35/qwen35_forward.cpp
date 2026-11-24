@@ -994,10 +994,17 @@ void Qwen35Engine::qsa_plan(uint32_t pos, int n) {
     // token keys are written for one sequence at column 0
     const bool keys = segs.empty() || (segs.size() == 1 && segs[0].col0 == 0);
     const auto step = qsa.plan.write(int(pos), n, keys, n <= NVER && !mm_chunk && gen.rdelta == 0, qsa.from);
-    for (auto & q : qsa.layer)
-        tqllm_cuda::qsa27_pool_blocks(static_cast<const __half *>(q.tok->p), q.block_norm, q.blocks.as<float>(), step.pool_first,
-                                      step.pool_count, cfg.theta, cfg.eps, stream);
     qsa.mode = step.mode;
+    if (tp) tp_peer_qsa.mode = step.mode;
+    if (!step.pool_count) return;
+    // Each rank keeps its own token keys, including gathered speculative paths.
+    // Pool only committed positions, ordered behind their writes on the same stream.
+    for (int rank = tp ? 0 : 1; rank <= 1; ++rank) {
+        if (tp) use_dev(rank, false);
+        for (auto & q : qsa.layer)
+            tqllm_cuda::qsa27_pool_blocks(static_cast<const __half *>(q.tok->p), q.block_norm, q.blocks.as<float>(), step.pool_first,
+                                          step.pool_count, cfg.theta, cfg.eps, stream);
+    }
 }
 
 void Qwen35Engine::qsa_index(const Layer & L, uint32_t attn_i, int n, const int * dpos, const int * dep) {

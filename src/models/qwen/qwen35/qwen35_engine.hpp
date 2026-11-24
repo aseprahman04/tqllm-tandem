@@ -432,7 +432,7 @@ private:
         int mode = 0;   // the verify block being launched: 0 dense, 1 every row sparse, 2 it crosses `from`
         const int32_t * cur = nullptr;  // the selection of the attention layer that runs next (attn_core)
         int mass_left = 0;              // TQLLM_DEBUG=qsa_mass: sparse steps still to report
-    } qsa;
+    } qsa, tp_peer_qsa;  // device-local index weights, token keys, pooled keys and selector scratch
     void qsa_load(const GgufFile & f);
     void qsa_setup();
     // before a verify launch writes n positions at pos: the block's mode and the block keys its rows may pick from

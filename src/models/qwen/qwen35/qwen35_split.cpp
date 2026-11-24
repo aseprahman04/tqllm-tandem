@@ -113,6 +113,7 @@ void Qwen35Engine::use_dev(int d, bool wait) {
     from.i8 = std::move(i8);
     i8 = std::move(to.i8);
     if (tp) {  // tensor parallel: the weights, KV and recurrent state are each GPU's own shard
+        std::swap(qsa, tp_peer_qsa);
         std::swap(layer, from.layer), std::swap(layer, to.layer);
         std::swap(kv_mem, from.kv_mem), std::swap(kv_mem, to.kv_mem);
         std::swap(kv_pool, from.kv_pool), std::swap(kv_pool, to.kv_pool);
@@ -168,6 +169,7 @@ void Qwen35Engine::split_alloc_dev0() {
     // the RoPE scaling table (YaRN, linear) is __constant__ memory, per device: the constructor loaded it on device 0
     // only, so the first GPU's attention layers ran unscaled RoPE under --rope-scaling until this line
     set_rope(false);
+    if (tp && tp_peer_qsa.on) qsa_setup();
     const auto list = dev_bufs();
     for (size_t i = 0; i < list.size(); ++i)
         if (bytes[i] && !list[i]->p) *list[i] = Buf(bytes[i]);
@@ -372,7 +374,9 @@ void Qwen35Engine::tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, in
     if (r == 1) capture_feature(l, X, v_feat.as<bf16>(), n);  // the drafter (home) reads the replicated stream
     nrot_h(X, L.in_norm, v_px.as<float>(), XH, H, n);
     if (cfg.full[l]) {
+        if (qsa.on) qsa_index(L, attn_i, n, v_pos.as<int>(), vdep);
         attn_mixer(L, key_cache[attn_i].as<bf16>(), value_cache[attn_i].as<bf16>(), n, max_seq);
+        qsa.cur = nullptr;
         return;
     }
     const int rows = mix_rows(L);
@@ -426,7 +430,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     auto seg = [&](int r, uint32_t l, int part, auto && body) {
         if (!graphs) return body();
         const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | (uint64_t(n) << 48) |
-                             (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) | (uint64_t(vkind) << 44) | uint64_t(uint32_t(max_seq));
+                             (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) | (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         auto it = tp_graphs.find(key);
         if (it == tp_graphs.end()) {
             it = tp_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, body))).first;
@@ -546,7 +550,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             sig(1, 1);
         };
         const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
-                              (uint64_t(vkind) << 44) | uint64_t(uint32_t(max_seq));
+                              (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         for (int r = 0; r < 2; ++r) {
             use_dev(r, false);
             const uint64_t key = (uint64_t(r) << 63) | key0;

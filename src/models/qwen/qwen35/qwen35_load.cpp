@@ -262,6 +262,11 @@ void Qwen35Engine::load_gguf(const GgufFile & f) {
     }
     use_dev(1);  // layer split: buffers, head and drafter are set up on the last device
     qsa_load(f);
+    if (tp && opt.qsa_from > 0 && !qsa.layer.empty()) {
+        use_dev(0);
+        qsa_load(f);
+        use_dev(1);
+    }
 }
 
 // Runtime LoRA adapters (--lora): A in each matrix's input basis (a rotated format reads x rotated per block, so A x =
