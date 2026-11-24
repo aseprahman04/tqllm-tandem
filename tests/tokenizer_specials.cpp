@@ -2,13 +2,14 @@
 // user-defined ones still match atomically (HF split_special_tokens=True, how pplx-embed-v2-context builds its document
 // input: "[D] " is split, "<|chunk_sep|>" is one token), and every id comes with the byte range of the text it covers.
 #include "tqllm/tokenizer.hpp"
+#include "platform/os_file.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <unistd.h>
+#include <filesystem>
 #include <vector>
 
 namespace {
@@ -41,8 +42,8 @@ std::string join(const std::vector<uint32_t> & v) { std::string s; for (auto x :
 }  // namespace
 
 int main() {
-    char tmpl[] = "/tmp/tqllm-tokspec-XXXXXX";
-    const std::string dir = mkdtemp(tmpl);
+    const auto dir = (std::filesystem::temp_directory_path() / ("tqllm-tokspec-" + std::to_string(tqllm::os::process_id()))).string();
+    if (!std::filesystem::create_directory(dir)) return 1;
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_str("tokenizer.ggml.model", "gpt2");
@@ -69,7 +70,7 @@ int main() {
     check(join(all_ids) == "7 0 6 1 8 ", "Specials::all with offsets: both added tokens matched: " + join(all_ids));
     const std::vector<std::pair<uint32_t, uint32_t>> want_all = {{0, 4}, {4, 5}, {5, 12}, {12, 13}, {13, 15}};
     check(off_all == want_all, "Specials::all: byte ranges per id");
-    std::remove(path.c_str()); rmdir(dir.c_str());
+    std::remove(path.c_str()); std::filesystem::remove(dir);
     std::cout << (failures ? "tokenizer specials: FAILED\n" : "tokenizer specials: OK\n");
     return failures ? 1 : 0;
 }

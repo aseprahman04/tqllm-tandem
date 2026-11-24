@@ -2,8 +2,12 @@
 // 300,000-byte piece with no pre-token break tokenizes in seconds (the merge was quadratic), an empty user-defined
 // token does not stop encode() from advancing, and an overfull piece cache keeps most of its entries.
 #include "tqllm/tokenizer.hpp"
+#include "platform/os_file.hpp"
 
+#include <filesystem>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -70,9 +74,11 @@ std::vector<uint32_t> reference(const std::string & piece) {
 }  // namespace
 
 int main() {
+#ifndef _WIN32
     alarm(120);  // a hang (the empty-token loop, the quadratic merge) fails the test instead of the ctest timeout
-    char tmpl[] = "/tmp/tqllm-tokbpe-XXXXXX";
-    const std::string dir = mkdtemp(tmpl);
+#endif
+    const auto dir = (std::filesystem::temp_directory_path() / ("tqllm-tokbpe-" + std::to_string(tqllm::os::process_id()))).string();
+    if (!std::filesystem::create_directory(dir)) return 1;
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_str("tokenizer.ggml.model", "gpt2");
@@ -118,7 +124,7 @@ int main() {
     }
     std::printf("piece cache: %zu of %zu after %zu distinct pieces\n", t.piece_cache_size(), cap, cap + cap / 4);
     check(t.piece_cache_size() >= cap / 2, "an overfull piece cache keeps at least half its entries");
-    std::remove(path.c_str()); rmdir(dir.c_str());
+    std::remove(path.c_str()); std::filesystem::remove(dir);
     std::cout << (failures ? "tokenizer bpe: FAILED\n" : "tokenizer bpe: OK\n");
     return failures ? 1 : 0;
 }
