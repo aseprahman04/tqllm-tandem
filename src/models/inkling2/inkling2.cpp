@@ -216,6 +216,12 @@ public:
         }
         return std::move(generated_);
     }
+    std::vector<uint32_t> generate_spec(const std::vector<uint32_t> & prompt, uint32_t count, int draft,
+                                        uint64_t * stats) override {
+        spec_begin(prompt, count, draft);
+        while (spec_advance()) {}
+        return spec_finish(stats);
+    }
 
 private:
     using Clock = std::chrono::steady_clock;
