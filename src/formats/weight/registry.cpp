@@ -49,6 +49,7 @@ void register_gsq_q2();
 void register_x3();
 void register_fp();
 void register_mxfp8();
+void register_nvfp4_gguf();
 }
 
 namespace {
@@ -70,6 +71,7 @@ void builtins() {
         formats::register_x3();
         formats::register_fp();
         formats::register_mxfp8();
+        formats::register_nvfp4_gguf();
     });
 }
 }  // namespace

@@ -7,10 +7,11 @@
 
 namespace tqllm_cuda::common {
 namespace {
-void check_launch(const char * what) {
+void check_launch_at(const char * what, int line) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + cudaGetErrorString(e));
+    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + cudaGetErrorString(e) + " (common_kernels.cu:" + std::to_string(line) + ")");
 }
+#define check_launch(what) check_launch_at((what), __LINE__)  // the message names the launcher's line
 int blocks(int n, int t) { return (n + t - 1) / t; }
 
 // one warp per row

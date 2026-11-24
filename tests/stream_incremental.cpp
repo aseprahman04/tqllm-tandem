@@ -13,7 +13,11 @@
 #include <random>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 struct GgufWriter {
@@ -60,6 +64,7 @@ std::string mock(const std::string & dir) {
     tokens.push_back("<|im_end|>"); types.push_back(3);   // 256: EOS
     tokens.push_back("</think>"); types.push_back(3);     // 257
     tokens.push_back("<|user|>"); types.push_back(3);     // 258: end of turn (GLM ends a turn with it, not with EOS)
+    tokens.push_back("<|content_text|>"); types.push_back(3);  // Inkling's visible channel
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_str("tokenizer.ggml.model", "gpt2");
@@ -77,7 +82,12 @@ std::vector<uint32_t> bytes(const std::string & s) {std::vector<uint32_t> v; for
 }  // namespace
 
 int main() {
-    const auto dir = std::filesystem::temp_directory_path() / ("tqllm_stream_" + std::to_string(::getpid()));
+#ifdef _WIN32
+    const auto pid = ::_getpid();
+#else
+    const auto pid = ::getpid();
+#endif
+    const auto dir = std::filesystem::temp_directory_path() / ("tqllm_stream_" + std::to_string(pid));
     std::filesystem::create_directories(dir);
     tqllm::Tokenizer tok;
     tok.load(mock(dir.string()));
@@ -171,6 +181,10 @@ int main() {
         tqserve::ChatRequest req; req.chat = true; req.thinking = true;
         tqserve::DecodeResult r;
         auto out = bytes("think it over"); out.push_back(257); for (auto b : bytes("answer")) out.push_back(b);
+        tqserve::split_reasoning(tok, req, out, r);
+        eog_ok = eog_ok && r.reasoning == "think it over" && r.text == "answer";
+        tqserve::serve_options().think_close = "<|content_text|>";
+        out[std::string("think it over").size()] = 259;
         tqserve::split_reasoning(tok, req, out, r);
         eog_ok = eog_ok && r.reasoning == "think it over" && r.text == "answer";
     }

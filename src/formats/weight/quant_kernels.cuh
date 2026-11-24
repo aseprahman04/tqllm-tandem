@@ -296,6 +296,11 @@ void tqt_dequant_i8(const uint8_t * w, const __half * sc, int8_t * out, float * 
 // 16 [rows][k / 16], FP32 global scale. x: [ncols][k] BF16 -> y: [ncols][rows] FP32. Reference kernel (not tuned).
 void nvfp4_matvec(const uint8_t * w, const uint8_t * sc, float gscale, const __nv_bfloat16 * x, float * y, int rows,
                   int k, int ncols, cudaStream_t);
+// ggml NVFP4 (GGUF type 40, block_nvfp4: 4 UE4M3 + 32 B E2M1 per 64 weights) expert matvec, decode in-register.
+// w: [experts * rows][k / 2] block_nvfp4 rows (k a multiple of 64); sc: [experts] F32 per-expert scale (1.0 if null);
+// ids: [n][topk] expert ids; x: [n][k] FP16; y: [n * topk][rows] BF16. Reference kernel (one warp per row, FP32 accumulate).
+void nvfp4_gguf_expert_matvec(const uint8_t * w, const float * sc, const __half * x, __nv_bfloat16 * y, int rows,
+                              int k, const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
 void tq4_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t);
 // Fused op + TQ4 rotation (identical to the op followed by tq4_rotate_h): swiglu of gu [n][2F]; attention sigmoid gate.
 void tq4_swiglu_rot_h(const __nv_bfloat16 * gu, int n, int F, __half * xh, cudaStream_t);
@@ -364,6 +369,12 @@ void bf16_to_f32(const __nv_bfloat16 * x, float * y, int n, cudaStream_t);
 void fp_matvec(bool bf16, const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t,
                int ldy = 0);  // ldy: output column stride (0 = rows)
 void fp_dequant_h(bool bf16, const void * w, __half * out, size_t n, cudaStream_t);
+// Grouped-expert matvec for dense BF16 / F16 stacked weights [experts * rows][k]; same semantics as
+// nvfp4_gguf_expert_matvec: y [n * topk][rows] BF16, ids [n * topk], x [n][k] (or [n * topk][k] when per_expert_input).
+void bf16_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                        const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
+void f16_expert_matvec(const void * w, const __half * x, __nv_bfloat16 * y, int rows, int k,
+                       const int * ids, int n, int topk, bool per_expert_input, cudaStream_t);
 // MXFP8: rows of k E4M3 bytes then the row's k / 32 E8M0 scales (k % 512 == 0); ldy 0 = rows
 void mxfp8_matvec(const void * w, const __half * x, void * y, bool f32_out, int rows, int k, int n, cudaStream_t, int ldy);
 void mxfp8_dequant_h(const void * w, __half * out, int rows, int k, cudaStream_t);
