@@ -101,6 +101,24 @@ Measured on 2x RTX 5060 Ti 16 GB with TQ_L:
 
 1,048,576 tokens does not fit 2x 16 GB with TQ_L: its KV alone is 15 GB.
 
+For a QSA-enabled Qwen3.8-27B checkpoint, enable sparse attention on both tensor-parallel ranks by passing
+`--qsa-from 49152` to `tqserve.exe` with `TQLLM_TP=1`. The weights must contain the QSA index. Use
+`--qsa-from off` to compare with dense attention on the same model and input.
+
+### Review a task with Pi on Windows
+
+Configure a Pi provider named `tql` with model ID `tqllm` pointing to your local Tandem server.
+With PowerShell 7 and Pi on PATH, run from the project being reviewed:
+
+```powershell
+& C:\path\to\pi-pel.ps1 -Tugas "Fix the failing inventory tests" -Cek .\verify.ps1 -Coba 2
+```
+
+The verifier script runs in the project directory. Exit code zero accepts the result. A failure supplies the next
+attempt with the verifier output in the same Pi session. `-Coba 2` permits two repairs after the first attempt.
+The bundled `pipel-compact.js` extension brings the task and latest verifier result back into context after compaction.
+For a Pi installation outside PATH, set `TANDEM_PI_BIN` to its executable.
+
 ## 6. Use it with apps and coding agents
 
 **One command for a terminal coding agent**: `tandem-agent.bat` starts the split server through tqLLM's launcher
