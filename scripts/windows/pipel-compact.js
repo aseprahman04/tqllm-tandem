@@ -12,11 +12,28 @@ function excerpt(file) {
 
 // Resolve only the sidecars that pipel itself creates beside the active session.
 export default function pipelCompact(pi) {
+    if (process.env.PIPEL_INKLING_PROVIDER) {
+        const { baseUrl, id, context } = JSON.parse(process.env.PIPEL_INKLING_PROVIDER);
+        const url = new URL(baseUrl);
+        if (url.protocol !== "http:" || !(url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(url.hostname)) ||
+            url.username || url.password || url.pathname !== "/v1" || url.search || url.hash ||
+            typeof id !== "string" || !id || !Number.isSafeInteger(context) || context <= 0) {
+            throw new Error("Invalid local Basalt provider configuration");
+        }
+        pi.registerProvider("tandem-inkling", {
+            name: "Local Basalt", baseUrl, apiKey: "local", api: "openai-completions",
+            models: [{ id, name: id, type: "chat", reasoning: true, input: ["text"], contextWindow: context,
+                maxTokens: Math.min(8192, Math.max(1, Math.floor(context / 2))),
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, maxTokensField: "max_tokens" } }],
+        });
+    }
     pi.registerFlag("tandem-effort", { type: "string", description: "Tandem reasoning effort for this attempt" });
     pi.on("before_provider_request", (event, ctx) => {
         const effort = pi.getFlag("tandem-effort");
         const payload = event.payload;
-        if (!effort || ctx.model?.provider !== "tql" || ctx.model?.id !== "tqllm" ||
+        const isTandem = ctx.model?.provider === "tql" && ctx.model?.id === "tqllm";
+        if (!effort || (!isTandem && ctx.model?.provider !== "tandem-inkling") ||
             !payload || !Array.isArray(payload.messages)) return;
         const budgets = { off: 0, low: 1024, medium: 3072, high: 6144, xhigh: 6144 };
         if (!Object.hasOwn(budgets, effort)) throw new Error("Unsupported Tandem reasoning effort: " + effort);

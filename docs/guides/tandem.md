@@ -127,6 +127,11 @@ For a Pi installation outside PATH, set `TANDEM_PI_BIN` to its executable.
 Use `-Pikir high` for a difficult first attempt. By default, a verifier failure enables a bounded thinking budget
 on the repair attempt. Set `-PikirUlang` to `off`, `low`, `medium`, `high`, or `xhigh` to choose its effort.
 
+For an Inkling 2 Mini model already loaded by a local Basalt server, pass its loopback URL to the same harness.
+For example, `./pi-pel.ps1 -InklingUrl http://127.0.0.1:8086/v1 -Pikir high -Cek ./verify.ps1 -Tugas "Implement the ticket"`.
+The harness reads the served model ID and context size from Basalt. Pi registers the provider for that invocation.
+After a failed check it can retry in the same session with the verifier's diagnostic.
+
 ## 6. Use it with apps and coding agents
 
 **One command for a terminal coding agent**: `tandem-agent.bat` starts the split server through tqLLM's launcher

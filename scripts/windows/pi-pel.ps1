@@ -3,11 +3,35 @@
 # -Cek: skrip dijalankan di direktori kerja; exit 0 = lulus; keluaran = alasan gagal. Gagal -> ulang dengan alasan; kegagalan dicatat ke pelajaran-usulan.txt
 param([Parameter(Mandatory, Position=0)][string]$Tugas, [string]$Cek, [ValidateRange(0,2147483646)][int]$Coba = 2, [switch]$Polos,
   [ValidateSet('off','low','medium','high','xhigh')][string]$Pikir,
-  [ValidateSet('off','low','medium','high','xhigh')][string]$PikirUlang = 'high')
+  [ValidateSet('off','low','medium','high','xhigh')][string]$PikirUlang = 'high',
+  [uri]$InklingUrl)
 $ErrorActionPreference = 'Stop'
 $piExecutable = if ($env:TANDEM_PI_BIN) { $env:TANDEM_PI_BIN } else { 'pi' }
 $usul = Join-Path $PSScriptRoot 'pelajaran-usulan.txt'
 $argsPi = @('--provider','tql','--model','tqllm','--print')
+$inklingTarget = $null
+if ($InklingUrl) {
+  if (-not $InklingUrl.IsAbsoluteUri -or $InklingUrl.Scheme -ne 'http' -or -not $InklingUrl.IsLoopback -or
+      $InklingUrl.UserInfo -or $InklingUrl.Query -or $InklingUrl.Fragment -or $InklingUrl.AbsolutePath.Trim('/') -notin '', 'v1') {
+    throw 'InklingUrl harus berupa URL HTTP loopback, misalnya http://127.0.0.1:8086/v1.'
+  }
+  $baseUrl = $InklingUrl.GetLeftPart([UriPartial]::Authority) + '/v1'
+  $catalog = Invoke-RestMethod -Uri "$baseUrl/models" -NoProxy -MaximumRedirection 0 -TimeoutSec 8
+  $models = @($catalog.data | Where-Object { $_.owned_by -eq 'basalt' -and $_.status.value -eq 'loaded' })
+  if ($models.Count -ne 1 -or $models[0].meta.n_ctx -lt 1) { throw 'Basalt harus sudah memuat satu model Inkling.' }
+  $m = $models[0]
+  $inklingTarget = @{ baseUrl=$baseUrl; id=$m.id; context=[int]$m.meta.n_ctx } | ConvertTo-Json -Compress
+  $argsPi = @('--provider','tandem-inkling','--model',$m.id,'--print')
+}
+function Invoke-LocalPi([string[]]$Options, [string]$PromptText) {
+  $previousTarget = $env:PIPEL_INKLING_PROVIDER
+  try {
+    $env:PIPEL_INKLING_PROVIDER = $inklingTarget
+    & $piExecutable @Options $PromptText
+  } finally {
+    $env:PIPEL_INKLING_PROVIDER = $previousTarget
+  }
+}
 $p = $Tugas
 if (-not $Polos -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pelajaran-kunci.txt'))) {
   $tmp = [IO.Path]::GetTempFileName()
@@ -21,8 +45,9 @@ if (-not $Polos -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pelajaran
   }
 }
 if (-not $Cek) {
-  if ($Pikir) { $argsPi += @('--extension',(Join-Path $PSScriptRoot 'pipel-compact.js'),'--tandem-effort',$Pikir) }
-  & $piExecutable @argsPi $p
+  if ($Pikir -or $InklingUrl) { $argsPi += @('--extension',(Join-Path $PSScriptRoot 'pipel-compact.js')) }
+  if ($Pikir) { $argsPi += @('--tandem-effort',$Pikir) }
+  Invoke-LocalPi $argsPi $p
   exit $LASTEXITCODE
 }
 $cekPath = (Get-Item -LiteralPath $Cek -ErrorAction Stop).FullName
@@ -45,7 +70,7 @@ for ($i = 0; $i -le $Coba; $i++) {
   $effort = if ($i -eq 0) { $Pikir } else { $PikirUlang }
   $attemptArgs = $argsPi
   if ($effort) { $attemptArgs += @('--tandem-effort',$effort) }
-  & $piExecutable @attemptArgs $p
+  Invoke-LocalPi $attemptArgs $p
   if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   $alasan = (& pwsh -NoProfile -File $cekPath 2>&1) -join "`n"
