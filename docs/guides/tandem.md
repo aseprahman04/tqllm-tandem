@@ -105,6 +105,12 @@ For a QSA-enabled Qwen3.8-27B checkpoint, enable sparse attention on both tensor
 `--qsa-from 49152` to `tqserve.exe` with `TQLLM_TP=1`. The weights must contain the QSA index. Use
 `--qsa-from off` to compare with dense attention on the same model and input.
 
+With prompt caching enabled, single-slot tensor parallelism can reuse the start of a long document across independent
+edits and compactions. After a cache miss, the engine compares the two token sequences. If at least 65,536 tokens
+match and the changed suffix is at most 8,192 tokens, it keeps the recurrent state at the last ordinary prefill
+chunk boundary within that prefix. Subsequent requests still compare the actual token IDs before reusing the checkpoint.
+The request monitor reports the reused count in `prefill_cached_tokens`.
+
 ### Review a task with Pi on Windows
 
 Configure a Pi provider named `tql` with model ID `tqllm` pointing to your local Tandem server.
