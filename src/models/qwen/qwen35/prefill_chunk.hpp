@@ -48,4 +48,16 @@ inline uint32_t kept_state_at(uint32_t prompt, uint32_t from, uint32_t chunk, ui
     const uint32_t grid = (prompt - tail) / chunk * chunk;
     return grid > from ? grid : 0;
 }
+
+// A long request that changes a short suffix can miss the final chat checkpoint on every turn.
+// Keep the last completed ordinary prefill chunk inside its proven common prefix.
+inline constexpr uint32_t kBranchMinPrefix = 65536;
+inline constexpr uint32_t kBranchMaxTail = 8192;
+inline uint32_t shared_chunk_boundary(const std::vector<uint32_t> & starts, uint32_t common, uint32_t prompt,
+                                      uint32_t chunk) {
+    if (!chunk || common < kBranchMinPrefix || common > prompt || prompt - common > kBranchMaxTail) return 0;
+    const auto next = std::upper_bound(starts.begin(), starts.end(), common);
+    const uint32_t segment = next == starts.begin() ? 0 : *(next - 1);
+    return segment + (common - segment) / chunk * chunk;
+}
 }  // namespace tqllm

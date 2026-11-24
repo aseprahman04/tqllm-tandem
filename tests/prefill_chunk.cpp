@@ -87,6 +87,13 @@ int main() {
     if (tqllm::chunk_end({}, 0, 20000, 8192) != 8192 || tqllm::chunk_end({}, 8192, 20000, 8192) != 16384)
         { std::fprintf(stderr, "FAIL no message starts: the plain grid\n"); ++failures; }
     if (tqllm::kept_state_msg({}, 20000, 0) != 0) { std::fprintf(stderr, "FAIL no message starts: nothing kept by this rule\n"); ++failures; }
+    const std::vector<uint32_t> messages{13, 65001, 70030};
+    expect(tqllm::shared_chunk_boundary(messages, 70029, 75000, 512), 69609, "rewind to a natural chunk within a message");
+    expect(tqllm::shared_chunk_boundary(messages, 70030, 75000, 512), 70030, "an exact message boundary");
+    expect(tqllm::shared_chunk_boundary({}, 70030, 75000, 512), 69632, "raw tokens use the original grid");
+    expect(tqllm::shared_chunk_boundary(messages, 60000, 60500, 512), 0, "short prefix keeps the ordinary checkpoint");
+    expect(tqllm::shared_chunk_boundary(messages, 66000, 80000, 512), 0, "large suffix keeps the ordinary checkpoint");
+    expect(tqllm::shared_chunk_boundary(messages, 76000, 75000, 512), 0, "common prefix cannot exceed the request");
     if (failures) return 1;
     std::puts("prefill_chunk: ok");
     return 0;

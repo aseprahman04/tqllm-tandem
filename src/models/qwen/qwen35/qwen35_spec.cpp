@@ -239,6 +239,13 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
     if (pc_on && images.empty()) park_swap(prompt);
     const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
+    uint32_t common = 0;
+    if (tp && pc_on && images.empty() && !P0 && pc_snap && P >= kBranchMinPrefix && pc_seq.size() >= kBranchMinPrefix) {
+        const auto mismatch = std::mismatch(prompt.begin(), prompt.end(), pc_seq.begin(), pc_seq.end());
+        common = uint32_t(mismatch.first - prompt.begin());
+    }
+    const bool keep_branch = pc_branch_snap && P0 == pc_branch_snap && P - P0 <= kBranchMaxTail;
+    if (!keep_branch) pc_branch_snap = 0;
     if (pc_on && !P0) pc_conv = ++conv_clock;  // a new conversation in this slot
     if (P0 < pc_snap) pc_snap = 0;
     pc_live = false;
@@ -262,7 +269,11 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         std::vector<uint32_t> starts;
         if (im_start_ != ~0u && !tf_path)
             for (uint32_t i = 1; i < P; ++i) if (prompt[i] == im_start_) starts.push_back(i);
-        const uint32_t snap = !pc_on ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
+        uint32_t snap = !pc_on || keep_branch ? 0 : !starts.empty() ? kept_state_msg(starts, P, P0) : kept_state_at(P, P0, uint32_t(CH), kTail);
+        if (common && !tf_path) {
+            pc_branch_snap = shared_chunk_boundary(starts, common, P, uint32_t(CH));
+            if (pc_branch_snap) snap = pc_branch_snap;
+        }
         const size_t chunks = (P - P0 + CH - 1) / CH + 1 + starts.size();  // + the split at snap and at each message start
         HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
         HostBuf staged_pos(chunks * 4 * sizeof(int));  // fork: the second half holds the --mtp prompt passes' positions

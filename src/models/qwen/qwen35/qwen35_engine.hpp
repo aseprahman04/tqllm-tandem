@@ -207,7 +207,7 @@ public:
         cmp_pos = 0, ring_used = 0;
         cmp_upload();
     }
-    void pc_drop() { pc_live = false, pc_snap = 0; }
+    void pc_drop() { pc_live = false, pc_snap = 0, pc_branch_snap = 0; }
     void pc_copy(bool save);
     // cache positions of prompt that can be kept (the recurrent state is set to match); the rest is prefilled
     uint32_t pc_match(const std::vector<uint32_t> & prompt);
@@ -387,6 +387,7 @@ private:
     static constexpr uint32_t kTail = 64;
     bool pc_on = false, pc_live = false;
     uint32_t pc_snap = 0;
+    uint32_t pc_branch_snap = 0;  // single-slot TP checkpoint learned from two long requests that share a prefix
     std::vector<uint32_t> pc_seq;
     std::unique_ptr<HostBuf> pc_host;
     uint64_t pc_conv = 0, conv_clock = 0;  // the active slot's conversation (0: none kept)
