@@ -145,6 +145,12 @@ The native CUDA Inkling loader accepts both `inkling2` and `inkling2_loop` GGUF 
 The prefix, suffix and output head run on device 0. Activations cross devices when entering and leaving the
 core. A numeric split such as `TQLLM_SPLIT=18` places all layers before that index on device 1.
 
+Set `TQLLM_INKLING2_LOOPCD=adaptive` before starting the Inkling server to enable
+adaptive LoopCD. It runs a second coda with independent attention and convolution
+history from core pass one. Sampling contrasts its soft-capped logits with the final
+head using a maximum strength of 0.5. This mode requires additional KV memory
+proportional to context length. The default is `off`.
+
 ## 6. Use it with apps and coding agents
 
 **One command for a terminal coding agent**: `tandem-agent.bat` starts the split server through tqLLM's launcher

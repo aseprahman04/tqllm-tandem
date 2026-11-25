@@ -135,6 +135,13 @@ public:
         if (sync_) std::fprintf(stderr, "inkling2: TQLLM_INKLING2_SYNC=%d: device sync + error check after every group of operations (diagnostic, slow)\n", sync_);
         meta_ = gguf_open(path);
         configure();
+        if (const char * mode = std::getenv("TQLLM_INKLING2_LOOPCD"); mode && *mode) {
+            loopcd_ = std::strcmp(mode, "adaptive") == 0;
+            if (!loopcd_ && std::strcmp(mode, "off") != 0)
+                throw std::invalid_argument("TQLLM_INKLING2_LOOPCD must be off or adaptive");
+            if (loopcd_ && n_pass_ < 2) throw std::invalid_argument("LoopCD requires multiple core passes");
+        }
+        std::fprintf(stderr, "inkling2: LoopCD %s\n", loopcd_ ? "adaptive (reference pass 1, omega_max 0.5)" : "off");
         split_setup();
         map_files(meta_);
         load();
@@ -166,9 +173,8 @@ public:
         // tqserve runs every request on a thread of its own, and a new thread starts on CUDA device 0: make the device
         // of the stage this engine is on current before any of that stage's streams is used.
         ck(cudaSetDevice(cuda_of_[cur_dev_]));
-        run_token(tok, pos);
+        run_token(tok, pos, sample);
         if (sample) {
-            compute_logits();
             return next_token();
         }
         return 0;
@@ -234,6 +240,7 @@ private:
     std::vector<uint32_t> generated_;
     uint32_t next_pos_ = 0, remaining_ = 0;
     bool ignore_eos_ = false;
+    bool loopcd_ = false;
     // ---- config ----
     uint32_t context_ = 32768, eos_ = 0;
     int H_ = 0, n_visits_ = 0, n_pass_ = 1, n_layers_ = 0;
@@ -295,6 +302,7 @@ private:
         Buf blocks_;     // [n_blocks][C] block states
         Buf prev_bank_;
         Buf prev_h_;     // [C] previous pass's final stream (for loop messages)
+        Buf ref_h_, ref_blocks_, ref_logits_;
         Buf logits_;     // [vocab] F32 on the output stage
         Buf sample_scratch_, candidates_;
         Buf s1_, s2_, s3_, s4_;
@@ -646,11 +654,19 @@ private:
             S.projected_half_ = Buf(2 * (2 * qd + 2 * n_kv_ * hd_ + n_head_ * d_rel_ + n_head_));
             if (d == head_stage()) {
                 S.logits_ = Buf(size_t(vocab_) * sizeof(float));
+                if (loopcd_) S.ref_logits_ = Buf(S.logits_.bytes);
                 S.sample_scratch_ = Buf(64 * 16 * (sizeof(float) + sizeof(uint32_t)));
                 S.candidates_ = Buf(sizeof(Candidates));
             }
+            if (loopcd_ && d == dev_of(core0_)) {
+                S.ref_h_ = Buf(S.h_.bytes);
+                S.ref_blocks_ = Buf(S.blocks_.bytes);
+            }
         }
-        visits_.resize(phys_.size());
+        // Both codas read causal history, including on non-sampled prefill tokens.
+        auto cache_layers = phys_;
+        if (loopcd_) for (int l = core1_; l < n_layers_; ++l) cache_layers.push_back(l);
+        visits_.resize(cache_layers.size());
         const size_t kd = size_t(n_kv_) * hd_;
         // Repeated visits share weights, but each has an independent cache and convolution history.
         for (int stage = 0; stage <= head_stage(); ++stage) {
@@ -659,7 +675,7 @@ private:
             s.kv_memory = make_cuda_kv_memory(stream_[stage]);
             for (int ring = 0; ring < 2; ++ring) {
                 int count = 0;
-                for (int layer : phys_) if (dev_of(layer) == stage && sliding_[layer] == bool(ring)) ++count;
+                for (int layer : cache_layers) if (dev_of(layer) == stage && sliding_[layer] == bool(ring)) ++count;
                 if (!count) continue;
                 const uint32_t capacity = ring ? std::min(context_, uint32_t(window_)) : context_;
                 KvGeometry g{count, kd * sizeof(__half), kd * sizeof(__half), capacity};
@@ -667,8 +683,8 @@ private:
                 KvPool & pool = *s.kv_pool[ring];
                 const int page = pool.take(KvTier::device);
                 int cache = 0;
-                for (size_t v = 0; v < phys_.size(); ++v) {
-                    const int layer = phys_[v];
+                for (size_t v = 0; v < cache_layers.size(); ++v) {
+                    const int layer = cache_layers[v];
                     if (dev_of(layer) != stage || sliding_[layer] != bool(ring)) continue;
                     visits_[v].keys = static_cast<__half *>(pool.page_ptr(KvTier::device, cache, true, page));
                     visits_[v].values = static_cast<__half *>(pool.page_ptr(KvTier::device, cache, false, page));
@@ -677,7 +693,7 @@ private:
             }
         }
         for (size_t v = 0; v < visits_.size(); ++v) {
-            const int layer = phys_[v];
+            const int layer = cache_layers[v];
             set_dev_for_alloc(dev_of(layer));
             VisitState & state = visits_[v];
             state.k_hist = Buf(size_t(taps_ - 1) * kd * sizeof(__half));
@@ -699,7 +715,7 @@ private:
         ck_at(cudaGetLastError(), line);
     }
 
-    void run_token(uint32_t tok, uint32_t pos) {
+    void run_token(uint32_t tok, uint32_t pos, bool sample) {
         if (pos >= context_ || tok >= uint32_t(vocab_)) throw std::out_of_range("inkling2: token or position out of range");
         if (sync_) where_ = " [pos " + std::to_string(pos) + "]";
         use_dev(dev_of(0));
@@ -714,6 +730,7 @@ private:
         ck(cudaMemcpyAsync(first.h_.p, e.data(), H_ * sizeof(__half), cudaMemcpyHostToDevice, stream()));
         tqllm_cuda::ik2_rms_norm(first.h_.as<__half>(), embd_norm_, eps_, H_, first.h_.as<__half>(), stream());
         n_blocks_ = 0;
+        int ref_nb = 0;
         // pre-core layers
         for (int l = 0; l < core0_; ++l) {
             if (dev_of(l) != cur_dev_) { hop_to(dev_of(l)); use_dev(dev_of(l)); }
@@ -742,6 +759,12 @@ private:
                     int v = core0_ + p * (core1_ - core0_) + (l - core0_);
                     visit(l, v, p, pos, nullptr, 0);
                 }
+                if (loopcd_ && p == 0) {
+                    ref_nb = n_blocks_;
+                    ck(cudaMemcpyAsync(S.ref_h_.p, S.h_.p, S.h_.bytes, cudaMemcpyDeviceToDevice, stream()));
+                    ck(cudaMemcpyAsync(S.ref_blocks_.p, S.blocks_.p, size_t(ref_nb) * S.h_.bytes,
+                                       cudaMemcpyDeviceToDevice, stream()));
+                }
                 if (p < n_pass_ - 1) {
                     ck(cudaMemcpyAsync(S.prev_h_.p, S.h_.p, H_ * 2, cudaMemcpyDeviceToDevice, stream()));
                     prev_nb_ = n_blocks_ - pre_nb - 1;
@@ -751,14 +774,32 @@ private:
                 }
             }
         }
-        // post-core layers
+        run_coda(pos, core1_ + (n_pass_ - 1) * (core1_ - core0_));
+        if (sample) compute_logits(st_[head_stage()].logits_);
+        if (loopcd_) {
+            use_dev(dev_of(core0_));
+            Stage & core = st();
+            n_blocks_ = ref_nb;
+            ck(cudaMemcpyAsync(core.h_.p, core.ref_h_.p, core.h_.bytes, cudaMemcpyDeviceToDevice, stream()));
+            ck(cudaMemcpyAsync(core.blocks_.p, core.ref_blocks_.p, size_t(ref_nb) * core.h_.bytes,
+                               cudaMemcpyDeviceToDevice, stream()));
+            run_coda(pos, int(phys_.size()));
+            if (sample) {
+                Stage & head = st_[head_stage()];
+                compute_logits(head.ref_logits_);
+                tqllm_cuda::ik2_loopcd(head.logits_.as<float>(), head.ref_logits_.as<float>(),
+                                       vocab_unpadded_, head.sample_scratch_.as<float>(), stream());
+            }
+        }
+    }
+    void run_coda(uint32_t pos, int first_visit) {
         for (int l = core1_; l < n_layers_; ++l) {
             if (split_at_ && dev_of(l) != cur_dev_) {
                 hop_to(dev_of(l));  // move h_ + blocks_ to the next stage
                 use_dev(dev_of(l));
                 sync_check("hop of the stream and the blocks to the next stage");
             }
-            visit(l, l + (n_pass_ - 1) * (core1_ - core0_), 0, pos, nullptr, 0);
+            visit(l, first_visit + l - core1_, 0, pos, nullptr, 0);
         }
     }
     // Move the residual vector (and block states) from the current stage to stage d across PCIe.
@@ -1025,7 +1066,7 @@ private:
 
     int e_ff_ = 0;  // expert feed-forward width (set in load)
 
-    void compute_logits() {
+    void compute_logits(Buf & logits) {
         // The output projection and its normalization share the final stage.
         if (cur_dev_ != head_stage()) hop_to(head_stage());
         use_dev(head_stage());
@@ -1036,8 +1077,8 @@ private:
         __half * hnorm = S.s2_.as<__half>();
         tqllm_cuda::ik2_rms_norm(hres, out_norm_, eps_, H_, hnorm, stream());
         sync_check("head: residual mix + output norm");
-        gemm_h(out_, hnorm, S.logits_.as<float>(), 1);
-        tqllm_cuda::ik2_softcap(S.logits_.as<float>(), vocab_unpadded_, logit_cap_, stream());
+        gemm_h(out_, hnorm, logits.as<float>(), 1);
+        tqllm_cuda::ik2_softcap(logits.as<float>(), vocab_unpadded_, logit_cap_, stream());
         sync_check("head: output projection + softcap");
     }
 

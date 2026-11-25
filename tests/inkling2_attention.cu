@@ -129,6 +129,27 @@ static void check_expert_rows() {
 }
 
 int main() {
+    // Cross-warp tie, unequal top two, highly confident final head, and untouched padding.
+    for (float peak : {2.f, 4.f, 28.f}) {
+        constexpr int vocab = 515;
+        Buffer<float> logits(vocab + 1), ref(vocab + 1), scratch(1);
+        for (int i = 0; i < vocab; ++i) {
+            logits.host[i] = float(i % 9 - 6) * 0.125f;
+            ref.host[i] = float(i % 7 - 3);
+        }
+        logits.host[13] = peak; logits.host[510] = 2.f; logits.host[vocab] = 123.f;
+        const auto before = logits.host;
+        logits.upload(); ref.upload();
+        tqllm_cuda::ik2_loopcd(logits.device, ref.device, vocab, scratch.device, nullptr);
+        check(cudaMemcpy(logits.host.data(), logits.device, (vocab + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+        double sum = 0;
+        for (int i = 0; i < vocab; ++i) sum += std::exp(double(before[i] - peak));
+        const double w = 0.5 * (1.0 - (1.0 - std::exp(2.0 - peak)) / sum);
+        for (int i = 0; i < vocab; ++i)
+            if (std::abs(logits.host[i] - (before[i] + w * (before[i] - ref.host[i]))) > 1e-5)
+                throw std::runtime_error("adaptive LoopCD differs from the full-vocabulary CPU oracle");
+        if (logits.host[vocab] != 123.f) throw std::runtime_error("LoopCD touched padded vocabulary");
+    }
     for (int p : {0, 1022, 1023, 1024, 1258, 4096}) {
         compare(p, false);
         compare(p, true);

@@ -393,6 +393,50 @@ void ik2_expert_sum(const __nv_bfloat16 * rows, const int * ids, const float * s
     launched();
 }
 
+// Use the full unpadded softmax for the confidence gap, including ties.
+__global__ void loopcd_confidence_k(const float * z, int vocab, float * weight) {
+    __shared__ float best[256], second[256], sums[256];
+    const int t = threadIdx.x;
+    float a = -CUDART_INF_F, b = -CUDART_INF_F;
+    for (int i = t; i < vocab; i += blockDim.x) {
+        const float v = z[i];
+        b = fmaxf(b, fminf(a, v));
+        a = fmaxf(a, v);
+    }
+    best[t] = a;
+    second[t] = b;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) {
+        if (t < s) {
+            const float x = best[t], y = best[t + s];
+            second[t] = fmaxf(fmaxf(second[t], second[t + s]), fminf(x, y));
+            best[t] = fmaxf(x, y);
+        }
+        __syncthreads();
+    }
+    float sum = 0.f;
+    for (int i = t; i < vocab; i += blockDim.x) sum += expf(z[i] - best[0]);
+    sums[t] = sum;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) {
+        if (t < s) sums[t] += sums[t + s];
+        __syncthreads();
+    }
+    if (t == 0) *weight = 0.5f * (1.f - (1.f - expf(second[0] - best[0])) / sums[0]);
+}
+
+__global__ void loopcd_mix_k(float * z, const float * ref, int vocab, const float * weight) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vocab) z[i] += *weight * (z[i] - ref[i]);
+}
+
+void ik2_loopcd(float * final, const float * reference, int vocab, float * scratch, cudaStream_t s) {
+    loopcd_confidence_k<<<1, 256, 0, s>>>(final, vocab, scratch);
+    launched();
+    loopcd_mix_k<<<(vocab + 255) / 256, 256, 0, s>>>(final, reference, vocab, scratch);
+    launched();
+}
+
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s) {
     softcap_k<<<(unpadded + 255) / 256, 256, 0, s>>>(logits, unpadded, cap);
     launched();

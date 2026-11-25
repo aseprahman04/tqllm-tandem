@@ -47,6 +47,8 @@ void ik2_expert_sum(const __nv_bfloat16 * rows, const int * ids, const float * s
                     int count, int width, __half * output, cudaStream_t stream);
 // logits[i] = cap * tanh(logits[i] / cap) for i < unpadded
 void ik2_softcap(float * logits, int unpadded, float cap, cudaStream_t s);
+// Adaptive LoopCD on soft-capped logits. scratch holds one device float.
+void ik2_loopcd(float * final, const float * reference, int vocab, float * scratch, cudaStream_t stream);
 // hist [taps-1][C] <- shift + append cur [C]
 void ik2_conv_hist_update(__half * hist, const __half * cur, int taps, int C, cudaStream_t s);
 // y[i] = a[i] + b[i]  (device-resident residual add)
