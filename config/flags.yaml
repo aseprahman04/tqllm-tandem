@@ -15,6 +15,10 @@ flags:
     kind: user
     default: "off"
     doc: "Inkling 2 only: adaptive contrasts the final head with a separate first-pass coda and head (maximum strength 0.5); off uses standard decoding"
+  - name: TQLLM_INKLING2_SYNC
+    kind: debug
+    default: "0"
+    doc: "Synchronize the Inkling CUDA device after each group of operations to locate errors; 2 also logs each checkpoint"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"
