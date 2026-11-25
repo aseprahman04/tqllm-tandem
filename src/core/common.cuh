@@ -92,6 +92,20 @@ __host__ __device__ inline int tq_split_point(int qpos) {
     return qpos >= TREE_MAX_DEPTH ? (qpos - TREE_MAX_DEPTH) / 32 * 32 : 0;
 }
 
+// A node at depth z in a topologically ordered tree is on the physical chain 0..z.
+__device__ inline int tq_tree_depth(int z, const int *par, const int *depth) {
+    if (depth) return depth[z];
+    int n = 0;
+    for (int a = par[z]; a >= 0; a = par[a]) ++n;
+    return n;
+}
+
+__device__ inline int tq_tree_slot(int position, int base, int z, int depth, const int *par) {
+    if (position < base || depth == z) return position;
+    for (int hops = base + depth - position; hops > 0; --hops) z = par[z];
+    return base + z;
+}
+
 // L1 for streaming matvec kernels (host, once per kernel): the smallest shared-memory carveout that keeps the kernel's
 // full occupancy. The driver default for a kernel with a few KB of static shared memory is a 64 KB carveout (L1 ~60 KB on
 // sm_86), too small for the 8-column activations (80-280 KB) that every 16-row block re-reads; with 32 KB the TQT verify

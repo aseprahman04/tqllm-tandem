@@ -544,7 +544,7 @@ __global__ void tq3_inverse_k(__nv_bfloat16 * y, int64_t nblocks) {
 // A node's result depends only on its path, so it equals that path verified as a chain.
 template <class KC, class VC>
 __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q, const uint8_t * kc, const uint8_t * vc,
-                                                        const float * part, const int * dseq0, const int * par, int heads,
+                                                        const float * part, const int * dseq0, const int * par, const int * dep, int heads,
                                                         int kvheads, float scale, int nsplit, int pstride,
                                                         __nv_bfloat16 * y) {
     constexpr int DIM = 256, MAXK = TREE_MAX_DEPTH + 33;
@@ -560,12 +560,11 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
     if constexpr (VT)
         for (int i = d; i < 256; i += DIM) reinterpret_cast<__half *>(s_cbv)[i] = __float2half_rn(tcq::CB2V[i]);
     const int pos = *dseq0 - 1, kh = h / (heads / kvheads);
-    int path[tqllm::kCopyVerifyColumns], len = 0;
-    for (int a = z; a >= 0; a = par[a]) path[len++] = a;  // z .. root; depth e is path[len - 1 - e]
-    const int qpos = pos + len - 1, from = tq_split_point(qpos), nk = qpos - from + 1;
+    const int depth = tqllm_dev::tq_tree_depth(z, par, dep);
+    const int qpos = pos + depth, from = tq_split_point(qpos), nk = qpos - from + 1;
     if (d < nk) {
         const int p = from + d;
-        slot[d] = p < pos ? p : pos + path[len - 1 - (p - pos)];
+        slot[d] = tqllm_dev::tq_tree_slot(p, pos, z, depth, par);
     }
     // Q into the K basis: signs, WHT over 32 (TQ3_0) or 128 (TCQ) values, then the codec's normalisation
     constexpr int WB = KC::ROT128 ? 128 : 32;
@@ -886,7 +885,7 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
         }
         attn_tq3kv_k<4, KC, VC, 1, true><<<dim3(kh, nq, nsplit), 4 * 32, tq3a::smem<4, 1>(), s>>>(
             q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, dep, ps, 0, nullptr, 0, nullptr, 0, 0, qsa_sel, qsa_from);
-        attn_blk_codec_k<KC, VC><<<dim3(h, nq), 256, 0, s>>>(q, k, v, part, dseq0, par, h, kh, scale, nsplit, ps, y);
+        attn_blk_codec_k<KC, VC><<<dim3(h, nq), 256, 0, s>>>(q, k, v, part, dseq0, par, dep, h, kh, scale, nsplit, ps, y);
         inverse_v<VC>(y, nq, h, s);
         return;
     }
@@ -902,7 +901,7 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
         }
         // the spare slot nsplit takes the stand-in segment; the block kernel then merges nsplit + 1 partials
         if (cs) compact_partial(q, *cs, part, nq, h, kh, scale, ps, nsplit, s);
-        attn_blk_codec_k<KC, VC><<<dim3(h, nq), 256, 0, s>>>(q, k, v, part, dseq0, par, h, kh, scale, nsplit + (cs ? 1 : 0), ps, y);
+        attn_blk_codec_k<KC, VC><<<dim3(h, nq), 256, 0, s>>>(q, k, v, part, dseq0, par, dep, h, kh, scale, nsplit + (cs ? 1 : 0), ps, y);
         inverse_v<VC>(y, nq, h, s);
         return;
     }
