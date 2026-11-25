@@ -15,6 +15,7 @@
 // step. Per row and column the k split, MMA order and 8-warp reduction do not depend on MT, PF, the grid or the column
 // count: the same numbers in every configuration (tests/tqv12_format.cu).
 #include "common.cuh"
+#include "verify_columns.hpp"
 #include "quant_kernels.cuh"
 
 #include <cuda_bf16.h>
@@ -78,7 +79,7 @@ template <int NCOL, int MT, int PF, class OUT>
 __global__ void __launch_bounds__(256, 2) tqv12_matvec_k(const uint4 * __restrict__ w, const __half * __restrict__ sc,
                                                          const __half * __restrict__ xh, OUT * __restrict__ y, int rows,
                                                          int k, int nc, int ldy) {
-    constexpr int NACC = NCOL > 8 ? 8 : 4;
+    constexpr int GROUPS = NCOL / 8, NACC = 4 * GROUPS;
     __shared__ uint32_t tb[4096];
     __shared__ float red[8][32][MT * NACC];
     // the table goes to shared memory after the first tile's first weight loads are issued (its L2 latency overlaps them)
@@ -109,25 +110,18 @@ __global__ void __launch_bounds__(256, 2) tqv12_matvec_k(const uint4 * __restric
                     q.s[m][h] = __half2float(sc[r * ng + b / 4]);
                 }
         };
-        auto loadx = [&](int b, uint4 * x4, uint4 * x42) {
+        auto loadx = [&](int b, uint4 (&x4)[GROUPS][4]) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i) x4[i] = x42[i] = make_uint4(0, 0, 0, 0);
-            if (g < nc) {
-                const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(g) * k + int64_t(b) * 32);
+            for (int group = 0; group < GROUPS; ++group) {
+                const int col = g + 8 * group;
 #pragma unroll
-                for (int i = 0; i < 4; ++i) x4[i] = __ldg(&xp[i]);
-            }
-            if constexpr (NCOL > 8) {
-                if (g + 8 < nc) {
-                    const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(g + 8) * k + int64_t(b) * 32);
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) x42[i] = __ldg(&xp[i]);
+                for (int i = 0; i < 4; ++i) {
+                    x4[group][i] = col < nc ? __ldg(reinterpret_cast<const uint4 *>(xh + int64_t(col) * k + int64_t(b) * 32) + i)
+                                            : make_uint4(0, 0, 0, 0);
                 }
             }
         };
-        auto step = [&](const Q & cur, const uint4 * x4, const uint4 * x42) {
-            const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4);
-            const uint32_t * xw2 = reinterpret_cast<const uint32_t *>(x42);
+        auto step = [&](const Q & cur, const uint4 (&x4)[GROUPS][4]) {
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
                 float tmp[NACC] = {};
@@ -137,8 +131,11 @@ __global__ void __launch_bounds__(256, 2) tqv12_matvec_k(const uint4 * __restric
                     uint32_t a01, a23, b01, b23;
                     tqvk::decode(tb[tqvk::idx12(qa.x, qa.y, qa.z, u)], qa.w, u, a01, a23);
                     tqvk::decode(tb[tqvk::idx12(qb.x, qb.y, qb.z, u)], qb.w, u, b01, b23);
-                    mma_f16(tmp, a01, b01, a23, b23, xw[2 * u], xw[2 * u + 1]);
-                    if constexpr (NCOL > 8) mma_f16(tmp + 4, a01, b01, a23, b23, xw2[2 * u], xw2[2 * u + 1]);
+#pragma unroll
+                    for (int group = 0; group < GROUPS; ++group) {
+                        const uint32_t * xw = reinterpret_cast<const uint32_t *>(x4[group]);
+                        mma_f16(tmp + 4 * group, a01, b01, a23, b23, xw[2 * u], xw[2 * u + 1]);
+                    }
                 }
 #pragma unroll
                 for (int hh = 0; hh < NACC / 4; ++hh) {
@@ -163,9 +160,9 @@ __global__ void __launch_bounds__(256, 2) tqv12_matvec_k(const uint4 * __restric
             if constexpr (PF == 1) {  // next step's weights in flight
                 if (b0 + 32 < nb) loadq(b + 32, nxt);
             }
-            uint4 x4[4], x42[4];
-            loadx(b, x4, x42);
-            step(cur, x4, x42);
+            uint4 x4[GROUPS][4];
+            loadx(b, x4);
+            step(cur, x4);
             if constexpr (PF == 0) {
                 if (b0 + 32 < nb) loadq(b + 32, nxt);
             }
@@ -239,7 +236,7 @@ template <class OUT>
 void tqv12_launch(const uint8_t * w, const __half * sc, const __half * xh, OUT * y, int rows, int k, int nc, int ldy, int variant,
                   cudaStream_t s) {
     if (k % 128) throw std::invalid_argument("tqv12_matvec: k must be a multiple of 128");
-    if (nc < 1 || nc > 16) throw std::invalid_argument("tqv12_matvec: 1..16 columns");
+    if (nc < 1 || nc > tqllm::kReplayColumns) throw std::invalid_argument("tqv12_matvec: unsupported column count");
     if (ldy == 0) ldy = rows;
     const TqvPick p = tqv12_pick(rows, k, nc, variant);
     const auto * w4 = reinterpret_cast<const uint4 *>(w);
@@ -254,7 +251,8 @@ void tqv12_launch(const uint8_t * w, const __half * sc, const __half * xh, OUT *
         }
     };
     if (nc <= 8) by(std::integral_constant<int, 8>{});
-    else by(std::integral_constant<int, 16>{});
+    else if (nc <= 16) by(std::integral_constant<int, 16>{});
+    else if constexpr (tqllm::kReplayColumns > 16) by(std::integral_constant<int, tqllm::kReplayColumns>{});
 }
 
 // FP16 [rows][k]: one thread per 32-weight segment, four 16-byte stores

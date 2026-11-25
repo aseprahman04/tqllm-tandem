@@ -1,3 +1,4 @@
+#include "verify_columns.hpp"
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 #include "gguf.hpp"
@@ -15,7 +16,7 @@ namespace {
 struct Tqv12 final : WeightFormat {
     const char * name() const override { return "TQV12"; }
     Basis basis() const override { return Basis::Tq4Rot128; }
-    int max_matvec_cols() const override { return 16; }  // single-request tree verify up to 16 nodes (as TQ4)
+    int max_matvec_cols() const override { return tqllm::kReplayColumns; }
     Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t) const override {
         if (cols % 128) throw std::runtime_error("TQV12: the row length must be a multiple of 128");
         const int64_t ng = int64_t(rows) * cols / 128;
