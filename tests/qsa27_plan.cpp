@@ -23,17 +23,15 @@ int main() {
         QsaPlan p;
         for (int pos = 0; pos < 4096; pos += 512) CHECK(p.write(pos, 512, true, false, from).mode == 0);
         CHECK(p.keyed == 4096 && p.made == 0);
-        const int crossing = from + tqllm::kReplayColumns - 1;
-        const int start = crossing - 7;  // the final five rows of the next block are sparse
-        CHECK(p.write(from, start - from, true, true, from).mode == 0);
-        auto s = p.write(start, 12, true, true, from);
+        CHECK(p.write(4096, 8, true, true, from).mode == 0);  // split(4103) = 4064
+        auto s = p.write(4104, 12, true, true, from);          // rows at 4104 .. 4115: split 4096 from row 4111
         CHECK(s.mode == 2 && s.pool_first == 0 && s.pool_count == 1024 && p.made == 1024);
         // 5 of the 12 rows accepted: the next block starts inside the rows just written
-        s = p.write(start + 5, 12, true, true, from);
-        CHECK(s.mode == 2 && s.pool_count == 0 && p.keyed == start + 17);
+        s = p.write(4109, 12, true, true, from);
+        CHECK(s.mode == 2 && s.pool_count == 0 && p.keyed == 4121);
         s = p.write(4160, 12, true, true, from);  // a gap (rows 4121 .. 4159 never keyed): dense
-        CHECK(s.mode == 0 && p.keyed == start + 17);
-        s = p.write(start + 17, 16, true, true, from);
+        CHECK(s.mode == 0 && p.keyed == 4121);
+        s = p.write(4121, 16, true, true, from);
         CHECK(s.mode == 1 && s.pool_count == 0);
         s = p.write(4200, 4, true, true, from);  // gap again
         CHECK(s.mode == 0);
@@ -51,7 +49,7 @@ int main() {
     {  // a new request keeps a shorter prefix: blocks past it are rebuilt, rows without keys stay dense
         QsaPlan p;
         p.write(0, 30000, true, false, from);
-        CHECK(p.write(30000, 8, true, true, from).mode == 1 && p.made == qsa_split_point(30007) / 4);
+        CHECK(p.write(30000, 8, true, true, from).mode == 1 && p.made == 29984 / 4);
         p.write(10000, 512, true, false, from);
         CHECK(p.made == 2500 && p.keyed == 10512);
         const auto s = p.write(10512, 8, true, true, from);

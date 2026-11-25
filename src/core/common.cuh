@@ -87,7 +87,7 @@ __device__ __forceinline__ void butterfly_fold(float (&a)[16], int lane) {
 // Two-part (tree) verify attention: a query at position qpos takes keys [0, split) from the cache kernel and [split, qpos]
 // from the in-block kernel. split <= qpos - TREE_MAX_DEPTH keeps it at or below the block start for any path of up to
 // 16 nodes, and depends only on qpos.
-constexpr int TREE_MAX_DEPTH = tqllm::kReplayColumns - 1;
+constexpr int TREE_MAX_DEPTH = 15;
 __host__ __device__ inline int tq_split_point(int qpos) {
     return qpos >= TREE_MAX_DEPTH ? (qpos - TREE_MAX_DEPTH) / 32 * 32 : 0;
 }

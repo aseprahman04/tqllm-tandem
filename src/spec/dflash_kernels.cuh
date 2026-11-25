@@ -30,6 +30,9 @@ void gather_path(const PathGather * descs, int n, const int * cols, int k, int p
 // Device-side best-first token tree (anchor + budget nodes) from the DFlash2 lattice: tok / par / dep for the verify.
 void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, int B, int budget, uint32_t * tok,
                  int * par, int * dep, cudaStream_t);
+// Wide verification requires a linear chain with the anchor in column zero and consecutive
+// physical KV slots in token order. Branched verification retains the 16-column limit.
+void dflash_copy_chain(uint32_t anchor, const uint32_t * host_copy, int count, uint32_t * tok, int * par, int * dep, cudaStream_t);
 // Extend the single neural child with a host-proposed copy, using a duplicate child only once.
 void dflash_copy_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, const uint32_t * host_copy,
                       int count, uint32_t * tok, int * par, int * dep, cudaStream_t);

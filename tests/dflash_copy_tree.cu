@@ -55,6 +55,14 @@ int main() {
             ck(cudaMemcpy(p.data(),parents,sizeof(p),cudaMemcpyDeviceToHost));
             ck(cudaMemcpy(d.data(),depths,sizeof(d),cudaMemcpyDeviceToHost));
             if (t != et || p != ep || d != ed) return 1;
+            tqllm_cuda::dflash_copy_chain(root,copy.data(),len,tokens,parents,depths,nullptr);
+            ck(cudaMemcpy(t.data(),tokens,sizeof(t),cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(p.data(),parents,sizeof(p),cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(d.data(),depths,sizeof(d),cudaMemcpyDeviceToHost));
+            for (int j = 0; j <= len; ++j) {
+                et[j] = j ? copy[j-1] : root; ep[j] = j-1; ed[j] = j;
+            }
+            if (t != et || p != ep || d != ed) return 1;
         }
     }
     ck(cudaFree(tokens)); ck(cudaFree(parents)); ck(cudaFree(depths));

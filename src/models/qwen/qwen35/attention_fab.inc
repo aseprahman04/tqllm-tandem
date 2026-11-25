@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(DIM) attn_blk_k(const __nv_bfloat16 * q, const
     __shared__ int slot[MAXK];
     const int h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, lane = d % 32, wid = d / 32;
     const int pos = *dseq0 - 1, kh = h / (heads / kvheads);
-    int path[tqllm_dev::TREE_MAX_DEPTH + 1], len = 0;
+    int path[tqllm::kReplayColumns], len = 0;
     for (int a = z; a >= 0; a = par[a]) path[len++] = a;  // z .. root; depth e is path[len - 1 - e]
     const int qpos = pos + len - 1, from = tq_split_point(qpos), nk = qpos - from + 1;
     if (d < nk) {  // canonical positions: committed cache, then this node's ancestors
@@ -237,7 +237,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
             if (dep == nullptr && z0) throw std::invalid_argument("tree attention: > 8 queries need node depths");
             attn_mq_k<DIM, Q8, TURBO3V><<<dim3(kh, nsplit), DIM, smem, s>>>(
                 q + int64_t(z0) * h * DIM, kc, vc, ksc, vsc, part + int64_t(z0) * h * (nsplit + 1) * (DIM + 2), dseq0, nz, h,
-                kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr);
+                kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr, nullptr, 0, z0 + nz - 1);
         }
         attn_blk_k<DIM><<<dim3(h, nq), DIM, 0, s>>>(q, static_cast<const __nv_bfloat16 *>(kc),
                                                     static_cast<const __nv_bfloat16 *>(vc), part, dseq0, par, dep, h, kh,

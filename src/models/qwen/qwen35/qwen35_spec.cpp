@@ -631,7 +631,7 @@ bool Qwen35Engine::dflash_advance() {
         // draft -> tree -> verify queued back to back on the device; one host sync after the verify
         const auto t0 = now();
         uint32_t lk[NVER];
-        const int NV = tp && !sampling() && !opt.lookup ? NVER : std::min(NVER, 16);
+        constexpr int NV = std::min(NVER, 16);
         int nl = opt.lookup ? lookup(lk, tqllm::lookup_limit(opt.lookup, NV)) : 0;
         // lookup-first (--lookup-first k): a context match of >= k tokens takes the whole verify block
         bool lf = false;
@@ -641,20 +641,31 @@ bool Qwen35Engine::dflash_advance() {
             if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
         }
         int nt = tqllm::tree_cols(D, nl, lf, NV);
-        bool merge_copy = false;
+        bool merge_copy = false, copy_chain = false;
         if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
             for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
             nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
             const bool can_merge = tp && !sampling() && nt == 2;
-            const auto cp = gen.copy.propose(can_merge ? NV - 1 : NV - nt);
-            merge_copy = can_merge && int(cp.size()) == NV - 1;
-            if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
-            nl = merge_copy ? NV - nt : int(cp.size());
-            std::copy(cp.begin(), cp.end(), lk);
+            const bool wide = NVER > NV && can_merge && !dfl.dspark && qsa.from <= 0;
+            const auto cp = gen.copy.propose(wide ? NVER - 1 : can_merge ? NV - 1 : NV - nt);
+            copy_chain = wide && int(cp.size()) == NVER - 1;
+            if (copy_chain) {
+                // Deep copy paths occupy consecutive physical KV slots in token order. Any rows
+                // before the normal 16-column attention split are therefore valid prefix keys.
+                nt = 1;
+                nl = int(cp.size());
+            } else {
+                merge_copy = can_merge && int(cp.size()) >= NV - 1;
+                if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
+                nl = merge_copy ? NV - nt : std::min(int(cp.size()), NV - nt);
+            }
+            std::copy_n(cp.begin(), merge_copy ? NV - 1 : nl, lk);
         }
-        dflash_draft(pending, pos, 0, nullptr, nullptr, true);
+        if (!copy_chain) dflash_draft(pending, pos, 0, nullptr, nullptr, true);
         const int n = nt + nl;
-        if (merge_copy) {
+        if (copy_chain) {
+            tqllm_cuda::dflash_copy_chain(pending, lk, nl, v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+        } else if (merge_copy) {
             // A matching first token frees one column for the copy tail. A different neural child
             // keeps its own branch. The target verifies every column in both layouts.
             tqllm_cuda::dflash_copy_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), lk, NV - 1,
@@ -663,7 +674,7 @@ bool Qwen35Engine::dflash_advance() {
             tqllm_cuda::dflash_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), dfl.block, nt - 1,
                                     v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
         }
-        if (nl && !merge_copy) {  // lookup chain: columns nt .. n - 1, the first under the root
+        if (nl && !merge_copy && !copy_chain) {  // lookup chain: columns nt .. n - 1, the first under the root
             int lp[NVER], ld[NVER];
             for (int i = 0; i < nl; ++i) lp[i] = i ? nt + i - 1 : 0, ld[i] = i + 1;
             ck(cudaMemcpyAsync(v_tokens.as<uint32_t>() + nt, lk, size_t(nl) * 4, cudaMemcpyHostToDevice, stream));

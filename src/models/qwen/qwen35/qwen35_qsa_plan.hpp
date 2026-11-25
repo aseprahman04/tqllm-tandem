@@ -3,12 +3,11 @@
 // built, and how the next verify block attends. Block keys are pooled from committed positions only: a row picks among
 // blocks below its split point, which lies at or below the block's first position.
 #include <algorithm>
-#include "verify_columns.hpp"
 
 namespace tqllm {
 
 // tq_split_point (src/core/common.cuh, device code); tests/qsa27.cu checks they agree
-constexpr int qsa_split_point(int qpos) { return qpos >= kReplayColumns - 1 ? (qpos - (kReplayColumns - 1)) / 32 * 32 : 0; }
+constexpr int qsa_split_point(int qpos) { return qpos >= 15 ? (qpos - 15) / 32 * 32 : 0; }
 
 // CUDA: QSA is an approximate path, so it is opt-in. option = --qsa-from (-1 not given, 0 off, N keys): rows past N keys
 // are sparse only when N is given; 0 = dense. (The file's qsa.sparse_from is not a request.)

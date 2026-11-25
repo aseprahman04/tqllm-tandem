@@ -413,7 +413,8 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
                                                  const __half * ksc, const __half * vsc, float * part,
                                                  const int * dseq0, int nq, int heads, int kvheads, float scale,
                                                  int nsplit, int query_offset, int pstride, int blk,
-                                                 const int * dep = nullptr, const int32_t * sel = nullptr, int from = 0) {
+                                                 const int * dep = nullptr, const int32_t * sel = nullptr, int from = 0,
+                                                 int last_verify_col = 0) {
     constexpr int SEL_KEYS = 2048;  // 512 blocks of 4
     if constexpr (SEL) {
         const int z = blockIdx.z;
@@ -453,8 +454,14 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
     const int seq0 = *dseq0 + query_offset, seq_last = seq0 + nq - 1;
     // tiles interleaved over the splits (tile i -> split i % nsplit): a key's split and summation order depend only on
     // its position, not on nq, so a query's result is the same for any verify width
-    // blk: keys of the current block (slots seq0 - 1 ..) are left to attn_blk_k, so this pass covers [0, seq0 - 1)
-    const int stride = nsplit * MQ_TILE, beg = split * MQ_TILE, end = SEL ? SEL_KEYS : blk ? seq0 - 1 : seq_last;
+    const int stride = nsplit * MQ_TILE, beg = split * MQ_TILE;
+    int end = SEL ? SEL_KEYS : blk ? seq0 - 1 : seq_last;
+    // A long linear copy can cross the split inside the verification block. Its physical KV
+    // slots are consecutive. Stage up to the largest possible split in this query tile;
+    // the per-row depth mask below still controls which keys each query consumes.
+    if constexpr (!SEL && tqllm::kReplayColumns > 16) {
+        if (blk) end = max(end, tq_split_point(seq0 - 1 + last_verify_col));
+    }
     // blk (two-part verify attention): row r (query z = r / g at position qpos = seq0 - 1 + depth) takes keys below
     // tq_split_point(qpos) here; attn_blk_k does the rest. The split depends on qpos alone, never on where the block starts.
     __shared__ int lim[MQ_MAXROWS];
