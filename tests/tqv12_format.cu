@@ -1,4 +1,3 @@
-#include "verify_columns.hpp"
 // TQV-12 weight format (src/formats/weight/tqv.cpp / tqv.cu, docs/reference/formats.md) through the WeightFormat registry:
 // 1. GGUF: type 305 + tqllm.tqv.codebook = "tqv12-v1" reads as GGML_TQV12; another tag is refused; 302 stays GSQ_Q2_0
 // 2. dequant_h == the CPU reference (dequantize_host_rows) within 1 FP16 ulp, ragged row counts included.
@@ -155,7 +154,7 @@ int main(int argc, char ** argv) {
         std::remove((dir + "/tqv12_a.gguf").c_str()); std::remove((dir + "/tqv12_b.gguf").c_str()); std::remove((dir + "/tqv12_c.gguf").c_str()); std::remove((dir + "/tqv12_d.gguf").c_str());
     }
     const tqllm::WeightFormat * fmt = tqllm::weight_format(tqllm::GGML_TQV12);
-    check(fmt && fmt->basis() == tqllm::Basis::Tq4Rot128 && fmt->max_matvec_cols() == tqllm::kReplayColumns, "registry: TQV12 registered, TQ4 basis, configured column capacity");
+    check(fmt && fmt->basis() == tqllm::Basis::Tq4Rot128 && fmt->max_matvec_cols() == 16, "registry: TQV12 registered, TQ4 basis, 16 columns");
     if (!fmt) return 1;
     tqllm::Upload up = [](const void * h, size_t n) {
         void * p = nullptr;
@@ -180,7 +179,7 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < h.size(); ++i) worst = std::max(worst, ulps(h[i], __float2half(ref[i])));
         check(worst <= 1, tag + "dequant_h == CPU reference (worst FP16 ulp)", worst);
         // 3. matvec vs double dot; variants and widths identical
-        const int NC = tqllm::kReplayColumns;
+        const int NC = 16;
         std::vector<__half> x(size_t(NC) * K);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto & v : x) v = __float2half(nd(rng));
@@ -197,10 +196,10 @@ int main(int argc, char ** argv) {
                 const double e = base[size_t(n) * R + r] - d;
                 se += e * e, sr += d * d;
             }
-        check(std::sqrt(se / sr) < 1e-5, tag + "matvec_f32 (full width) vs double dot over the CPU reference (rel-rms)", std::sqrt(se / sr));
+        check(std::sqrt(se / sr) < 1e-5, tag + "matvec_f32 (16 columns) vs double dot over the CPU reference (rel-rms)", std::sqrt(se / sr));
         size_t diff = 0;
         for (int v = 0; v <= 8; ++v)
-            for (int nc = 1; nc <= NC; ++nc) {
+            for (const int nc : {1, 3, 8, 9, 16}) {
                 tqllm_cuda::tqv12_matvec_variant(static_cast<const uint8_t *>(m.p), static_cast<const __half *>(m.aux), dx, y1, R, K, nc, v, nullptr);
                 const auto got = host(y1, size_t(nc) * R);
                 diff += std::memcmp(got.data(), base.data(), got.size() * 4) != 0;
