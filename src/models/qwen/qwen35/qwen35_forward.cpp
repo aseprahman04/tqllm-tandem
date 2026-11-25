@@ -1372,7 +1372,9 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
 // [0, V0), merges the two lists and rescores the 16 with the int8 head as head_argmax does. Both GPUs hold the same
 // final residual rows. False when the head is not the two-stage one (the caller runs head_argmax).
 bool Qwen35Engine::tp_head(int n) {
-    if (lm_head.fmt || full_logits || !head4.p || !has_head8() || n > 32 || !segs.empty()) return false;
+    // HeadSampler reads a full vocabulary screen per column and re-scores from its saved hidden row.
+    // The split head exchanges only the peer's top 16. Let head_argmax supply both sampler inputs.
+    if (want_topk() || lm_head.fmt || full_logits || !head4.p || !has_head8() || n > 32 || !segs.empty()) return false;
     const int H = int(cfg.hidden), V = int(lm_head.rows), V0 = V / 2;
     if (!tp_h4) {  // first use: rank 0's half of head4, the output norm, its top-16 buffers, the mapped exchange
         const size_t wb = size_t(V - V0) * H / 2, sb = size_t(V - V0) * H / 32 * 4;
@@ -1409,8 +1411,7 @@ bool Qwen35Engine::tp_head(int n) {
     ck(cudaStreamWaitEvent(stream, tp_hev, 0));
     tqllm_cuda::tp_merge16(h2_vals.as<float>(), h2_idx.as<uint32_t>(), tp_hx, n, uint32_t(V0), stream);
     tqllm_cuda::i8h_rescore_argmax(w8(), s8(), v_xh.as<__half>(), h2_idx.as<uint32_t>(), H, n, v_tok.as<uint32_t>(), stream,
-                                   want_topk() ? s_lg.as<float>() : nullptr);
-    if (want_topk()) ck(cudaMemcpyAsync(s_id.p, h2_idx.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToDevice, stream));
+                                   nullptr);
     return true;
 }
 
