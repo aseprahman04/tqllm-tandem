@@ -558,13 +558,23 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
         };
         const uint64_t key0 = (uint64_t(0xFF) << 54) | width_key | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
                               (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
+        // A cold graph can take longer to instantiate than a peer's bounded exchange wait.
+        // Prepare both ranks before either starts waiting for the other's first partial.
+        cudaGraphExec_t rank_graph[2];
         for (int r = 0; r < 2; ++r) {
-            use_dev(r, false);
             const uint64_t key = (uint64_t(r) << 63) | key0;
             auto it = tp_graphs.find(key);
-            if (it == tp_graphs.end())
+            if (it == tp_graphs.end()) {
+                use_dev(r, false);
                 it = tp_graphs.emplace(key, tqllm::instantiate_graph(tqllm::capture_graph(stream, [&] { body(r); }))).first;
-            ck(cudaGraphLaunch(it->second, stream));
+                ck(cudaGraphUpload(it->second, stream));
+                ck(cudaStreamSynchronize(stream));
+            }
+            rank_graph[r] = it->second;
+        }
+        for (int r = 0; r < 2; ++r) {
+            use_dev(r, false);
+            ck(cudaGraphLaunch(rank_graph[r], stream));
             (void)cudaStreamQuery(stream);  // WDDM batches submissions: hand this graph to the GPU now
         }
     } else {
