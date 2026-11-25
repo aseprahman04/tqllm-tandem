@@ -430,9 +430,11 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     static const bool eager = tqllm::debug_on("tp_eager");
     const bool graphs = n <= verify_limit() && !eager;
     const int vkind = !vpar ? 0 : vpar == d_tpar.as<int>() ? 1 : 2;
+    // max_seq occupies bits 0..31; keep the linear width below qsa.mode at bit 42.
+    const uint64_t width_key = uint64_t(n - 1) << 32;
     auto seg = [&](int r, uint32_t l, int part, auto && body) {
         if (!graphs) return body();
-        const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | (uint64_t(n - 1) << 48) |
+        const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | width_key |
                              (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) | (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         auto it = tp_graphs.find(key);
         if (it == tp_graphs.end()) {
@@ -554,7 +556,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             xadd(v_x.as<bf16>(), r, 1);
             tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
         };
-        const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n - 1) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
+        const uint64_t key0 = (uint64_t(0xFF) << 54) | width_key | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
                               (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         for (int r = 0; r < 2; ++r) {
             use_dev(r, false);

@@ -692,7 +692,13 @@ bool Qwen35Engine::dflash_advance() {
         const bool direct_copy = copy_chain && defer;
         linear_copy_step = direct_copy;
         tree_step = true;
-        verify_async(nullptr, h_pos, n, pos, res.data(), true);
+        try {
+            verify_async(nullptr, h_pos, n, pos, res.data(), true);
+        } catch (...) {
+            tree_step = false;
+            linear_copy_step = false;
+            throw;
+        }
         tree_step = false;
         linear_copy_step = false;
         std::vector<int> tpar(static_cast<size_t>(n) + 0);
