@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include "dflash_kernels.cuh"
 #include "tree_columns.hpp"
+#include <algorithm>
 
 #include <math_constants.h>
 
@@ -262,7 +263,7 @@ namespace {
 __global__ void dflash_tree_k(const uint32_t * idx, const float * score, const uint32_t * anchor, int B, int budget,
                               uint32_t * tok, int * par, int * dep, float inv_temp) {
     if (threadIdx.x || blockIdx.x) return;
-    constexpr int MAXN = 16, POOL = 256;
+    constexpr int MAXN = tqllm::kGdnReplayCols, POOL = MAXN * 16;
     float nlp[MAXN], plp[POOL];
     int ncand[MAXN], ndep[MAXN], pd[POOL], pc[POOL], pp[POOL], np = 0, n = 1;
     tok[0] = *anchor, par[0] = -1, dep[0] = 0, nlp[0] = 0.f, ncand[0] = 0, ndep[0] = 0;
@@ -320,6 +321,14 @@ namespace {
 struct CopyProposal {
     uint32_t token[tqllm::kGdnReplayCols - 1];
 };
+__global__ void copy_chain_k(uint32_t anchor, CopyProposal copy, int count, uint32_t * tok, int * par, int * dep) {
+    const int col = threadIdx.x;
+    if (col <= count) {
+        tok[col] = col ? copy.token[col - 1] : anchor;
+        par[col] = col - 1;
+        dep[col] = col;
+    }
+}
 __global__ void copy_tree_k(const uint32_t * idx, const float * score, const uint32_t * anchor,
                             CopyProposal copy, int count, uint32_t * tok, int * par, int * dep) {
     const int col = threadIdx.x;
@@ -339,6 +348,12 @@ __global__ void copy_tree_k(const uint32_t * idx, const float * score, const uin
     par[col] = sibling ? 0 : col - 1;
     dep[col] = sibling ? 1 : col;
 }
+}
+void dflash_copy_chain(uint32_t anchor, const uint32_t * host_copy, int count, uint32_t * tok, int * par, int * dep, cudaStream_t s) {
+    if (count < 1 || count >= tqllm::kGdnReplayCols) throw std::invalid_argument("unsupported copy chain width");
+    CopyProposal copy{};
+    std::copy_n(host_copy, count, copy.token);
+    copy_chain_k<<<1, 32, 0, s>>>(anchor, copy, count, tok, par, dep);
 }
 void dflash_copy_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, const uint32_t * host_copy,
                       int count, uint32_t * tok, int * par, int * dep, cudaStream_t s) {

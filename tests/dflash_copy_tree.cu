@@ -1,5 +1,6 @@
 #include "dflash_kernels.cuh"
 #include <array>
+#include "tree_columns.hpp"
 #include <cstdio>
 #include <stdexcept>
 
@@ -10,6 +11,7 @@ void ck(cudaError_t e) {
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    constexpr int capacity = tqllm::kGdnReplayCols + 2;
     uint32_t* tokens;
     int* parents;
     int* depths;
@@ -20,13 +22,13 @@ int main() {
     ck(cudaMalloc(&anchor,sizeof(*anchor)));
     const uint32_t root=7;
     ck(cudaMemcpy(anchor,&root,sizeof(root),cudaMemcpyHostToDevice));
-    ck(cudaMalloc(&tokens, 18 * sizeof(*tokens)));
-    ck(cudaMalloc(&parents, 18 * sizeof(*parents)));
-    ck(cudaMalloc(&depths, 18 * sizeof(*depths)));
-    for (int len = 2; len <= 15; ++len) {
+    ck(cudaMalloc(&tokens, capacity * sizeof(*tokens)));
+    ck(cudaMalloc(&parents, capacity * sizeof(*parents)));
+    ck(cudaMalloc(&depths, capacity * sizeof(*depths)));
+    for (int len = 2; len < tqllm::kGdnReplayCols; ++len) {
         for (int duplicate = 0; duplicate <= 1; ++duplicate) {
-            std::array<uint32_t,18> t{}, copy{};
-            std::array<int,18> p{}, d{};
+            std::array<uint32_t,capacity> t{}, copy{};
+            std::array<int,capacity> p{}, d{};
             t.fill(999); p.fill(-99); d.fill(-99);
             for (int i = 0; i < len; ++i) copy[i] = 40 + i;
             std::array<uint32_t,32> candidates{};
@@ -53,9 +55,17 @@ int main() {
             ck(cudaMemcpy(p.data(),parents,sizeof(p),cudaMemcpyDeviceToHost));
             ck(cudaMemcpy(d.data(),depths,sizeof(d),cudaMemcpyDeviceToHost));
             if (t != et || p != ep || d != ed) return 1;
+            tqllm_cuda::dflash_copy_chain(root,copy.data(),len,tokens,parents,depths,nullptr);
+            ck(cudaMemcpy(t.data(),tokens,sizeof(t),cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(p.data(),parents,sizeof(p),cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(d.data(),depths,sizeof(d),cudaMemcpyDeviceToHost));
+            for (int j = 0; j <= len; ++j) {
+                et[j] = j ? copy[j-1] : root; ep[j] = j-1; ed[j] = j;
+            }
+            if (t != et || p != ep || d != ed) return 1;
         }
     }
     ck(cudaFree(tokens)); ck(cudaFree(parents)); ck(cudaFree(depths));
     ck(cudaFree(ids)); ck(cudaFree(scores)); ck(cudaFree(anchor));
-    std::puts("28 copy trees matched, including the root, sibling and untouched trailing columns");
+    std::puts("copy trees matched, including the root, sibling and untouched trailing columns");
 }

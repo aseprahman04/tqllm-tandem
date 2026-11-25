@@ -641,20 +641,25 @@ bool Qwen35Engine::dflash_advance() {
             if (n2 >= opt.lookup_first) std::copy(lk2, lk2 + n2, lk), nl = n2, lf = true;
         }
         int nt = tqllm::tree_cols(D, nl, lf, NV);
-        bool merge_copy = false;
+        bool merge_copy = false, copy_chain = false;
         if (!opt.lookup) {  // copy-first: a long repeat of the context takes the block beside a small drafter tree
             for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
             nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
             const bool can_merge = tp && !sampling() && nt == 2;
             const auto cp = gen.copy.propose(can_merge ? NV - 1 : NV - nt);
             merge_copy = can_merge && int(cp.size()) == NV - 1;
+            copy_chain = merge_copy && !dfl.dspark && !dfl.dspine && !qsa.on;
+            if (copy_chain) nt = 1;
             if (cp.empty()) nt = tqllm::tree_cols(D, 0, false, NV);
             nl = merge_copy ? NV - nt : int(cp.size());
             std::copy(cp.begin(), cp.end(), lk);
         }
-        dflash_draft(pending, pos, 0, nullptr, nullptr, true);
+        if (!copy_chain) dflash_draft(pending, pos, 0, nullptr, nullptr, true);
         const int n = nt + nl;
-        if (merge_copy) {
+        if (copy_chain) {
+            // The target checks the full copy, including the first token at which it diverges.
+            tqllm_cuda::dflash_copy_chain(pending, lk, nl, v_tokens.as<uint32_t>(), d_tpar.as<int>(), d_tdep.as<int>(), stream);
+        } else if (merge_copy) {
             // A matching first token frees one column for the copy tail. A different neural child
             // keeps its own branch. The target verifies every column in both layouts.
             tqllm_cuda::dflash_copy_tree(d_idx.as<uint32_t>(), d_score.as<float>(), d_tok.as<uint32_t>(), lk, NV - 1,
