@@ -606,7 +606,7 @@ private:
     // Larger chunks amortise the per-chunk FP16 weight dequant; the size follows the context budget (buffer memory).
     int NPF = 512, NBUF = 512;
     static constexpr int NGEMM_BLAS = 128;  // columns from which projections dequantize to FP16 and run on cuBLAS
-    static_assert(NVER <= kReplayColumns);
+    static_assert(NVER <= kCopyVerifyColumns);
     int cur = 0;
     bf16 * conv_slot(uint32_t lin, int slot) { return conv_state[lin * NSLOT + (slot % NSLOT)].as<bf16>(); }
     float * rec_slot(uint32_t lin, int slot) { return rec_state[lin * NSLOT + (slot % NSLOT)].as<float>(); }

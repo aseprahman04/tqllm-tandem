@@ -541,6 +541,10 @@ int main() {
         test_attention(tqllm::kReplayColumns, 350);
         test_attention_codec("wide tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, tqllm::kReplayColumns, 350);
     }
+    if constexpr (tqllm::kCopyVerifyColumns > tqllm::kReplayColumns) {
+        test_attention(tqllm::kCopyVerifyColumns, 350);
+        test_attention_codec("linear tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, tqllm::kCopyVerifyColumns, 350);
+    }
     test_rope();
     test_attention(8, 333);
     test_attention(12, 333);  // > 8 queries: tiled part in chunks

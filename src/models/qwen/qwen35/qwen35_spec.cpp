@@ -646,10 +646,13 @@ bool Qwen35Engine::dflash_advance() {
             for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
             nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
             const bool can_merge = tp && !sampling() && nt == 2;
-            const bool wide = NVER > NV && can_merge && nslots == 1 && !dfl.dspark && !dfl.dspine && !qsa.on &&
-                              !kv_cmp && !mm_chunk && size_t(pos) + NVER <= context_;
-            const auto cp = gen.copy.propose(wide ? NVER - 1 : can_merge ? NV - 1 : NV - nt);
-            copy_chain = wide && int(cp.size()) == NVER - 1;
+            static const int requested = tqllm::debug_int("copy_cols");
+            const int cap = requested > 0 ? std::clamp(requested, NV, NVER) : NVER;
+            const int copy_width = defer && std::string_view(kvf->name()) == "tq3" ? cap : std::min(cap, 32);
+            const bool wide = copy_width > NV && can_merge && nslots == 1 && !dfl.dspark && !dfl.dspine && !qsa.on &&
+                              !kv_cmp && !mm_chunk && size_t(pos) + copy_width <= context_;
+            const auto cp = gen.copy.propose(wide ? copy_width - 1 : can_merge ? NV - 1 : NV - nt);
+            copy_chain = wide && int(cp.size()) == copy_width - 1;
             if (copy_chain) {
                 // Deep copy paths occupy consecutive physical KV slots in token order. Any rows
                 // before the normal 16-column attention split are therefore valid prefix keys.

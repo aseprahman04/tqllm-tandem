@@ -392,11 +392,14 @@ void Qwen35Engine::tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, in
         grp.qkv = d_rep_qkvc.as<bf16>(), grp.b0 = RT + qkv_dim + zdim, grp.a0 = grp.b0 + lvh;
         grp.abs_ = rows, grp.pend = d_pend.as<int>(), grp.smid = rec_slot(lin_i, cur + 1);
     }
+    // Wide prompt copies are physical chains; the causal kernel streams them in small
+    // groups and saves the final state without allocating a tree-sized shared workspace.
+    const int * recurrent_par = linear_copy_step && n > int(tqllm::kReplayColumns) ? nullptr : vpar;
     tqllm_cuda::conv_multi(TL, rows, n, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w, QKVC, qkv_dim, stream,
-                           vpar, crp);
+                           recurrent_par, crp);
     const bf16 * B0 = TL + qkv_dim + zdim;  // row layout [qkv | z | b | a]
     tqllm_cuda::gdn_multi(QKVC, n, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur), rec_slot(lin_i, cur + 1),
-                          CORE, lkh, lvh, dk, dv, cfg.tiled, stream, vpar, grp);
+                          CORE, lkh, lvh, dk, dv, cfg.tiled, stream, recurrent_par, grp);
     if (basis_ == Basis::Tq3Rot32) {
         tqllm_cuda::gated_rms_rot_h(CORE, TL + qkv_dim, rows, n, L.gnorm_w, XH, lvh, dv, cfg.eps, stream);
     } else {
@@ -429,7 +432,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     const int vkind = !vpar ? 0 : vpar == d_tpar.as<int>() ? 1 : 2;
     auto seg = [&](int r, uint32_t l, int part, auto && body) {
         if (!graphs) return body();
-        const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | (uint64_t(n) << 48) |
+        const uint64_t key = (uint64_t(r) << 63) | (uint64_t(part) << 62) | (uint64_t(l) << 54) | (uint64_t(n - 1) << 48) |
                              (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) | (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         auto it = tp_graphs.find(key);
         if (it == tp_graphs.end()) {
@@ -551,7 +554,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
             xadd(v_x.as<bf16>(), r, 1);
             tqllm_cuda::add_sumsq(v_x.as<bf16>(), v_m.as<bf16>(), v_px.as<float>(), n * H, stream);
         };
-        const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
+        const uint64_t key0 = (uint64_t(0xFF) << 54) | (uint64_t(n - 1) << 48) | (uint64_t(cur % NSLOT) << 47) | (uint64_t(sp) << 46) |
                               (uint64_t(vkind) << 44) | (uint64_t(qsa.mode) << 42) | uint64_t(uint32_t(max_seq));
         for (int r = 0; r < 2; ++r) {
             use_dev(r, false);

@@ -560,7 +560,7 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
     if constexpr (VT)
         for (int i = d; i < 256; i += DIM) reinterpret_cast<__half *>(s_cbv)[i] = __float2half_rn(tcq::CB2V[i]);
     const int pos = *dseq0 - 1, kh = h / (heads / kvheads);
-    int path[tqllm::kReplayColumns], len = 0;
+    int path[tqllm::kCopyVerifyColumns], len = 0;
     for (int a = z; a >= 0; a = par[a]) path[len++] = a;  // z .. root; depth e is path[len - 1 - e]
     const int qpos = pos + len - 1, from = tq_split_point(qpos), nk = qpos - from + 1;
     if (d < nk) {

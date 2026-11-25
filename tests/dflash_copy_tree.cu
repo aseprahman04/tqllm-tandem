@@ -11,7 +11,7 @@ void ck(cudaError_t e) {
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
-    constexpr int capacity = tqllm::kReplayColumns + 2;
+    constexpr int capacity = tqllm::kCopyVerifyColumns + 2;
     uint32_t* tokens;
     int* parents;
     int* depths;
@@ -63,6 +63,24 @@ int main() {
                 et[j] = j ? copy[j-1] : root; ep[j] = j-1; ed[j] = j;
             }
             if (t != et || p != ep || d != ed) return 1;
+        }
+    }
+    if constexpr (tqllm::kCopyVerifyColumns > tqllm::kReplayColumns) {
+        std::array<uint32_t,capacity> copy{}, actual{};
+        std::array<int,capacity> par{}, dep{};
+        for (int c = 0; c < capacity; ++c) copy[c] = 321 + c;
+        for (int len = tqllm::kReplayColumns; len < tqllm::kCopyVerifyColumns; ++len) {
+            ck(cudaMemset(tokens, 0xff, sizeof(actual)));
+            ck(cudaMemset(parents, 0xff, sizeof(par)));
+            ck(cudaMemset(depths, 0xff, sizeof(dep)));
+            tqllm_cuda::dflash_copy_chain(root, copy.data(), len, tokens, parents, depths, nullptr);
+            ck(cudaMemcpy(actual.data(), tokens, sizeof(actual), cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(par.data(), parents, sizeof(par), cudaMemcpyDeviceToHost));
+            ck(cudaMemcpy(dep.data(), depths, sizeof(dep), cudaMemcpyDeviceToHost));
+            for (int c = 0; c < capacity; ++c) {
+                if (actual[c] != (c > len ? UINT32_MAX : c == 0 ? root : copy[c-1]) ||
+                    par[c] != (c > len ? -1 : c-1) || dep[c] != (c > len ? -1 : c)) return 1;
+            }
         }
     }
     ck(cudaFree(tokens)); ck(cudaFree(parents)); ck(cudaFree(depths));

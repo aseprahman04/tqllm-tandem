@@ -1375,7 +1375,7 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
 bool Qwen35Engine::tp_head(int n) {
     // HeadSampler reads a full vocabulary screen per column and re-scores from its saved hidden row.
     // The split head exchanges only the peer's top 16. Let head_argmax supply both sampler inputs.
-    if (want_topk() || lm_head.fmt || full_logits || !head4.p || !has_head8() || n > 32 || !segs.empty()) return false;
+    if (want_topk() || lm_head.fmt || full_logits || !head4.p || !has_head8() || (n > 32 && !linear_copy_step) || !segs.empty()) return false;
     const int H = int(cfg.hidden), V = int(lm_head.rows), V0 = V / 2;
     if (!tp_h4) {  // first use: rank 0's half of head4, the output norm, its top-16 buffers, the mapped exchange
         const size_t wb = size_t(V - V0) * H / 2, sb = size_t(V - V0) * H / 32 * 4;
@@ -1397,7 +1397,9 @@ bool Qwen35Engine::tp_head(int n) {
     use_dev(0, false);
     tqllm_cuda::rms_f(v_x.as<bf16>(), H, tp_onorm, v_np.as<bf16>(), H, H, n, cfg.eps, stream);
     tqllm_cuda::bf16_to_h(v_np.as<bf16>(), v_xh.as<__half>(), n * H, stream);
-    tqllm_cuda::u4h_matvec(tp_h4, tp_h4s, v_xh.as<__half>(), v_logits.as<float>(), V - V0, H, n, stream);
+    for (int c = 0; c < n; c += 32)
+        tqllm_cuda::u4h_matvec(tp_h4, tp_h4s, v_xh.as<__half>() + size_t(c) * H,
+                               v_logits.as<float>() + size_t(c) * (V - V0), V - V0, H, std::min(32, n - c), stream);
     auto * tv = static_cast<float *>(tp_htop);
     tqllm_cuda::topk16_big(v_logits.as<float>(), V - V0, n, tv, reinterpret_cast<uint32_t *>(tv + size_t(n) * 16), tp_hscr,
                            stream);
@@ -1407,7 +1409,9 @@ bool Qwen35Engine::tp_head(int n) {
     use_dev(1, false);
     tqllm_cuda::rms_f(v_x.as<bf16>(), H, out_norm, v_np.as<bf16>(), H, H, n, cfg.eps, stream);
     tqllm_cuda::bf16_to_h(v_np.as<bf16>(), v_xh.as<__half>(), n * H, stream);
-    tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>(), v_logits.as<float>(), V0, H, n, stream);
+    for (int c = 0; c < n; c += 32)
+        tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>() + size_t(c) * H,
+                               v_logits.as<float>() + size_t(c) * V0, V0, H, std::min(32, n - c), stream);
     tqllm_cuda::topk16_big(v_logits.as<float>(), V0, n, h2_vals.as<float>(), h2_idx.as<uint32_t>(), h2_scr.p, stream);
     ck(cudaStreamWaitEvent(stream, tp_hev, 0));
     tqllm_cuda::tp_merge16(h2_vals.as<float>(), h2_idx.as<uint32_t>(), tp_hx, n, uint32_t(V0), stream);
@@ -1788,12 +1792,13 @@ void Qwen35Engine::flush_pending() {
             const auto & L = layer[l];
             const int rows = mix_rows(L);
             const bf16 * T = v_stash2[pend_sp][lin_i].as<bf16>();
+            const int * accepted_chain = pend_k > int(tqllm::kReplayColumns) ? nullptr : d_chain.as<int>();
             tqllm_cuda::conv_multi(T, rows, pend_k, conv_slot(lin_i, cur), conv_slot(lin_i, cur + 1), L.conv_w,
-                                   v_qkvc.as<bf16>(), qkv_dim, stream, d_chain.as<int>());
+                                   v_qkvc.as<bf16>(), qkv_dim, stream, accepted_chain);
             const bf16 * B0 = T + qkv_dim + zdim;
             tqllm_cuda::gdn_multi(v_qkvc.as<bf16>(), pend_k, B0 + lvh, B0, rows, L.neg_a, L.dt_bias, rec_slot(lin_i, cur),
                                   rec_slot(lin_i, cur + 1), v_core.as<bf16>(), lkh, lvh, dk, dv, cfg.tiled, stream,
-                                  d_chain.as<int>());
+                                  accepted_chain);
             ++lin_i;
         }
     }

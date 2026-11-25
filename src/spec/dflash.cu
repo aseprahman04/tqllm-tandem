@@ -319,7 +319,7 @@ void dflash_tree(const uint32_t * idx, const float * score, const uint32_t * anc
 
 namespace {
 struct CopyProposal {
-    uint32_t token[tqllm::kGdnReplayCols - 1];
+    uint32_t token[tqllm::kCopyVerifyColumns - 1];
 };
 __global__ void copy_chain_k(uint32_t anchor, CopyProposal copy, int count, uint32_t * tok, int * par, int * dep) {
     const int col = threadIdx.x;
@@ -350,10 +350,10 @@ __global__ void copy_tree_k(const uint32_t * idx, const float * score, const uin
 }
 }
 void dflash_copy_chain(uint32_t anchor, const uint32_t * host_copy, int count, uint32_t * tok, int * par, int * dep, cudaStream_t s) {
-    if (count < 1 || count >= tqllm::kReplayColumns) throw std::invalid_argument("unsupported copy chain width");
+    if (count < 1 || count >= tqllm::kCopyVerifyColumns) throw std::invalid_argument("unsupported copy chain width");
     CopyProposal copy{};
     std::copy_n(host_copy, count, copy.token);
-    copy_chain_k<<<1, 32, 0, s>>>(anchor, copy, count, tok, par, dep);
+    copy_chain_k<<<1, tqllm::kCopyVerifyColumns, 0, s>>>(anchor, copy, count, tok, par, dep);
 }
 void dflash_copy_tree(const uint32_t * idx, const float * score, const uint32_t * anchor, const uint32_t * host_copy,
                       int count, uint32_t * tok, int * par, int * dep, cudaStream_t s) {
