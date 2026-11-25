@@ -114,6 +114,7 @@ struct FmtSpec {
 
 static const FmtSpec kSpecs[] = {
     { 2u, "Q4_0->U4h",   18,  0,   0,  false},
+    { 6u, "Q5_0->I8h",   22,  0,   0,  false},
     { 8u, "Q8_0->I8h",   34,  0,   0,  false},
     {10u, "Q2_K->Udq",   84,  0,   0,  false},
     {11u, "Q3_K->K3",   110,  0,   0,  false},
@@ -130,7 +131,7 @@ static const FmtSpec kSpecs[] = {
     {23u, "IQ4_XS->Iq4n",136, 0,   0,  false},
 };
 // blocks per 256-column row: Q4_0, Q8_0 and IQ4_NL blocks hold 32 weights, the others 256
-static int row_blocks(unsigned type) { return type == 2u || type == 8u || type == 20u ? 8 : 1; }
+static int row_blocks(unsigned type) { return type == 2u || type == 6u || type == 8u || type == 20u ? 8 : 1; }
 static const FmtSpec & spec_of(unsigned type) {
     for (const auto & sp : kSpecs) if (sp.type == type) return sp;
     throw std::runtime_error("grouped_test: type not in kSpecs");

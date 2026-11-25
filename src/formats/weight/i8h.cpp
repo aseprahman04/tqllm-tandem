@@ -81,19 +81,35 @@ struct I8h final : WeightFormat {
 };
 // Q8_0 (GGUF 8) loader: int8 + FP16 scale per 32 -> I8H (scale repeated per 16), exact. The run-time format is looked up
 // at load, so a plugin patch of I8H (patch_weight_format) applies.
-struct Q8_0 final : WeightFormat {
-    const char * name() const override { return "Q8_0"; }
+// Q5_0 (GGUF 6) uses the same block scale, with 32 signed values packed into five bits each.
+template<bool FiveBit>
+struct BlockToI8h final : WeightFormat {
+    const char * name() const override { return FiveBit ? "Q5_0" : "Q8_0"; }
     Basis basis() const override { return Basis::Plain; }
     Mat load(const std::vector<char> & raw, int rows, int cols, const Upload & up, cudaStream_t s) const override {
         const int64_t nb = int64_t(rows) * cols / 32;
+        constexpr size_t block_bytes = FiveBit ? 22 : 34;
+        if (rows <= 0 || cols <= 0 || cols % 32 || raw.size() < size_t(nb) * block_bytes)
+            throw std::runtime_error(std::string(name()) + ": invalid quantized matrix size");
         std::vector<int8_t> q(size_t(nb) * 32);
         std::vector<__half> sc(size_t(nb) * 2);
         for (int64_t b = 0; b < nb; ++b) {
-            const char * blk = raw.data() + b * 34;
+            const auto * blk = reinterpret_cast<const uint8_t *>(raw.data()) + b * block_bytes;
             __half d;
             std::memcpy(&d, blk, 2);
             sc[2 * b] = sc[2 * b + 1] = d;
-            std::memcpy(q.data() + b * 32, blk + 2, 32);
+            if constexpr (FiveBit) {
+                // Q5_0 has one sign-offset high bit per value and two 16-value halves of nibbles.
+                uint32_t high;
+                std::memcpy(&high, blk + 2, sizeof(high));
+                for (int j = 0; j < 16; ++j) {
+                    const int pair = blk[6 + j];
+                    q[b * 32 + j] = int8_t((pair & 15) + 16 * int((high >> j) & 1) - 16);
+                    q[b * 32 + j + 16] = int8_t((pair >> 4) + 16 * int((high >> (16 + j)) & 1) - 16);
+                }
+            } else {
+                std::memcpy(q.data() + b * 32, blk + 2, 32);
+            }
         }
         const void * p = up(q.data(), q.size());
         const void * a = up(sc.data(), sc.size() * sizeof(__half));
@@ -101,15 +117,16 @@ struct Q8_0 final : WeightFormat {
         return {p, 1000, rows, cols, a, weight_format(1000)};
     }
     void matvec(const Mat &, const __half *, __nv_bfloat16 *, int, cudaStream_t) const override {
-        throw std::runtime_error("Q8_0 is a loader; matrices run as I8H");
+        throw std::runtime_error(std::string(name()) + " is a loader; matrices run as I8H");
     }
     void dequant_h(const Mat &, __half *, cudaStream_t) const override {
-        throw std::runtime_error("Q8_0 is a loader; matrices run as I8H");
+        throw std::runtime_error(std::string(name()) + " is a loader; matrices run as I8H");
     }
 };
 }  // namespace
 void register_i8h() {  // no weight_format() lookups here (runs inside the registry's call_once)
     register_weight_format(1000, std::make_unique<I8h>());
-    register_weight_format(8, std::make_unique<Q8_0>());
+    register_weight_format(6, std::make_unique<BlockToI8h<true>>());
+    register_weight_format(8, std::make_unique<BlockToI8h<false>>());
 }
 }  // namespace tqllm::formats

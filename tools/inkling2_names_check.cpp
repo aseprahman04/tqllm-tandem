@@ -72,6 +72,13 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    const std::string arch = f.str("general.architecture");
+    const bool physical_layout = arch == "inkling2_loop";
+    if (!physical_layout && arch != "inkling2") {
+        std::fprintf(stderr, "Unsupported Inkling architecture: %s\n", arch.c_str());
+        return 2;
+    }
+    const std::string prefix = arch + ".";
     // ---- 1. Dump every tensor (name, type, shape) to the text file ----
     {
         std::ofstream out(dump_path);
@@ -85,7 +92,7 @@ int main(int argc, char ** argv) {
         // Key metadata the loader reads (inkling2.* keys)
         out << "# ---- inkling2.* metadata ----\n";
         for (const auto & [k, v] : f.kv) {
-            if (k.rfind("inkling2.", 0) == 0 || k == "general.architecture") {
+            if (k.rfind(prefix, 0) == 0 || k == "general.architecture") {
                 out << k << " = ";
                 if (!v.str.empty()) out << v.str;
                 else if (!v.arr.empty()) {
@@ -103,19 +110,23 @@ int main(int argc, char ** argv) {
 
     // ---- 2. Read the config the loader reads ----
     auto num = [&](const std::string & k, double fb) -> double {
-        const std::string key = "inkling2." + k;
+        const std::string key = prefix + k;
         return f.has(key) ? f.num(key) : fb;
     };
     const int H = int(num("embedding_length", 0));
-    const int n_visits = int(num("block_count", 0));
-    const int n_pass = int(num("num_loops", 1));
-    const int core0 = int(num("loop.core_start", 0));
-    const int core1 = int(num("loop.core_end", 0));
+    const int blocks = int(num("block_count", 0));
+    const int n_pass = int(num(physical_layout ? "loop.count" : "num_loops", 1));
+    const int core0 = int(num(physical_layout ? "loop.start" : "loop.core_start", 0));
+    const int core1 = int(num(physical_layout ? "loop.end" : "loop.core_end", 0));
     const int n_core = core1 - core0;
-    const int n_layers = n_visits - (n_pass - 1) * n_core;
+    if (blocks <= 0 || core0 < 0 || core1 > blocks || n_core <= 0 || n_pass < 1) return 2;
+    const int64_t extra = int64_t(n_pass - 1) * n_core;
+    if ((!physical_layout && extra >= blocks) || extra > INT32_MAX - blocks) return 2;
+    const int n_layers = physical_layout ? blocks : blocks - int(extra);
+    const int n_visits = physical_layout ? blocks + int(extra) : blocks;
     // head_count / head_count_kv are stored as arrays (one per visit); take the first element.
     auto arr0 = [&](const std::string & k) -> int {
-        const std::string key = "inkling2." + k;
+        const std::string key = prefix + k;
         if (!f.has(key)) return 0;
         const auto & v = f.kv.at(key);
         if (!v.arr.empty()) return int(v.arr[0]);
@@ -143,8 +154,8 @@ int main(int argc, char ** argv) {
     // sliding_window_pattern: 48 bools (one per visit). A physical layer is "full" if any of its
     // visits has pattern=false. This is the ONLY source of the sliding/full distinction in the GGUF.
     std::vector<bool> sliding(n_layers, true);
-    if (f.has("inkling2.attention.sliding_window_pattern")) {
-        const auto & v = f.kv.at("inkling2.attention.sliding_window_pattern");
+    if (f.has(prefix + "attention.sliding_window_pattern")) {
+        const auto & v = f.kv.at(prefix + "attention.sliding_window_pattern");
         // The pattern is stored as a bool array (GGUF type 7 = bool, packed into v.arr as 0/1).
         std::vector<bool> pat;
         for (double x : v.arr) pat.push_back(x != 0.0);
@@ -152,7 +163,7 @@ int main(int argc, char ** argv) {
         for (size_t vi = 0; vi < pat.size(); ++vi) {
             int v = int(vi);
             int p;
-            if (v < core0) p = v;
+            if (physical_layout || v < core0) p = v;
             else if (v < core0 + n_pass * n_core) p = core0 + (v - core0) % n_core;
             else p = v - (n_pass - 1) * n_core;
             if (p >= 0 && p < n_layers && !pat[vi]) sliding[p] = false;
@@ -174,8 +185,10 @@ int main(int argc, char ** argv) {
     exp.push_back({"output_norm.weight", true, {uint64_t(H)}, 0});
     exp.push_back({"output_res_query.weight", true, {uint64_t(H)}, 0});
     // loop_res_query / loop_kv_res_query: GGUF ne = [H, 2*n_core] (loader's load_mat swaps to rows=2*n_core, cols=H)
-    exp.push_back({"loop_res_query.weight", true, {uint64_t(H), uint64_t(2 * n_core)}, 0});
-    exp.push_back({"loop_kv_res_query.weight", true, {uint64_t(H), uint64_t(2 * n_core)}, 0});
+    if (!physical_layout) {
+        exp.push_back({"loop_res_query.weight", true, {uint64_t(H), uint64_t(2 * n_core)}, 0});
+        exp.push_back({"loop_kv_res_query.weight", true, {uint64_t(H), uint64_t(2 * n_core)}, 0});
+    }
 
     for (int l = 0; l < n_layers; ++l) {
         const std::string p = "blk." + std::to_string(l) + ".";
@@ -224,18 +237,13 @@ int main(int argc, char ** argv) {
         }
         // Core loop layers: loop_* tensors
         if (l >= core0 && l < core1) {
-            exp.push_back({p + "loop_attn_down.weight", true, {uint64_t(2 * H), 64}, 0});
-            exp.push_back({p + "loop_attn_forget.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_attn_gain.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_k_down.weight", true, {uint64_t(2 * H), 64}, 0});
-            exp.push_back({p + "loop_k_forget.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_k_gain.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_v_down.weight", true, {uint64_t(2 * H), 64}, 0});
-            exp.push_back({p + "loop_v_forget.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_v_gain.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_mlp_down.weight", true, {uint64_t(2 * H), 64}, 0});
-            exp.push_back({p + "loop_mlp_forget.weight", true, {64, uint64_t(H)}, 0});
-            exp.push_back({p + "loop_mlp_gain.weight", true, {64, uint64_t(H)}, 0});
+            if (physical_layout) exp.push_back({p + "loop_msg_query.weight", true, {uint64_t(H), 4}, 0});
+            for (const char * kind : {physical_layout ? "q" : "attn", "k", "v", physical_layout ? "ffn" : "mlp"}) {
+                const std::string ctrl = p + "loop_" + kind + (physical_layout ? "_ctrl_" : "_");
+                exp.push_back({ctrl + "down.weight", true, {uint64_t(2 * H), 64}, 0});
+                exp.push_back({ctrl + "forget.weight", true, {64, uint64_t(H)}, 0});
+                exp.push_back({ctrl + "gain.weight", true, {64, uint64_t(H)}, 0});
+            }
         }
         // Router [n_exp, H]
         exp.push_back({p + "ffn_gate_inp.weight", true, {uint64_t(H), uint64_t(n_exp)}, 0});
@@ -330,13 +338,15 @@ int main(int argc, char ** argv) {
             // Q8_0 (8): yes (I8H). Others: check.
             if (dtype == 40) { has_kernel = true; kernel_path = "NVFP4 expert_matvec"; }
             else if (dtype == 30 || dtype == 1 || dtype == 0) { has_kernel = true; kernel_path = "Fp expert_matvec (BF16/F16)"; }
-            else if (dtype == 8) { has_kernel = true; kernel_path = "I8H expert_matvec"; }
+            else if (dtype == 6 || dtype == 8) { has_kernel = true; kernel_path = "I8H expert_matvec"; }
+            else if (dtype == 12 || dtype == 14) { kernel_path = "K-quant expert_matvec"; }
             else { has_kernel = false; kernel_path = "NO expert_matvec kernel for type " + std::to_string(dtype); }
         } else if (is_projection) {
             // Needs matvec (dense) or matvec_f32
             if (dtype == 40) { has_kernel = false; kernel_path = "NVFP4 has NO dense matvec (expert-only format)"; }
             else if (dtype == 30 || dtype == 1 || dtype == 0) { has_kernel = true; kernel_path = "Fp matvec (BF16/F16/F32)"; }
-            else if (dtype == 8) { has_kernel = true; kernel_path = "I8H matvec"; }
+            else if (dtype == 6 || dtype == 8) { has_kernel = true; kernel_path = "I8H matvec"; }
+            else if (dtype == 12 || dtype == 14) { kernel_path = "K-quant matvec"; }
             else { has_kernel = false; kernel_path = "NO matvec kernel for type " + std::to_string(dtype); }
         } else {
             // Host path: always OK (dequantize_host_rows handles all types)

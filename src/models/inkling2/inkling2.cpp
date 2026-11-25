@@ -114,6 +114,7 @@ struct Layer {
     const float * attn_res_q = nullptr;
     int attn_res_nq = 1;
     const float * ffn_res_q = nullptr;
+    const float * loop_msg_query = nullptr;  // mainline: Q, K, V, FFN rows in one physical layer
     const float * loop_attn_down = nullptr, * loop_attn_forget = nullptr, * loop_attn_gain = nullptr;
     const float * loop_k_down = nullptr, * loop_k_forget = nullptr, * loop_k_gain = nullptr;
     const float * loop_v_down = nullptr, * loop_v_forget = nullptr, * loop_v_gain = nullptr;
@@ -311,8 +312,9 @@ private:
     std::vector<Buf> owned_;
     GgufFile meta_;
 
-    double num(const std::string & k) const { return meta_.num("inkling2." + k); }
-    double num(const std::string & k, double fb) const { return meta_.num("inkling2." + k, fb); }
+    std::string prefix_;
+    double num(const std::string & k) const { return meta_.num(prefix_ + k); }
+    double num(const std::string & k, double fb) const { return meta_.num(prefix_ + k, fb); }
     // First element of an array-valued KV (the root layout stores per-visit scalars as arrays);
     // falls back to the scalar value when the key holds a number.
     double arr0(const std::string & full_key) const {
@@ -369,16 +371,23 @@ private:
     cudaStream_t load_stream() const { return stream_[load_dev_]; }
 
     void configure() {
-        if (meta_.str("general.architecture") != "inkling2") throw std::runtime_error("inkling2: wrong architecture");
+        const std::string arch = meta_.str("general.architecture");
+        const bool physical_layout = arch == "inkling2_loop";
+        if (!physical_layout && arch != "inkling2") throw std::runtime_error("inkling2: wrong architecture");
+        prefix_ = arch + ".";
+        if (physical_layout && (num("loop.varying", 0) != 0 || num("loop.gate_rank") != 64))
+            throw std::runtime_error("inkling2: expected fixed loop and gate rank 64");
         H_ = int(num("embedding_length"));
-        n_visits_ = int(num("block_count"));
-        n_pass_ = int(num("num_loops", 1));
-        core0_ = int(num("loop.core_start", 0));
-        core1_ = int(num("loop.core_end", 0));
+        const int blocks = int(num("block_count"));
+        n_pass_ = int(num(physical_layout ? "loop.count" : "num_loops", 1));
+        core0_ = int(num(physical_layout ? "loop.start" : "loop.core_start", 0));
+        core1_ = int(num(physical_layout ? "loop.end" : "loop.core_end", 0));
+        if (core0_ < 0 || core1_ <= core0_ || core1_ > blocks || n_pass_ < 1)
+            throw std::runtime_error("inkling2: invalid loop bounds");
         // head_count / head_count_kv are stored as arrays (one value per visit) in the root layout;
         // GgufFile::num returns 0 for an array, so read the first element explicitly.
-        n_head_ = int(arr0("inkling2.attention.head_count"));
-        n_kv_ = int(arr0("inkling2.attention.head_count_kv"));
+        n_head_ = int(arr0(prefix_ + "attention.head_count"));
+        n_kv_ = int(arr0(prefix_ + "attention.head_count_kv"));
         hd_ = int(num("attention.key_length"));
         d_rel_ = int(num("attention.relative_length"));
         extent_ = int(num("attention.relative_extent"));
@@ -401,7 +410,11 @@ private:
         vocab_unpadded_ = int(num("vocab_size_unpadded", vocab_));
         if (meta_.has("tokenizer.ggml.eos_token_id")) eos_ = uint32_t(meta_.num("tokenizer.ggml.eos_token_id"));
         const int n_core = core1_ - core0_;
-        n_layers_ = n_visits_ - (n_pass_ - 1) * n_core;
+        const int64_t extra = int64_t(n_pass_ - 1) * n_core;
+        if (physical_layout && extra > INT32_MAX - blocks) throw std::runtime_error("inkling2: loop count overflow");
+        if (!physical_layout && extra >= blocks) throw std::runtime_error("inkling2: no physical layers");
+        n_layers_ = physical_layout ? blocks : blocks - int(extra);
+        n_visits_ = physical_layout ? blocks + int(extra) : blocks;
         if (n_layers_ <= 0 || core0_ < 0 || core1_ <= core0_ || core1_ > n_layers_ || n_pass_ < 1 ||
             vocab_unpadded_ < 16 || vocab_unpadded_ > vocab_ || window_ <= 0 || hd_ <= 0 || hd_ > 256 || n_head_ <= 0 || n_kv_ <= 0 || n_head_ % n_kv_ ||
             n_exp_ <= 0 || k_exp_ <= 0 || k_exp_ > n_exp_ || taps_ < 2 || block_ < 1 || n_layers_ / block_ + 2 > 64)
@@ -416,12 +429,13 @@ private:
         // if any of its visits has pattern=false. The root layout stores this as the only source of
         // the sliding/full distinction; full layers carry attn_{q,k,v}_inp_norm instead of attn_norm.
         sliding_.resize(n_layers_, true);
-        if (meta_.has("inkling2.attention.sliding_window_pattern")) {
-            const auto & v = meta_.kv.at("inkling2.attention.sliding_window_pattern");
-            if (v.arr.size() != phys_.size()) throw std::runtime_error("inkling2: wrong sliding window pattern length");
+        const auto pattern = prefix_ + "attention.sliding_window_pattern";
+        if (meta_.has(pattern)) {
+            const auto & v = meta_.kv.at(pattern);
+            if (v.arr.size() != size_t(blocks)) throw std::runtime_error("inkling2: wrong sliding window pattern length");
             for (size_t vi = 0; vi < v.arr.size(); ++vi) {
                 const int visit = int(vi);
-                const int p = phys_[visit];
+                const int p = physical_layout ? visit : phys_[visit];
                 if (p >= 0 && p < n_layers_ && v.arr[vi] == 0.0) sliding_[p] = false;
             }
         }
@@ -528,8 +542,11 @@ private:
         // The global loop queries are read by the core layers' kernels (loop_messages), so they live on the core's
         // GPU: a kernel cannot read another device's memory.
         set_load_dev(dev_of(core0_));
-        loop_res_q_ = vec("loop_res_query.weight");
-        loop_kv_res_q_ = vec("loop_kv_res_query.weight");
+        const bool physical_layout = prefix_ == "inkling2_loop.";
+        if (!physical_layout) {
+            loop_res_q_ = vec("loop_res_query.weight");
+            loop_kv_res_q_ = vec("loop_kv_res_query.weight");
+        }
         e_ff_ = int(num("expert_feed_forward_length", 1152));
         L_.resize(n_layers_);
         for (int l = 0; l < n_layers_; ++l) {
@@ -566,10 +583,23 @@ private:
             Y.ffn_res_q = vec(p + "ffn_res_query.weight");
             if (!sliding_[l]) { Y.k_conv_proj = load_mat(p + "attn_k_conv_proj.weight"); Y.v_conv_proj = load_mat(p + "attn_v_conv_proj.weight"); }
             if (l >= core0_ && l < core1_) {
-                Y.loop_attn_down = vec(p + "loop_attn_down.weight"); Y.loop_attn_forget = vec(p + "loop_attn_forget.weight"); Y.loop_attn_gain = vec(p + "loop_attn_gain.weight");
-                Y.loop_k_down = vec(p + "loop_k_down.weight"); Y.loop_k_forget = vec(p + "loop_k_forget.weight"); Y.loop_k_gain = vec(p + "loop_k_gain.weight");
-                Y.loop_v_down = vec(p + "loop_v_down.weight"); Y.loop_v_forget = vec(p + "loop_v_forget.weight"); Y.loop_v_gain = vec(p + "loop_v_gain.weight");
-                Y.loop_mlp_down = vec(p + "loop_mlp_down.weight"); Y.loop_mlp_forget = vec(p + "loop_mlp_forget.weight"); Y.loop_mlp_gain = vec(p + "loop_mlp_gain.weight");
+                if (physical_layout) {
+                    const auto name = p + "loop_msg_query.weight";
+                    const auto & dims = tensor(name).ne;
+                    if (dims.size() != 2 || dims[0] != uint64_t(H_) || dims[1] != 4)
+                        throw std::runtime_error("inkling2: expected four message queries in " + name);
+                    Y.loop_msg_query = vec(name);
+                }
+                auto load_control = [&](const std::string & name, const float *& down, const float *& forget, const float *& gain) {
+                    const auto base = p + "loop_" + name + (physical_layout ? "_ctrl_" : "_");
+                    down = vec(base + "down.weight");
+                    forget = vec(base + "forget.weight");
+                    gain = vec(base + "gain.weight");
+                };
+                load_control(physical_layout ? "q" : "attn", Y.loop_attn_down, Y.loop_attn_forget, Y.loop_attn_gain);
+                load_control("k", Y.loop_k_down, Y.loop_k_forget, Y.loop_k_gain);
+                load_control("v", Y.loop_v_down, Y.loop_v_forget, Y.loop_v_gain);
+                load_control(physical_layout ? "ffn" : "mlp", Y.loop_mlp_down, Y.loop_mlp_forget, Y.loop_mlp_gain);
             }
             Y.router = load_mat(p + "ffn_gate_inp.weight");
             if (meta_.tensors.count(p + "exp_probs_b.bias")) Y.probs_bias = expert_vec(p + "exp_probs_b.bias");
@@ -868,10 +898,14 @@ private:
         const int C = H_;
         const __half * bank = st().prev_bank_.as<__half>();
         // Emit [attention, key, value, MLP] directly; both query matrices contain two rows per core layer.
-        const float * q = loop_res_q_ + 2 * i * C;
-        tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, q, 1, C, out, stream());
-        tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, loop_kv_res_q_ + 2 * i * C, 2, C, out + C, stream());
-        tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, q + C, 1, C, out + 3 * C, stream());
+        if (const float * rows = L_[l].loop_msg_query) {
+            tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, rows, 4, C, out, stream());
+        } else {
+            const float * q = loop_res_q_ + 2 * i * C;
+            tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, q, 1, C, out, stream());
+            tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, loop_kv_res_q_ + 2 * i * C, 2, C, out + C, stream());
+            tqllm_cuda::ik2_attn_res(bank, prev_nblocks, prev_last, q + C, 1, C, out + 3 * C, stream());
+        }
         sync_check("loop messages: reorder");
         ck(cudaStreamSynchronize(stream()));  // tmp is freed here: nothing queued may still use it
     }
@@ -1027,7 +1061,10 @@ std::unique_ptr<Engine> make_inkling2_engine_impl(const std::string & path, uint
 }  // namespace
 
 bool is_inkling2_gguf(const std::string & path) {
-    try { return gguf_architecture(path) == "inkling2"; } catch (...) { return false; }
+    try {
+        const auto arch = gguf_architecture(path);
+        return arch == "inkling2" || arch == "inkling2_loop";
+    } catch (...) { return false; }
 }
 
 std::unique_ptr<Engine> make_inkling2_engine(const std::string & path, uint32_t context) {
