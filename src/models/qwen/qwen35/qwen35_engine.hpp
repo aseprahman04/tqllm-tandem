@@ -69,9 +69,7 @@
 #include <utility>
 #include <vector>
 
-#ifndef TQLLM_VERIFY_COLUMNS
-#define TQLLM_VERIFY_COLUMNS 16
-#endif
+#include "verify_columns.hpp"
 
 namespace tqllm {
 void check_grouped_expert_format(const Mat & m, const std::string & prefix);
@@ -604,7 +602,7 @@ private:
     // Larger chunks amortise the per-chunk FP16 weight dequant; the size follows the context budget (buffer memory).
     int NPF = 512, NBUF = 512;
     static constexpr int NGEMM_BLAS = 128;  // columns from which projections dequantize to FP16 and run on cuBLAS
-    static_assert(NVER >= 8 && NVER <= 16);
+    static_assert(NVER <= kReplayColumns);
     int cur = 0;
     bf16 * conv_slot(uint32_t lin, int slot) { return conv_state[lin * NSLOT + (slot % NSLOT)].as<bf16>(); }
     float * rec_slot(uint32_t lin, int slot) { return rec_state[lin * NSLOT + (slot % NSLOT)].as<float>(); }

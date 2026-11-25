@@ -1,10 +1,11 @@
 #pragma once
 #include <algorithm>
+#include "verify_columns.hpp"
 
 namespace tqllm {
 // Verify columns of one token-tree step: nt tree columns (root + drafts) and nl prompt-lookup / copy columns. The hybrid
 // models' GDN layers replay at most kGdnReplayCols columns per verify, so drafts and copies share that budget.
-inline constexpr int kGdnReplayCols = 16;
+inline constexpr int kGdnReplayCols = kReplayColumns;
 // longest lookup chain to ask for: leaves the root and at least one draft
 inline int lookup_limit(int requested, int cap) { return std::max(0, std::min(requested, cap - 2)); }
 // lookup-first takes the whole block except the root

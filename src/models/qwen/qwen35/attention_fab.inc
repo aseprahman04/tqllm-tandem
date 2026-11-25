@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(DIM) attn_blk_k(const __nv_bfloat16 * q, const
     __shared__ int slot[MAXK];
     const int h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, lane = d % 32, wid = d / 32;
     const int pos = *dseq0 - 1, kh = h / (heads / kvheads);
-    int path[16], len = 0;
+    int path[tqllm_dev::TREE_MAX_DEPTH + 1], len = 0;
     for (int a = z; a >= 0; a = par[a]) path[len++] = a;  // z .. root; depth e is path[len - 1 - e]
     const int qpos = pos + len - 1, from = tq_split_point(qpos), nk = qpos - from + 1;
     if (d < nk) {  // canonical positions: committed cache, then this node's ancestors

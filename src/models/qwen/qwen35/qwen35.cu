@@ -1,4 +1,5 @@
 #include "zero_copy_guard.hpp"
+#include "verify_columns.hpp"
 #include <cstdlib>
 #include "qwen35_kernels.cuh"
 
@@ -146,17 +147,18 @@ __global__ void gated_rms_k(const __nv_bfloat16 * x, const __nv_bfloat16 * z, co
 }
 
 
+template <int MaxColumns>
 __global__ void conv_multi_k(const __nv_bfloat16 * xin, int xs_, int n, const __nv_bfloat16 * sin, __nv_bfloat16 * sout,
                              const float * w, __nv_bfloat16 * y, int C, const int * par = nullptr,
                              const tqllm_cuda::ConvReplay rp = {}) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (par) {  // tree: node i's window is its three nearest ancestors (then the conv state), as along a chain
-        __shared__ int spar[16];
-        if (threadIdx.x < n && threadIdx.x < 16) spar[threadIdx.x] = par[threadIdx.x];
+        __shared__ int spar[MaxColumns];
+        if (threadIdx.x < n) spar[threadIdx.x] = par[threadIdx.x];
         __syncthreads();
         if (c >= C) return;
         const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-        __nv_bfloat16 xs[16];
+        __nv_bfloat16 xs[MaxColumns];
         for (int i = 0; i < n; ++i) xs[i] = xin[int64_t(i) * xs_ + c];
         __nv_bfloat16 hs[3] = {sin[c], sin[C + c], sin[2 * C + c]};  // s0, s1, s2 (s2 most recent)
         const int pend = rp.pend ? *rp.pend : 0;
@@ -239,14 +241,14 @@ __global__ void conv_long_k(const __nv_bfloat16 * xin, int xs_, int n, const __n
 // q / k / v and gates are fetched up front and the norms computed in one pass, so the recurrence itself only reads
 // shared memory and registers (no block barriers between tokens).
 constexpr int GDN_SL = 4, GDN_CPB = 4 * (32 / GDN_SL);
-template <int DK>
+template <int DK, int NMAX>
 __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0,
                                                    const __nv_bfloat16 * b0, int abs_, const float * neg_a,
                                                    const float * dt_bias, const float * sin, float * sout,
                                                    __nv_bfloat16 * y, int kheads, int vheads, int dv, bool tiled,
                                                    const int * par = nullptr, const tqllm_cuda::GdnReplay rp = {}) {
     static_assert(DK == 128, "one element per thread for the q / k loads");
-    constexpr int SL = GDN_SL, CPW = 32 / SL, R = DK / SL, NMAX = 16;
+    constexpr int SL = GDN_SL, CPW = 32 / SL, R = DK / SL;
     // tree + deferred commit (rp.pend): the previous step's accepted path (rp.* rows, *rp.pend tokens) first, then its
     // state -> rp.smid, then the tree from there. Tokens 0 .. pend - 1 are the replay, pend .. pend + n - 1 the tree.
     const int pend = par && rp.pend ? *rp.pend : 0;
@@ -952,17 +954,31 @@ void conv_multi(const __nv_bfloat16 * xin, int x_stride, int n, const __nv_bfloa
                                                                                                 y, channels);
         return;
     }
-    conv_multi_k<<<(channels + 255) / 256, 256, 0, s>>>(xin, x_stride, n, in, out, w, y, channels, par, rp);
+    if (par && n > tqllm::kReplayColumns) throw std::invalid_argument("conv_multi: tree exceeds replay width");
+    if constexpr (tqllm::kReplayColumns > 16) {
+        if (par && n > 16) {
+            conv_multi_k<tqllm::kReplayColumns><<<(channels + 255) / 256, 256, 0, s>>>(xin, x_stride, n, in, out, w, y, channels, par, rp);
+            return;
+        }
+    }
+    conv_multi_k<16><<<(channels + 255) / 256, 256, 0, s>>>(xin, x_stride, n, in, out, w, y, channels, par, rp);
 }
 
 void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const __nv_bfloat16 * b0, int ab_stride,
                const float * neg_a, const float * dt_bias, const float * in, float * out, __nv_bfloat16 * y, int kheads,
                int vheads, int dk, int dv, bool tiled, cudaStream_t s, const int * par, const GdnReplay & rp) {
     if (dk != 128 || dv % 32) throw std::invalid_argument("gdn_multi: dk 128, dv % 32 == 0");
-    if (par && n > 16) throw std::invalid_argument("gdn_multi: tree mode needs n <= 16");
+    if (par && n > tqllm::kReplayColumns) throw std::invalid_argument("gdn_multi: tree exceeds replay width");
     if (rp.smid && !par) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode");
     if (dv % GDN_CPB) throw std::invalid_argument("gdn_multi: dv % columns per block");
-    gdn_multi_k<128><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
+    if constexpr (tqllm::kReplayColumns > 16) {
+        if (par && n > 16) {
+            gdn_multi_k<128, tqllm::kReplayColumns><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride,
+                    neg_a, dt_bias, in, out, y, kheads, vheads, dv, tiled, par, rp);
+            return;
+        }
+    }
+    gdn_multi_k<128, 16><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
                                                           vheads, dv, tiled, par, rp);
 }
 

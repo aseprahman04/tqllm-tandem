@@ -262,7 +262,7 @@ namespace {
 __global__ void dflash_tree_k(const uint32_t * idx, const float * score, const uint32_t * anchor, int B, int budget,
                               uint32_t * tok, int * par, int * dep, float inv_temp) {
     if (threadIdx.x || blockIdx.x) return;
-    constexpr int MAXN = 16, POOL = 256;
+    constexpr int MAXN = tqllm::kGdnReplayCols, POOL = MAXN * 16;
     float nlp[MAXN], plp[POOL];
     int ncand[MAXN], ndep[MAXN], pd[POOL], pc[POOL], pp[POOL], np = 0, n = 1;
     tok[0] = *anchor, par[0] = -1, dep[0] = 0, nlp[0] = 0.f, ncand[0] = 0, ndep[0] = 0;

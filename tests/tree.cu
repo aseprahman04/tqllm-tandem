@@ -13,6 +13,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <random>
+#include "verify_columns.hpp"
 #include <vector>
 
 namespace {
@@ -169,8 +170,8 @@ void test_conv_long() {  // long blocks (token-parallel kernel) == the same toke
     cudaFree(dx), cudaFree(dst), cudaFree(dw), cudaFree(dso), cudaFree(dsa), cudaFree(dsb), cudaFree(dy), cudaFree(dy2);
 }
 
-void test_replay() {  // deferred commit: replay + tree in one kernel == replay (chain) then tree, outputs and mid state
-    const int n = 8, k = 5, kh = 16, vh = 48, dk = 128, dv = 128, qkv = 2 * kh * dk + vh * dv, ab = 2 * vh, C = 10240;
+void test_replay(int n = 8, int k = 5) {  // deferred commit: replay + tree in one kernel == replay (chain) then tree, outputs and mid state
+    const int kh = 16, vh = 48, dk = 128, dv = 128, qkv = 2 * kh * dk + vh * dv, ab = 2 * vh, C = 10240;
     bool ok = true;
     for (int trial = 0; trial < 3; ++trial) {
         const auto par = random_tree(n);
@@ -252,7 +253,10 @@ void test_attention(int n, int pos) {
     bool ok = true;
     float maxerr = 0.f;
     for (int trial = 0; trial < 4; ++trial) {
-        const auto par = random_tree(n);
+        const auto par = n > 16 && trial == 0 ? chain(n) : random_tree(n);
+        auto depth = chain(n);
+        for (int &v : depth) ++v;
+        auto * chain_dep = dev(depth);
         const auto kc = randb(size_t(ctx) * kvw), vc = randb(size_t(ctx) * kvw), q = randb(size_t(n) * heads * dim);
         auto *dk = dev(kc), *dv = dev(vc), *dq = dev(q);
         bf16 * dy = nullptr;
@@ -285,7 +289,7 @@ void test_attention(int n, int pos) {
                 auto * dch = dev(chain(mb));
                 const std::vector<int> dpos2{pos + c, pos + c + 1};
                 auto * dp2 = dev(dpos2);
-                tqllm_cuda::attention_mq256(dq2, dk2, dv2, dy, part, dp2 + 1, mb, heads, kvh, scale, nsplit, nullptr, 0, dch);
+                tqllm_cuda::attention_mq256(dq2, dk2, dv2, dy, part, dp2 + 1, mb, heads, kvh, scale, nsplit, nullptr, 0, dch, chain_dep);
                 const auto yc = host(dy, size_t(mb) * heads * dim);
                 ok &= same(&yt[size_t(z) * heads * dim], &yc[size_t(mb - 1) * heads * dim], size_t(heads) * dim);
                 cudaFree(dk2), cudaFree(dv2), cudaFree(dq2), cudaFree(dch), cudaFree(dp2);
@@ -304,7 +308,7 @@ void test_attention(int n, int pos) {
             }
             auto *dk2 = dev(kc2), *dv2 = dev(vc2), *dq2 = dev(q2);
             auto * dch = dev(chain(m));
-            tqllm_cuda::attention_mq256(dq2, dk2, dv2, dy, part, dp + 1, m, heads, kvh, scale, nsplit, nullptr, 0, dch);
+            tqllm_cuda::attention_mq256(dq2, dk2, dv2, dy, part, dp + 1, m, heads, kvh, scale, nsplit, nullptr, 0, dch, chain_dep);
             const auto yc = host(dy, size_t(m) * heads * dim);
             ok &= same(&yt[size_t(z) * heads * dim], &yc[size_t(m - 1) * heads * dim], size_t(heads) * dim);
             // FP64 reference for node z (keys 0 .. pos - 1, then the path)
@@ -335,6 +339,7 @@ void test_attention(int n, int pos) {
             cudaFree(dk2), cudaFree(dv2), cudaFree(dq2), cudaFree(dch);
         }
         cudaFree(dk), cudaFree(dv), cudaFree(dq), cudaFree(dy), cudaFree(part), cudaFree(dp), cudaFree(dpar);
+        cudaFree(chain_dep);
     }
     report("attention tree == path, any block start", ok);
     std::printf("%-28s max_abs %.3e vs FP64\n", "attention tree accuracy", maxerr);
@@ -424,7 +429,10 @@ void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, 
     bool ok = true;
     float maxdiff = 0.f;
     for (int trial = 0; trial < 2; ++trial) {
-        const auto par = random_tree(n);
+        const auto par = n > 16 && trial == 0 ? chain(n) : random_tree(n);
+        auto depth = chain(n);
+        for (int &v : depth) ++v;
+        auto * chain_dep = dev(depth);
         std::vector<int> dep(n, 0);
         for (int i = 1; i < n; ++i) dep[i] = dep[par[i]] + 1;
         const auto kv = randb(size_t(ctx) * 2 * kvh * dim), q = randb(size_t(n) * qw);
@@ -461,7 +469,7 @@ void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, 
                 auto * dch = dev(chain(mb));
                 auto * dp2 = dev(std::vector<int>{pos + c, pos + c + 1});
                 tqllm_cuda::attention_kv_split(kcod, vcod, dq2, dk2, dv2, dy, part, dp2 + 1, mb, heads, kvh, scale, nsplit,
-                                               nullptr, dch);
+                                               nullptr, dch, chain_dep);
                 const auto yc = host(dy, size_t(mb) * qw);
                 ok &= same(&yt[size_t(z) * qw], &yc[size_t(mb - 1) * qw], qw);
                 if (c == 0) {  // plain attention of the same chain (int8 Q, different summation): close, not equal
@@ -478,6 +486,7 @@ void test_attention_codec(const char * name, KvCodec kcod, KvCodec vcod, int n, 
         }
         cudaFree(dkv), cudaFree(dq), cudaFree(d0), cudaFree(dk), cudaFree(dv), cudaFree(dy), cudaFree(part), cudaFree(dp),
             cudaFree(dpar), cudaFree(ddep);
+        cudaFree(chain_dep);
     }
     char label[64];
     std::snprintf(label, sizeof label, "attn %s n%d pos%d", name, n, pos);
@@ -527,6 +536,11 @@ int main() {
     test_conv();
     test_conv_long();
     test_replay();
+    if constexpr (tqllm::kReplayColumns > 16) {
+        test_replay(tqllm::kReplayColumns, tqllm::kReplayColumns - 1);
+        test_attention(tqllm::kReplayColumns, 350);
+        test_attention_codec("wide tq3/tq3", KvCodec::Tq3, KvCodec::Tq3, tqllm::kReplayColumns, 350);
+    }
     test_rope();
     test_attention(8, 333);
     test_attention(12, 333);  // > 8 queries: tiled part in chunks
