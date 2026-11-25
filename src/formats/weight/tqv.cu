@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <type_traits>
 
@@ -198,10 +199,33 @@ __global__ void __launch_bounds__(256, 2) tqv12_matvec_k(const uint4 * __restric
 namespace {
 // Kernel choice per shape (3090 measurements in tqv12_pick's comments; same numbers in every choice).
 struct TqvPick { int mt, pf, persist; };
+// The dispatch table is shared across devices. Keep the default on mixed-GPU hosts.
+bool all_rtx5060ti() {
+    static const bool match = [] {
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return false;
+        for (int device = 0; device < count; ++device) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, device) != cudaSuccess ||
+                std::strcmp(prop.name, "NVIDIA GeForce RTX 5060 Ti") != 0) return false;
+        }
+        return true;
+    }();
+    return match;
+}
 TqvPick tqv12_pick(int rows, int k, int nc, int variant) {
     if (variant > 0) {  // tests / benches: variant - 1 = mt2 * 4 + pf * 2 + persist
         const int v = variant - 1;
         return {(v >> 2) & 1 ? 2 : 1, (v >> 1) & 1, v & 1};
+    }
+    // Two 5060 Ti cards, cold weight buffers: 8-16% faster in these TP projections.
+    if ((nc == 8 || nc == 16) && all_rtx5060ti()) {
+        if (nc == 16 && rows == 5120 && k == 8704) return {1, 1, 1};
+        if (nc == 8) {
+            if (rows == 5120 && k == 3072) return {1, 0, 1};
+            if (rows == 7168 && k == 5120) return {1, 1, 1};
+            if ((rows == 8192 || rows == 17408) && k == 5120) return {1, 1, 0};
+        }
     }
     // 3090 (test-tqv12-format --bench, second run after the early table staging; us at 1 / 8 / 16 columns):
     //   few rows: <= 4 columns 1 tile + prefetch (5120 x 17408 59.1 vs 64.1 for 2 tiles; 5120 x 6144 24.5 vs 24.9);
