@@ -1300,8 +1300,11 @@ public:
     void inj_mm(const Mat & m, const bf16 * in, bf16 * out, int n);
     // Encodes n rows of target features (device [n][nf*H]) for positions pos.. and writes every drafter layer's K/V.
     void dflash_inject(const bf16 * feats, int n, uint32_t pos) {
-        set_dpos(pos);
-        dflash_inject_body(feats, n);
+        const size_t stride = size_t(cfg.hidden) * dfl.target_ids.size();
+        for (int c = 0; c < n; c += DFlash::injBatch) {
+            set_dpos(pos + c);
+            dflash_inject_body(feats + size_t(c) * stride, std::min(n - c, DFlash::injBatch));
+        }
     }
     void dflash_inject_body(const bf16 * feats, int n);
 
