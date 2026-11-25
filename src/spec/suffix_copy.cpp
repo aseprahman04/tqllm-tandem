@@ -33,7 +33,7 @@ void SuffixCopy::reset() {
     last_match_ = 0;
 }
 
-std::vector<uint32_t> SuffixCopy::propose(int max_tokens, size_t prompt_end, int min_prompt_match) const {
+std::vector<uint32_t> SuffixCopy::propose(int max_tokens) const {
     last_match_ = 0;
     const size_t n = context_.size();
     if (max_tokens < 1 || n < size_t(options_.min_match) + 1) return {};
@@ -41,7 +41,7 @@ std::vector<uint32_t> SuffixCopy::propose(int max_tokens, size_t prompt_end, int
     if (it == index_.end()) return {};
     const auto& ends = it->second;
     size_t best_end = 0;
-    int best = 0, ties = 0;
+    int best = 0;
     int examined = 0;
     // newest first, so an equally long older repeat never replaces a newer one
     for (size_t k = ends.size(); k-- > 0 && examined < options_.max_candidates;) {
@@ -51,19 +51,9 @@ std::vector<uint32_t> SuffixCopy::propose(int max_tokens, size_t prompt_end, int
         int match = 0;
         while (match < options_.max_match && size_t(match) < end && context_[end - 1 - match] == context_[n - 1 - match])
             ++match;
-        if (match > best) {
-            best = match;
-            best_end = end;
-            ties = 1;
-        } else if (match == best) {
-            ++ties;
-        }
+        if (match > best) best = match, best_end = end;
     }
-    if (best < options_.min_match) {
-        if (min_prompt_match < options_.key || best < min_prompt_match || ties != 1 ||
-            ends.size() - 1 > size_t(options_.max_candidates) || prompt_end > n ||
-            best_end > prompt_end || size_t(max_tokens) > prompt_end - best_end) return {};
-    }
+    if (best < options_.min_match) return {};
     last_match_ = best;
     // the tokens after the repeat; a repeat that runs into the suffix continues with its own period (n - best_end)
     std::vector<uint32_t> draft;
