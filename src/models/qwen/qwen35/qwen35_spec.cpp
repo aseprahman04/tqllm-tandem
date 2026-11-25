@@ -685,13 +685,21 @@ bool Qwen35Engine::dflash_advance() {
         const auto t1 = now();
         h_pos[0] = int(pos);
         h_pos[1] = int(pos) + 1;
+        const bool direct_copy = copy_chain && defer;
+        linear_copy_step = direct_copy;
         tree_step = true;
         verify_async(nullptr, h_pos, n, pos, res.data(), true);
         tree_step = false;
+        linear_copy_step = false;
         std::vector<int> tpar(static_cast<size_t>(n) + 0);
         in.resize(size_t(n));
-        ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
-        ck(cudaMemcpyAsync(tpar.data(), d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+        if (copy_chain) {
+            in[0] = pending;
+            std::copy_n(lk, nl, in.begin() + 1);
+        } else {
+            ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+            ck(cudaMemcpyAsync(tpar.data(), d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+        }
         if (sampling()) queue_sample(0, n, samp.temperature);  // every node's draw: the walk below follows them
         sync_ck();
         const auto t2 = now();
@@ -748,6 +756,8 @@ bool Qwen35Engine::dflash_advance() {
         };
         if (sampling()) {
             // path built above
+        } else if (copy_chain) {
+            for (int c = 1; c < n && in[c] == res[c - 1]; ++c) path.push_back(c);
         } else if (nl) {
             walk(0);
             path = best;
@@ -803,7 +813,13 @@ bool Qwen35Engine::dflash_advance() {
                                         int(pos), stream);
             }
         }
-        if (defer) {  // deferred commit: the next verify replays this path in its GDN / conv kernels
+        if (direct_copy && j + 1 == n) {
+            // The verified linear block already wrote its final recurrent state into the spare
+            // slot. A partial match must instead replay the accepted prefix from the old slot.
+            cur = (cur + 1) % NSLOT;
+            last_n = 0;
+            dflash_inject(v_feat.as<bf16>(), n, pos);
+        } else if (defer) {  // deferred commit: the next verify replays this path in its GDN / conv kernels
             if (pend_k) cur = (cur + 1) % NSLOT;  // this verify wrote the previous path's state into slot cur + 1
             pend_sp = sp;
             sp ^= 1;

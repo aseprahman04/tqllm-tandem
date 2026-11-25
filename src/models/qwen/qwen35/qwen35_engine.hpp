@@ -750,6 +750,7 @@ private:
     Buf d_tpar, d_tdep, d_chain, d_cdep, d_tcols, d_gdesc;
     const int * vpar = nullptr, * vdep = nullptr;
     bool tree_step = false;  // the current verify block is a drafted tree (d_tpar / d_tdep)
+    bool linear_copy_step = false;  // all rows are a single prompt copy in physical slot order
     void swap_seq(SeqState & s);
     std::mt19937_64 rng{0};
     Buf s_id, s_lg, s_scr;
@@ -1011,12 +1012,13 @@ public:
         join_commit();  // a commit replay on the side stream writes the state this verify reads
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
-        if (!(defer && tree_step && n <= verify_limit())) flush_pending();
+        if (!(defer && tree_step && !linear_copy_step && n <= verify_limit())) flush_pending();
         // every verify-sized block (decode included) goes through the two-part attention when the KV format has it: a tree
         // with its parents, anything else as a chain. One arithmetic for plain decode, chain / MTP / tree verify, so greedy
         // speculative output equals plain decoding (one-part causal attention groups the sums differently: tests/tree.cu)
-        vpar = n <= verify_limit() && chain2 ? (tree_mode && tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
-        vdep = !vpar ? nullptr : tree_mode && tree_step ? d_tdep.as<int>() : d_cdep.as<int>();
+        const bool branched = tree_mode && tree_step && !linear_copy_step;
+        vpar = n <= verify_limit() && chain2 ? (branched ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
+        vdep = !vpar ? nullptr : branched ? d_tdep.as<int>() : d_cdep.as<int>();
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
         bucket = dfl.dspine ? context_ : std::min(bucket, context_);
