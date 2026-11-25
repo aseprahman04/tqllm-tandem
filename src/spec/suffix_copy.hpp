@@ -28,7 +28,9 @@ public:
 
     // The copy draft for the current context: up to `max_tokens` tokens that followed the longest earlier repeat of the
     // context's suffix (the most recent one among equally long repeats). Empty when no repeat reaches min_match.
-    std::vector<uint32_t> propose(int max_tokens) const;
+    // A shorter match may be used when it has a unique longest source and the complete
+    // proposal is already inside the original prompt. A zero prompt_end disables this.
+    std::vector<uint32_t> propose(int max_tokens, size_t prompt_end = 0, int min_prompt_match = 0) const;
     int last_match() const { return last_match_; }  // the matched length of the last propose() (0: none)
     size_t size() const { return context_.size(); }
 

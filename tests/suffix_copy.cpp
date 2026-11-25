@@ -85,6 +85,14 @@ int main() {
         }
         expect(threw, "min_match below key refused");
     }
+    {
+        auto unique = make(2, 6, {8, 1, 2, 3, 7, 9, 10, 1, 2, 3});
+        expect(unique.propose(2, 7, 3) == Tokens({7, 9}), "unique short source inside prompt");
+        expect(unique.propose(2, 5, 3).empty(), "short proposal crosses prompt boundary");
+        expect(unique.propose(2).empty(), "ordinary minimum still applies");
+        auto tied = make(2, 6, {8, 1, 2, 3, 7, 9, 10, 1, 2, 3, 5, 6, 11, 1, 2, 3});
+        expect(tied.propose(2, 13, 3).empty(), "equally long sources need the ordinary minimum");
+    }
     if (failures) return 1;
     std::printf("suffix_copy: ok\n");
     return 0;

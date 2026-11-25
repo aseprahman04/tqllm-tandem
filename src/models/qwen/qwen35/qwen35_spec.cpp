@@ -651,7 +651,8 @@ bool Qwen35Engine::dflash_advance() {
             const int copy_width = defer && std::string_view(kvf->name()) == "tq3" ? cap : std::min(cap, 32);
             const bool wide = copy_width > NV && can_merge && nslots == 1 && !dfl.dspark && !dfl.dspine && !qsa.on &&
                               !kv_cmp && !mm_chunk && size_t(pos) + copy_width <= context_;
-            const auto cp = gen.copy.propose(wide ? copy_width - 1 : can_merge ? NV - 1 : NV - nt);
+            const auto cp = gen.copy.propose(wide ? copy_width - 1 : can_merge ? NV - 1 : NV - nt,
+                                             wide ? gen.P : 0, wide ? 8 : 0);
             copy_chain = wide && int(cp.size()) == copy_width - 1;
             if (copy_chain) {
                 // Deep copy paths occupy consecutive physical KV slots in token order. Any rows
