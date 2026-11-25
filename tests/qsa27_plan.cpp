@@ -51,7 +51,7 @@ int main() {
     {  // a new request keeps a shorter prefix: blocks past it are rebuilt, rows without keys stay dense
         QsaPlan p;
         p.write(0, 30000, true, false, from);
-        CHECK(p.write(30000, 8, true, true, from).mode == 1 && p.made == 29984 / 4);
+        CHECK(p.write(30000, 8, true, true, from).mode == 1 && p.made == qsa_split_point(30007) / 4);
         p.write(10000, 512, true, false, from);
         CHECK(p.made == 2500 && p.keyed == 10512);
         const auto s = p.write(10512, 8, true, true, from);

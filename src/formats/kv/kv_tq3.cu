@@ -550,8 +550,12 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
     constexpr int DIM = 256, MAXK = TREE_MAX_DEPTH + 33;
     constexpr bool KT = std::is_same_v<KC, kvc::Tcq3>, VT = std::is_same_v<VC, kvc::Tcq2>;
     __shared__ float s_cbk[KT ? 128 : 1], s_cbv[VT ? 128 : 1];
-    __shared__ __align__(16) int8_t k8[MAXK * DIM];
-    __shared__ __align__(16) __half vh[MAXK * DIM];
+    // At width 32 the two decoded tiles together exceed the static shared-memory limit.
+    // After the score reduction the keys are dead. Stage the values in the same tile.
+    constexpr bool reuse_tile = tqllm::kReplayColumns > 24;
+    __shared__ __align__(16) uint8_t tile[MAXK * DIM * (reuse_tile ? 2 : 3)];
+    auto * k8 = reinterpret_cast<int8_t *>(tile);
+    auto * vh = reinterpret_cast<__half *>(tile + (reuse_tile ? 0 : MAXK * DIM));
     __shared__ float ksf[MAXK * 8], qr[DIM], sc[MAXK];
     __shared__ int slot[MAXK];
     const int h = blockIdx.x, z = blockIdx.y, d = threadIdx.x, lane = d % 32, wid = d / 32;
@@ -585,8 +589,10 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
         __half ks, vs;
         KC::load(kc + (int64_t(slot[i]) * kvheads + kh) * KC::RB, b, kw, ks);
         KC::store_k(kw, ks, k8 + i * DIM + b * 32, ksf[i * 8 + b], s_cbk);
-        VC::load(vc + (int64_t(slot[i]) * kvheads + kh) * VC::RB, b, vw, vs);
-        VC::store_v(vw, vs, vh + i * DIM + b * 32, s_cbv);
+        if constexpr (!reuse_tile) {
+            VC::load(vc + (int64_t(slot[i]) * kvheads + kh) * VC::RB, b, vw, vs);
+            VC::store_v(vw, vs, vh + i * DIM + b * 32, s_cbv);
+        }
     }
     __syncthreads();
     for (int i = wid; i < nk; i += DIM / 32) {  // one warp per key, 8 dims per lane, fixed-order reduction
@@ -599,6 +605,16 @@ __global__ void __launch_bounds__(256) attn_blk_codec_k(const __nv_bfloat16 * q,
         if (lane == 0) sc[i] = v * scale;
     }
     __syncthreads();
+    if constexpr (reuse_tile) {
+        for (int u = d; u < nk * 8; u += DIM) {
+            const int i = u / 8, b = u % 8;
+            uint32_t vw[VC::NW];
+            __half vs;
+            VC::load(vc + (int64_t(slot[i]) * kvheads + kh) * VC::RB, b, vw, vs);
+            VC::store_v(vw, vs, vh + i * DIM + b * 32, s_cbv);
+        }
+        __syncthreads();
+    }
     float m = -CUDART_INF_F;
     for (int i = 0; i < nk; ++i) m = fmaxf(m, sc[i]);
     float l = 0.f, o = 0.f;
