@@ -15,7 +15,7 @@ static bool sample_chain() {
 
 void Qwen35Engine::verify(const uint32_t * tokens, int n, uint32_t pos, uint32_t * next) {
     if (!fmt_target) throw std::runtime_error("verify() needs a quantized GGUF model (a registered weight format)");
-    if (n < 1 || n > NVER || pos + n > context_) throw std::runtime_error("verify: bad token count or position");
+    if (n < 1 || n > verify_limit() || pos + n > context_) throw std::runtime_error("verify: bad token count or position");
     for (int i = 0; i < n; ++i) h_tok[i] = tokens[i];
     h_pos[0] = int(pos);
     h_pos[1] = int(pos) + 1;
@@ -96,7 +96,7 @@ void Qwen35Engine::verify_body(int n, int max_seq, int part) {
             const int rows = mix_rows(L);
             // verify blocks project straight into this layer's stash, which commit(k < n) replays (no copy);
             // prefill chunks are always committed whole
-            bf16 * TL = n <= NVER || !segs.empty() ? v_stash2[sp][lin_i].as<bf16>() : T;
+            bf16 * TL = n <= verify_limit() || !segs.empty() ? v_stash2[sp][lin_i].as<bf16>() : T;
             mix_mm(L, TL, n);
             st("gdn_mix_matvec(+ba)");
             bf16 * QKVC = v_qkvc.as<bf16>();
@@ -154,7 +154,7 @@ void Qwen35Engine::verify_body(int n, int max_seq, int part) {
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {  // batched verify: one head pass over every slot's columns (per-column results unchanged)
         head_argmax(out_norm, n, 0);
-    } else if (n > NVER) {  // prefill chunk: only the final chunk's last position needs the head
+    } else if (n > verify_limit()) {  // prefill chunk: only the final chunk's last position needs the head
         if (prefill_final) {
             ck(cudaMemcpyAsync(X, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
             head_argmax(out_norm, 1);
@@ -191,12 +191,12 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
     if (use_mtp) {
         if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
         if (nslots != 1) throw std::runtime_error("--mtp currently needs --np 1");
-        if (D < 1 || D >= NVER) throw std::runtime_error("MTP draft length exceeds verify capacity");
+        if (D < 1 || D >= kBaseVerifyColumns) throw std::runtime_error("MTP draft length exceeds verify capacity");
     }
     // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
     if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
-    D = dfl_on ? std::min(D, tree_mode && !(sampling() && sample_chain()) ? std::min(NVER, 16) - 1 : std::min(NVER - 1, dfl.block - 1)) : use_mtp ? D : 0;
-    const int reserve = use_mtp ? D + 1 : std::max(dfl.block, int(NVER)) + 1;
+    D = dfl_on ? std::min(D, tree_mode && !(sampling() && sample_chain()) ? kBaseVerifyColumns - 1 : std::min(kBaseVerifyColumns - 1, dfl.block - 1)) : use_mtp ? D : 0;
+    const int reserve = use_mtp ? D + 1 : std::max(dfl.block, kBaseVerifyColumns) + 1;
     if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
         throw std::runtime_error("request exceeds context capacity");
     if (use_mtp) {
@@ -260,7 +260,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         const std::string * tf_dump = tqllm::debug_value("tf_dump");
         const char * tf_path = tf_dump && !tf_dump->empty() ? tf_dump->c_str() : nullptr;
         // prefill chunk: NPF tokens through the GEMM path (the dump needs every argmax)
-        const int CH = tf_path ? NVER : std::clamp(NPF, 1, NBUF);
+        const int CH = tf_path ? kBaseVerifyColumns : std::clamp(NPF, 1, NBUF);
         // the kept state sits on the chunk grid a cold prefill uses (multiples of CH from 0), at least kTail before the
         // end, so a later turn that resumes there prefills exactly the chunks a cold prefill would: same kernels, same
         // numbers, the same reply as with the cache off
@@ -288,7 +288,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
         // Where the final chunk's head left the last prompt position's top-16 (verify_body): a chunk longer than NVER runs
         // the head on its last position only, into column 0; a shorter one (a chat prompt's last message is a chunk of its
         // own, a few tokens) runs it on every column, so the last position is column m - 1.
-        const auto final_top16 = [](int m) { return m <= NVER ? size_t(m - 1) * 16 : size_t(0); };
+        const auto final_top16 = [](int m) { return m <= kBaseVerifyColumns ? size_t(m - 1) * 16 : size_t(0); };
         try {
             for (uint32_t t = P0, ci = 0; t < P; t += uint32_t(m_last), ++ci) {
                 const int m = int(std::min<uint32_t>(chunk_end(starts, t, P, uint32_t(CH)) - t, snap > t ? snap - t : P));
@@ -463,7 +463,7 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
-        return tqllm::qwen35::verify_column_budget(major, integrated != 0, NB);
+        return tqllm::qwen35::verify_column_budget(major, integrated != 0, kBaseVerifyColumns * nslots);
     }();
     int live = 0;
     for (int i = 0; i < ns; ++i) {
@@ -631,7 +631,7 @@ bool Qwen35Engine::dflash_advance() {
         // draft -> tree -> verify queued back to back on the device; one host sync after the verify
         const auto t0 = now();
         uint32_t lk[NVER];
-        constexpr int NV = std::min(NVER, 16);
+        constexpr int NV = kBaseVerifyColumns;
         int nl = opt.lookup ? lookup(lk, tqllm::lookup_limit(opt.lookup, NV)) : 0;
         // lookup-first (--lookup-first k): a context match of >= k tokens takes the whole verify block
         bool lf = false;
@@ -646,7 +646,8 @@ bool Qwen35Engine::dflash_advance() {
             for (; gen.copied < out.size(); ++gen.copied) gen.copy.append(out[gen.copied]);
             nt = 1 + std::min(D, tqllm::kCopyDrafterSiblings);
             const bool can_merge = tp && !sampling() && nt == 2;
-            const bool wide = NVER > NV && can_merge && !dfl.dspark && qsa.from <= 0;
+            const bool wide = NVER > NV && can_merge && nslots == 1 && !dfl.dspark && !dfl.dspine && !qsa.on &&
+                              !kv_cmp && !mm_chunk && size_t(pos) + NVER <= context_;
             const auto cp = gen.copy.propose(wide ? NVER - 1 : can_merge ? NV - 1 : NV - nt);
             copy_chain = wide && int(cp.size()) == NVER - 1;
             if (copy_chain) {
@@ -966,7 +967,7 @@ uint32_t Qwen35Engine::mtp_run(const uint32_t * tokens, const bf16 * hidden, int
     uint32_t bucket = 256;
     while (bucket < pos + n) bucket *= 2;
     bucket = std::min(bucket, context_);
-    vpar = chain2 && n <= NVER ? d_chain.as<int>() : nullptr;  // the MTP layer's attention: two-part chain like the verify
+    vpar = chain2 && n <= verify_limit() ? d_chain.as<int>() : nullptr;  // the MTP layer's attention: two-part chain like the verify
     vdep = vpar ? d_cdep.as<int>() : nullptr;                   // (> 8 queries need depths; tree mode crashed here)
     auto layer_kernels = [&] {
         embed_multi(v_tokens.as<uint32_t>(), n, E);
@@ -1067,7 +1068,7 @@ bool Qwen35Engine::mtp_advance() {
     // with --lookup-first K) is the draft instead; the MTP cache is rebuilt from the verified tokens either way
     if (opt.lookup > 0) {
         uint32_t lk[NVER];
-        const int n = lookup(lk, std::min(opt.lookup, NVER - 1));
+        const int n = lookup(lk, std::min(opt.lookup, kBaseVerifyColumns - 1));
         if (n >= (opt.lookup_first > 0 ? opt.lookup_first : D + 1)) {
             draft.assign(lk, lk + n);
             D = n;

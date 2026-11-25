@@ -380,7 +380,7 @@ void Qwen35Engine::tp_mix(uint32_t l, uint32_t attn_i, uint32_t lin_i, int n, in
         return;
     }
     const int rows = mix_rows(L);
-    bf16 * TL = n <= NVER ? v_stash2[sp][lin_i].as<bf16>() : T;
+    bf16 * TL = n <= verify_limit() ? v_stash2[sp][lin_i].as<bf16>() : T;
     mix_mm(L, TL, n);
     bf16 * QKVC = v_qkvc.as<bf16>();
     tqllm_cuda::ConvReplay crp;
@@ -425,7 +425,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     const int H = int(cfg.hidden);
     const size_t cnt = size_t(n) * H;
     static const bool eager = tqllm::debug_on("tp_eager");
-    const bool graphs = n <= NVER && !eager;
+    const bool graphs = n <= verify_limit() && !eager;
     const int vkind = !vpar ? 0 : vpar == d_tpar.as<int>() ? 1 : 2;
     auto seg = [&](int r, uint32_t l, int part, auto && body) {
         if (!graphs) return body();
@@ -605,7 +605,7 @@ void Qwen35Engine::verify_body_tp(int n, int max_seq) {
     ck(cudaMemcpyAsync(v_hid.p, X, size_t(n) * H * 2, cudaMemcpyDeviceToDevice, stream));
     if (!segs.empty()) {
         head_argmax(out_norm, n, 0);
-    } else if (n > NVER) {
+    } else if (n > verify_limit()) {
         if (prefill_final) {
             ck(cudaMemcpyAsync(X, X + size_t(n - 1) * H, size_t(H) * 2, cudaMemcpyDeviceToDevice, stream));
             head_argmax(out_norm, 1);

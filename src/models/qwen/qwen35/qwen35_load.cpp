@@ -569,9 +569,10 @@ void Qwen35Engine::allocate() {
     // tensor parallel (fork addition): each GPU holds half the weights, room for 2048-token chunks at any context
     // (TQ_L at 262,144 tokens: 512-token chunks prefill ~15 % slower)
     if (tp) NPF = NBUF = std::max(NPF, 2048);
-    if (opt.ubatch) NPF = NBUF = std::max(NVER, opt.ubatch);
+    if (opt.ubatch) NPF = NBUF = std::max(kBaseVerifyColumns, opt.ubatch);
     // A trained draft block can be wider than the requested prefill micro-batch or verify capacity.
     if (!opt.draft_model.empty()) NBUF = std::max(NBUF, 16 * nslots);
+    if (tp && nslots == 1) NBUF = std::max(NBUF, NVER);
     x = Buf(H * 2);
     norm = Buf(H * 2);
     resid = Buf(H * 2);
@@ -643,7 +644,7 @@ void Qwen35Engine::allocate() {
     v_px = Buf(NBUF * ((H + 255) / 256) * 4);
     v_pm = Buf(NBUF * ((H + 255) / 256) * 4);
     v_logits = Buf(size_t(std::max(NVER, NVER * nslots)) * cfg.vocab * 4);  // batched verify: head over every slot
-    NB = NVER * nslots;  // columns of one batched verify (every slot drafting NVER - 1)
+    NB = tp && nslots == 1 ? NVER : kBaseVerifyColumns * nslots;  // columns of one batched verify (every slot drafting NVER - 1)
     if (NB > NBUF) throw std::runtime_error("too many slots for the column buffers (TQLLM_PREFILL_BUF)");
     v_tok = Buf(size_t(NB) * 4);
     s_id = Buf(size_t(NB) * 16 * 4);
@@ -1009,7 +1010,7 @@ void Qwen35Engine::load_dflash(const std::string & path) {
     dfl.nb = dfl.block;
     if (dfl.dspark) {
         if (!f.num(A + "sample_from_anchor", 1)) throw std::runtime_error("DSpark drafter: only sample_from_anchor is supported");
-        dfl.nb = std::min(dfl.nb, NVER - 1);  // a runtime block may be shorter than the trained one; lattice <= verify width
+        dfl.nb = std::min(dfl.nb, kBaseVerifyColumns - 1);  // a runtime block may be shorter than the trained one; lattice <= verify width
         dfl.block = dfl.nb + 1;
     }
     dfl.group = (dfl.dspark || dfl.dspine) ? 0 : int(f.num(A + "conv_group_size"));

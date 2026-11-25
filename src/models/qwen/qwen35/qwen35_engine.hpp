@@ -598,6 +598,10 @@ private:
     // Gated DeltaNet state is double-buffered per layer: the current state is slot `cur`; verify() writes the state
     // after all n tokens to the other slot and commit(k) either flips `cur` (k == n) or replays k tokens into it.
     static constexpr int NVER = TQLLM_VERIFY_COLUMNS, NSLOT = 2;
+    static constexpr int kBaseVerifyColumns = std::min(NVER, 16);
+    // Wider buffers serve long copy proposals only. Ordinary prompt chunks must select
+    // the same projection, attention and output-head paths as a standard build.
+    int verify_limit() const { return tree_step ? NVER : kBaseVerifyColumns; }
     // prefill chunk: the verify graph over NPF prompt tokens, projections as one GEMM (weights read once per chunk).
     // Larger chunks amortise the per-chunk FP16 weight dequant; the size follows the context budget (buffer memory).
     int NPF = 512, NBUF = 512;
@@ -783,7 +787,7 @@ private:
     Buf fp8_sw;                     // row scales of the current gemm_rows output, [ldo]
     bool fp8_x_ready = false, fp8_used = false;
     size_t prefill_room = 0;        // free device memory after the device-resident KV (chunk rule)
-    Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > NVER): run the LM head only on the final chunk
+    Buf gemm_w, gemm_c, blas_ws;  // prefill cuBLAS path: FP16 weight scratch, FP32 output, capture-safe workspace  // prefill chunks (n > verify_limit()): run the LM head only on the final chunk
     Buf v_feat, feat1, d_x, d_r, d_a, d_b, d_dyn, d_dynf, d_te, d_gate, d_vals, d_idx, d_cand, d_score, d_pos, d_tok, d_kv, d_inj_g, d_inj_kv,
         d_topk;
     Buf dfl_part, ds_t, ds_act, ds_q, ds_o;  // DSpark drafter attention partials and block scratch
@@ -1007,11 +1011,11 @@ public:
         join_commit();  // a commit replay on the side stream writes the state this verify reads
         if (pos == 0) reset_state(), pc_drop();
         kv_track(pos, n);
-        if (!(defer && tree_step && n <= NVER)) flush_pending();
+        if (!(defer && tree_step && n <= verify_limit())) flush_pending();
         // every verify-sized block (decode included) goes through the two-part attention when the KV format has it: a tree
         // with its parents, anything else as a chain. One arithmetic for plain decode, chain / MTP / tree verify, so greedy
         // speculative output equals plain decoding (one-part causal attention groups the sums differently: tests/tree.cu)
-        vpar = n <= NVER && chain2 ? (tree_mode && tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
+        vpar = n <= verify_limit() && chain2 ? (tree_mode && tree_step ? d_tpar.as<int>() : d_chain.as<int>()) : nullptr;
         vdep = !vpar ? nullptr : tree_mode && tree_step ? d_tdep.as<int>() : d_cdep.as<int>();
         uint32_t bucket = 256;
         while (bucket < pos + n) bucket *= 2;
@@ -1027,14 +1031,14 @@ public:
             ck(cudaMemcpyAsync(v_rpos.p, h_rpos, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
         }
         // captured graphs bake in the slot's cache and state pointers, so the slot is part of the key
-        const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > NVER && prefill_final) << 63) |
+        const uint64_t key = (uint64_t(n) << 40) | (uint64_t(cur) << 32) | bucket | (uint64_t(n > verify_limit() && prefill_final) << 63) |
                              (uint64_t(sampling()) << 62) | (uint64_t(active) << 54) | (uint64_t(tree_step) << 53) |
                              (uint64_t(sp) << 52) | (uint64_t(qsa.mode) << 50);
         if (tp) {  // tensor parallel (fork addition): eager, both GPUs interleaved
             verify_body_tp(n, int(bucket));
         } else if (qsa.mode && qsa.mass_left > 0) {
             verify_body(n, int(bucket));
-        } else if (stage_prof && n <= NVER && !mm_chunk && segs.empty()) {
+        } else if (stage_prof && n <= verify_limit() && !mm_chunk && segs.empty()) {
             ck(cudaStreamSynchronize(stream));
             stage_on = true;
             stage_t = std::chrono::steady_clock::now();
@@ -1042,7 +1046,7 @@ public:
             st("zz_tail");
             stage_on = false;
             ++stage_acc["_steps"].second;
-        } else if (n > NVER || mm_chunk) {
+        } else if (n > verify_limit() || mm_chunk) {
             // prefill chunks run eagerly: their sizes and positions vary per prompt, so cached graphs would grow without
             // bound (~12 MB each; a 2-slot server OOMed after ~800 requests), and launch cost is negligible at this size
             if (split_at && !mm_chunk && tokens && gen.rdelta == 0) split_prefill(tokens, pos_host, n, int(bucket));
@@ -1061,7 +1065,7 @@ public:
             ck(cudaGraphLaunch(cached_verify_graph(kGraphVerify, key, [&] { verify_body(n, int(bucket)); }), stream));
         }
         if (next) {
-            const auto * src = v_tok.as<uint32_t>() + (copy_all || n > NVER ? 0 : n - 1);
+            const auto * src = v_tok.as<uint32_t>() + (copy_all || n > verify_limit() ? 0 : n - 1);
             ck(cudaMemcpyAsync(next, src, size_t(copy_all ? n : 1) * 4, cudaMemcpyDeviceToHost, stream));
         }
         last_n = n;
@@ -1167,7 +1171,7 @@ public:
         if (!part) part = v_part.as<float>();
         const bool cmp = kv_cmp && cmp_layer >= 0;
         if (cmp) tqllm_cuda::q_ring_write(Q, n, nh * hd, dpos, kRing, q_ring[size_t(cmp_layer)].as<bf16>(), stream);
-        KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, NVER, mq_split, int64_t(context_), Q, O, part,
+        KvStep step{K0, rows, n, kc, vc, dpos, nh, kvh, hd, verify_limit(), mq_split, int64_t(context_), Q, O, part,
                     1.f / std::sqrt(float(hd)), stream, par, dep, cmp ? &cmp_seg[size_t(cmp_layer)] : nullptr};
         if (qsa.cur && (par || kvf->qsa_one_part())) step.qsa_sel = qsa.cur, step.qsa_from = qsa.from, step.qsa_mixed = qsa.mode == 2;
         kvf->write_and_attend(step);
@@ -1639,7 +1643,7 @@ public:
         std::vector<int> cols(rq.size());
         int col = 0;
         for (size_t i = 0; i < rq.size(); ++i) {
-            rq[i].want = std::min(rq[i].want, NVER - 1);
+            rq[i].want = std::min(rq[i].want, kBaseVerifyColumns - 1);
             cols[i] = col;
             col += 1 + rq[i].want;
         }
@@ -1808,7 +1812,7 @@ public:
             return spec_finish(stats);
         }
         if (!mtp.present) throw std::runtime_error("model has no MTP head");
-        if (D < 1 || D > NVER - 1) throw std::runtime_error("draft length exceeds verify capacity");
+        if (D < 1 || D > kBaseVerifyColumns - 1) throw std::runtime_error("draft length exceeds verify capacity");
         const auto P = uint32_t(prompt.size());
         if (P == 0 || P + count + D + 1 > context_) throw std::runtime_error("request exceeds context capacity");
         const int H = int(cfg.hidden);
@@ -1823,7 +1827,7 @@ public:
                 ck(cudaMemcpyAsync(hbuf.as<bf16>() + ptoks.size() * H, x.p, size_t(H) * 2, cudaMemcpyDeviceToDevice,
                                    stream));
                 ptoks.push_back(prompt[t + 1]);
-                if (int(ptoks.size()) == NVER || t + 2 == P) {
+                if (int(ptoks.size()) == kBaseVerifyColumns || t + 2 == P) {
                     mtp_run(ptoks.data(), hbuf.as<bf16>(), int(ptoks.size()), pstart);
                     pstart += uint32_t(ptoks.size());
                     ptoks.clear();

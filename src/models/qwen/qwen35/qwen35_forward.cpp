@@ -676,7 +676,7 @@ void Qwen35Engine::calibrate_prefill() {
 }
 
 PrefillPath Qwen35Engine::path_of(const Mat & m, int n) const {
-    const bool verify_width = n <= NVER || !segs.empty() || wide_mm;
+    const bool verify_width = n <= verify_limit() || !segs.empty() || wide_mm;
     if (const std::string * v = tqllm::debug_value("prefill_path"); v && *v == "old") {  // A/B against the old rule
         if (n <= m.fmt->max_matvec_cols()) return PrefillPath::matvec;
         if (verify_width) return PrefillPath::batched;
@@ -994,7 +994,7 @@ void Qwen35Engine::kv_track(uint32_t pos, int n) {
 void Qwen35Engine::qsa_plan(uint32_t pos, int n) {
     // token keys are written for one sequence at column 0
     const bool keys = segs.empty() || (segs.size() == 1 && segs[0].col0 == 0);
-    const auto step = qsa.plan.write(int(pos), n, keys, n <= NVER && !mm_chunk && gen.rdelta == 0, qsa.from);
+    const auto step = qsa.plan.write(int(pos), n, keys, n <= verify_limit() && !mm_chunk && gen.rdelta == 0, qsa.from);
     qsa.mode = step.mode;
     if (tp) tp_peer_qsa.mode = step.mode;
     if (!step.pool_count) return;
@@ -1018,7 +1018,7 @@ void Qwen35Engine::qsa_index(const Layer & L, uint32_t attn_i, int n, const int 
     qsa.cur = nullptr;
     // the indexer reads the layer's normalised input in the model's own basis (weight formats rotate inside their products)
     norm_h(v_x.as<bf16>(), L.in_norm, v_px.as<float>(), cfg.eps, xu, H, n, stream);
-    if (n > NVER) {  // prefill chunk: token keys only, one GEMM
+    if (n > verify_limit()) {  // prefill chunk: token keys only, one GEMM
         const float alpha = 1.f, beta = 0.f;
         cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, kQsa27Dim, n, H, &alpha, q.w + size_t(kQsa27Heads) * kQsa27Dim * H,
                         CUDA_R_16F, H, xu, CUDA_R_16F, H, &beta, P, CUDA_R_32F, kQsa27Dim, CUBLAS_COMPUTE_32F,
@@ -1170,7 +1170,7 @@ void Qwen35Engine::ffn_block(const Layer & L, int n, const bf16 * resid) {
             if (li + 1 == long(cfg.layers)) moe_profile_write();
         }
         const bool split = L.n_cold > 0;
-        const bool grouped_gemm = n > NVER && segs.empty() && !wide_mm;
+        const bool grouped_gemm = n > verify_limit() && segs.empty() && !wide_mm;
         // decode: the shared expert rides the routed launches as assignment K of every token (appended to the hot
         // experts at load; same rows and kernels as its dense matvec), ids widened to K + 1 per token
         const bool fuse = L.sh_slot >= 0 && !grouped_gemm;
@@ -1334,7 +1334,7 @@ void Qwen35Engine::head_argmax(const float * norm_w, int n, int col0) {
     }
     if (!k_head()) throw std::runtime_error("multi-token path needs a Q6_K / Q5_K LM head");
     const bool two_stage = !full_logits;
-    if (two_stage && head4.p && has_head8() && (n <= NVER || !segs.empty())) {  // same head path for decode and verify
+    if (two_stage && head4.p && has_head8() && (n <= verify_limit() || !segs.empty())) {  // same head path for decode and verify
         tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
         for (int c0 = 0; c0 < n; c0 += 32)  // batched verify: every slot's columns in one pass per 32
             head4_mv(v_xh.as<__half>() + size_t(c0) * H, v_logits.as<float>() + size_t(c0) * lm_head.rows, lm_head.rows,
