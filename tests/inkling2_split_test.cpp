@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "../src/models/inkling2/inkling2_split.hpp"
 
 namespace {
 
@@ -34,7 +35,7 @@ constexpr double kMonitorBytes = 2.0 * 1024 * 1024 * 1024;
 constexpr double kGpuBytes = 16.0 * 1024 * 1024 * 1024;  // 16 GB per RTX 5060 Ti
 
 // Mirror of Inkling2Engine::dev_of()
-int dev_of(int l, int split_at) { return split_at && l >= split_at ? 1 : 0; }
+int dev_of(int l, int split_at) { return tqllm::inkling2_layer_stage(l, 0, split_at); }
 
 // Mirror of the phys_ mapping in configure()
 int phys_of(int v, int n_visits, int n_pass, int core0, int core1) {
@@ -101,6 +102,18 @@ int main() {
         if (dev_of(l, K) != dev_of(kCore0, K)) core_same_dev = false;
     check(core_same_dev, "core loop (6-17) all on one device");
     check(dev_of(kCore0, K) == 0, "core loop on dev 0 (no PCIe in the 3-pass loop)");
+
+    int previous_stage = 1, switches = 0;
+    for (int v = 0; v < kVisits; ++v) {
+        const int layer = phys_of(v, kVisits, kPass, kCore0, kCore1);
+        const int stage = tqllm::inkling2_layer_stage(layer, kCore0, kCore1);
+        const bool inside_repeated_visits = v >= kCore0 && v < kCore0 + kPass * kNCore;
+        check(stage == (inside_repeated_visits ? 0 : 1), "core-only placement for every visit");
+        check(tqllm::inkling2_layer_stage(layer, 0, 0) == 0, "single GPU placement");
+        switches += stage != previous_stage;
+        previous_stage = stage;
+    }
+    check(switches == 2 && previous_stage == 1, "core-only layout crosses once at each core boundary");
 
     // 5. VRAM budget: K=18 must fit both GPUs within 16 GB.
     const double b0 = dev0_bytes(K);

@@ -130,6 +130,7 @@ on the repair attempt. Set `-PikirUlang` to `off`, `low`, `medium`, `high`, or `
 For an Inkling 2 Mini model already loaded by a local Basalt server, pass its loopback URL to the same harness.
 For example, `./pi-pel.ps1 -InklingUrl http://127.0.0.1:8086/v1 -Pikir high -Cek ./verify.ps1 -Tugas "Implement the ticket"`.
 The harness reads the served model ID and context size from Basalt. Pi registers the provider for that invocation.
+
 After a failed check it can retry in the same session with the verifier's diagnostic.
 If Pi exits partway through a turn, the harness still runs the verifier and includes the observed file or test
 failure in the next attempt. The original task and last check are attached when Pi compacts the session.
@@ -138,6 +139,11 @@ An explicit temperature in the client's request is preserved.
 For a task with a repeatable verifier that covers its full acceptance criteria, add `-CekSaatTulis`.
 Pi runs that verifier after turns that successfully write or edit files. A pass ends generation before another
 edit can regress the task. The launcher checks the final workspace once more before it reports success.
+
+The native CUDA Inkling loader accepts both `inkling2` and `inkling2_loop` GGUF layouts. For two GPUs, set
+`TQLLM_SPLIT=core` in the environment of `tqserve` to place the repeated physical layers on CUDA device 1.
+The prefix, suffix and output head run on device 0. Activations cross devices when entering and leaving the
+core. A numeric split such as `TQLLM_SPLIT=18` places all layers before that index on device 1.
 
 ## 6. Use it with apps and coding agents
 

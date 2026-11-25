@@ -35,6 +35,7 @@
 #include "gguf.hpp"
 #include "gguf_mapped.hpp"
 #include "inkling2_kernels.cuh"
+#include "inkling2_split.hpp"
 #include "quant_kernels.cuh"
 #include "weight_format.hpp"
 
@@ -280,6 +281,7 @@ private:
     int prev_nb_ = 0;  // number of block states retained from the previous pass
     // 2-GPU layer split
     int split_at_ = 0;  // 0 = single GPU; layers [0, split_at_) on dev 1, [split_at_, n_layers_) on dev 0
+    int split_begin_ = 0;  // in core mode the prefix also runs on the output GPU
     int cur_dev_ = 0;   // 0 or 1
     int load_dev_ = 0;  // device the next put()/load targets (set per layer during load())
     cudaStream_t stream_[2] = {nullptr, nullptr};
@@ -331,21 +333,23 @@ private:
     void split_setup() {
         const char * e = std::getenv("TQLLM_SPLIT");
         if (!e || !*e) return;
-        const int k = std::atoi(e);
+        const bool core_only = std::strcmp(e, "core") == 0;
+        const int k = core_only ? core1_ : std::atoi(e);
         int n = 0;
         ck(cudaGetDeviceCount(&n));
         if (n < 2) throw std::runtime_error("TQLLM_SPLIT: needs two CUDA devices");
-        if (k <= 0 || k >= n_layers_) throw std::runtime_error("TQLLM_SPLIT: K must be in 1.." + std::to_string(n_layers_ - 1));
+        if (!core_only && (k <= 0 || k >= n_layers_)) throw std::runtime_error("TQLLM_SPLIT: K must be in 1.." + std::to_string(n_layers_ - 1));
         if (k > core0_ && k < core1_) throw std::runtime_error("inkling2: keep the repeated core on one GPU");
         split_at_ = k;
+        split_begin_ = core_only ? core0_ : 0;
         cuda_of_[0] = 1;  // stage 0 (layers [0,K)) on CUDA device 1
         cuda_of_[1] = 0;  // stage 1 (layers [K,n) + head) on CUDA device 0
         cur_dev_ = 0;
         load_dev_ = 0;
-        std::fprintf(stderr, "inkling2: layer split: layers 0-%d on GPU 1, %d-%d + head on GPU 0\n", k - 1, k, n_layers_ - 1);
+        std::fprintf(stderr, "inkling2: layer split: layers %d-%d on GPU 1, all other layers and head on GPU 0\n", split_begin_, k - 1);
     }
     int head_stage() const { return split_at_ ? 1 : 0; }
-    int dev_of(int l) const { return split_at_ && l >= split_at_ ? 1 : 0; }
+    int dev_of(int l) const { return inkling2_layer_stage(l, split_begin_, split_at_); }
     // Create the stage stream on its owning device.
     void ensure_dev(int d) {
         if (!stream_[d]) {
@@ -1023,6 +1027,7 @@ private:
 
     void compute_logits() {
         // The output projection and its normalization share the final stage.
+        if (cur_dev_ != head_stage()) hop_to(head_stage());
         use_dev(head_stage());
         Stage & S = st();
         __half * h = S.h_.as<__half>();
