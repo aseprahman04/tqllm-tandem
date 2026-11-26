@@ -9,6 +9,7 @@
 #include "basalt/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -127,6 +128,7 @@ public:
     }
     void spec_abort(int) override { checkpoints_.clear(); previous_.clear(); }
     void spec_begin(const std::vector<uint32_t> &ids, uint32_t count, int draft_count) override {
+        const nvtx3::scoped_range range{"Inkling prefill and first token"};
         if (ids.empty() || uint64_t(ids.size()) + count > capacity_)
             throw std::invalid_argument("Inkling pack request exceeds context");
         const auto start = Clock::now();
@@ -203,6 +205,7 @@ public:
     }
     bool spec_advance() override {
         if (output_.size() >= limit_ || (!ignore_eos_ && output_.back() == eos())) return false;
+        const nvtx3::scoped_range range{"Inkling decode step"};
         const size_t before = output_.size();
         if (dspark_ && sampling_.greedy && !has_penalty() && limit_ - before > 1) verify_drafts();
         else output_.push_back(pick(int32_t(output_.back())));
@@ -263,6 +266,7 @@ private:
         }
         const bool copied = proposed > 0;
         if (!copied) {
+            const nvtx3::scoped_range range{"Inkling DSpark proposal"};
             const int ask = std::min({want, draft_limit_, policy_ ? next_drafts_ : kNeuralDrafts});
             require(session().draft_begin(window[0], next_pos_, ask));
             require(session().draft_end(window.data() + 1, confidence.data(), ask, proposed, {}));
@@ -277,7 +281,10 @@ private:
         sampling_.counter = output_.size();
         sampling_.penalty_last_n = 0;
         r.sampling = &sampling_;
-        require(session().decode_window(r));
+        {
+            const nvtx3::scoped_range range{"Inkling target verification"};
+            require(session().decode_window(r));
+        }
         int kept = 0;
         int matched = 0;
         for (int i = 0; i <= proposed; ++i) {

@@ -63,3 +63,21 @@ cache enabled. Set `TQSERVE_INKLING_PACK_TEST_URL` to its local URL and run
 `python tests/test_inkling_pack_cache_live.py`. The test changes the history after
 a long user turn, checks the monitor's reuse counter, and compares the answer to a
 fresh prefill of the same compacted request.
+
+### Profiling a warm decode
+
+On Windows SM120 with CUDA 13.2 we captured node-level traces with Nsight
+Systems 2026.6.1. Version 2025.6.3 caused an illegal CUDA memory access during
+the cold 256K request on the same binary and machine. Use a named Nsight
+session, launch the server with `nsys launch --session-new=inkling -t cuda,nvtx
+--cuda-graph-trace=node tqserve.exe <server arguments>`, and warm the desired
+prefix. Start capture with `nsys start --session=inkling --sample=none
+--cpuctxsw=none -o warm`. Send one post-compaction request, wait for its reply,
+then run `nsys stop --session=inkling`. Export with
+`nsys export --type=sqlite -o warm.sqlite warm.nsys-rep`, then run
+`python tools/inkling_trace.py warm.sqlite`.
+
+The trace marks prefill and first token, individual decode steps, DSpark
+proposals, and target verification. Phase times include their nested ranges.
+GPU kernel durations can overlap. The summary also reports the time with at
+least one active kernel. Measure decode throughput without the profiler.
