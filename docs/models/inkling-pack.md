@@ -33,6 +33,19 @@ up to 15 tokens from the current prompt or from tokens already generated in this
 request. The minimum matching suffix is eight tokens, adjustable with
 `--lookup-first`. Each proposal still passes through the target model.
 
+For long-context greedy coding, the optional local-draft pack limits DSpark's
+middle proposal layer to the same 1,024-token window as its other two layers.
+The target model verifies every proposed token against the full context. The
+conversion copies the original tensor sections and checks their digests.
+It needs disk space for one additional pack and a volume supporting hard links.
+
+```sh
+python tools/inkling_local_draft.py Inkling-2-Mini-NVFP4-MX8.basalt Inkling-MX8-local-draft.basalt --basalt-source /absolute/path/to/basalt
+```
+
+Start the new pack with `--mtp --draft-max 4`. The shorter proposal window can
+change the acceptance rate. Compare decode time and task results on your workload.
+
 Prefill uses the pack's batched CUDA kernels. With
 `--prompt-cache on`, Tandem saves sliding attention rings and convolution state for
 both devices in host memory. Full attention KV remains on its owning device.
