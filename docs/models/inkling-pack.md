@@ -1,6 +1,6 @@
 # Inkling packs on Blackwell
 
-The optional Windows/Linux CUDA build links the Basalt 0.5.7 Inkling model library into
+The optional CUDA build links the Basalt Inkling model library into
 `tqserve`. It accepts the Inkling NVFP4/MXFP8 `.basalt` pack, a matching Inkling GGUF
 tokenizer, one slot, and one or two visible SM120 devices. On two cards the backend
 splits layers according to free VRAM. The GGUF backend remains available in the same build.
@@ -10,13 +10,20 @@ CUDA 13.2 cuBLAS and cuSOLVER libraries on PATH, and the Microsoft Visual C++ x6
 The pack contains the weights. The matching GGUF supplies the tokenizer and chat template.
 
 ```sh
-git clone --branch v0.5.7 --depth 1 https://github.com/jesdga95/basalt
+git clone https://github.com/jesdga95/basalt
+git -C basalt checkout --detach f9e689df02d8f5075b6660812656c222a51790aa
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DTQLLM_BASALT_SOURCE=/absolute/path/to/basalt
 cmake --build build --config Release --target tqserve
 tqserve --model Inkling-2-Mini-NVFP4-MX8.basalt --tokenizer Inkling-2-Mini-UD-Q4_K_XL.gguf --kv fp8 --exact off --context 264192 --prompt-cache on --host 127.0.0.1 --port 19558
 ```
 
-Generation uses plain decode. Prefill uses the pack's batched CUDA kernels. With
+Generation defaults to plain decode. For greedy requests, `--mtp --draft-max 7`
+enables the DSpark drafter shipped in the same pack. The target model verifies
+each proposed token. A nonzero sampling temperature or an active repetition,
+frequency or presence penalty selects single-token decoding. The API returns
+the proposal and acceptance counts in `timings.draft_n` and `timings.draft_n_accepted`.
+
+Prefill uses the pack's batched CUDA kernels. With
 `--prompt-cache on`, Tandem saves sliding attention rings and convolution state for
 both devices in host memory. Full attention KV remains on its owning device.
 Tandem checkpoints roughly every quarter of the context, at the end of the longest

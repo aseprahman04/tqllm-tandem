@@ -33,6 +33,22 @@ def user(text):
 
 @unittest.skipUnless(URL, "requires a dedicated Inkling pack server with prompt caching")
 class InklingPackCache(unittest.TestCase):
+    def test_embedded_drafter_respects_output_limit_and_sampling(self):
+        if "DSpark" not in api("/health")["fit"]:
+            self.skipTest("requires --mtp")
+        body = {
+            "model": "inkling", "messages": [user("List the integers from 1 to 100 in ascending order.")],
+            "temperature": 0, "max_tokens": 9, "chat_template_kwargs": {"enable_thinking": False},
+        }
+        for limit, temperature in [(1, 0), (9, 0), (9, 0.4)]:
+            with self.subTest(limit=limit, temperature=temperature):
+                reply = api("/v1/chat/completions", {**body, "temperature": temperature, "max_tokens": limit})
+                self.assertEqual(reply["usage"]["completion_tokens"], limit)
+                self.assertEqual(reply["choices"][0]["finish_reason"], "length")
+                timings = reply["timings"]
+                self.assertLessEqual(timings["draft_n_accepted"], timings["draft_n"])
+                self.assertEqual(timings["draft_n"] > 0, limit > 1 and temperature == 0)
+
     def test_compacted_tail_matches_cold_and_changed_prefix_is_invalidated(self):
         self.assertIn("Basalt CUDA in-process", str(api("/health")))
         filler = "The shipment register records the date and the weight of each pallet.\n" * 400
