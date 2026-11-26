@@ -1,0 +1,91 @@
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -3499,6 +3499,67 @@
+     }
+ }
+
++// Experimental Inkling gate/up fusion. Ingine groups both projections for the
++// same feature tile and applies softcapped SwiGLU at the producer. This version
++// retains the Basalt pack's independent matrices, q8_1 input and dot order.
++template<int NC, bool Exact>
++__device__ __forceinline__ void paired_gate_up_features(
++        const uint8_t* blob, const block_q8_1* xq, NativeExpertLayout layout,
++        const int32_t* ent_tok, int entry, int n, int tile, float (&hidden)[GRP_NC][32]) {
++    constexpr int kWarpCount = 8;
++    constexpr int kDotCalls = 144;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    int offset[NC];
++#pragma unroll
++    for (int c = 0; c < NC; ++c) offset[c] = ent_tok[entry + min(c, n - 1)] * (2304 / 32);
++    const float gate_scale = nvfp4_tail(blob, layout)[0];
++    const float up_scale = nvfp4_tail(blob, layout)[1];
++    for (int col = warp; col < 32; col += kWarpCount) {
++        const auto* gate_row = blob + (size_t)(tile + col) * layout.gu_row;
++        float gate[NC], up[NC];
++        row_dot_multi<40, NC, Exact, false, kDotCalls>(gate_row, xq, offset, n, 2304 / 64, lane, gate);
++        row_dot_multi<40, NC, Exact, false, kDotCalls>(gate_row + layout.up_off, xq, offset, n, 2304 / 64, lane, up);
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            if (lane == c && (Exact || c < n)) {
++                const float g = gate[c] * gate_scale;
++                const float u = up[c] * up_scale;
++                hidden[c][col] = __fmul_rn(__fmul_rn(layout.gate_softcap * tanhf(g / layout.gate_softcap),
++                                                     1.f / (1.f + expf(-g))), layout.up_softcap * tanhf(u / layout.up_softcap));
++            }
++        }
++    }
++}
++
++__global__ void __launch_bounds__(256) inkling_paired_gate_up_q8_kernel(
++        const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++        const int32_t* ent_tok, const block_q8_1* xq, NativeExpertLayout layout, block_q8_1* hq) {
++    const int groups = *n_groups;
++    if (groups <= (int)gridDim.y) pdl_launch_dependents();
++    if (blockIdx.y >= groups) return;
++    __shared__ float hidden[GRP_NC][32];
++    const int tile = (int)blockIdx.x * 32;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    for (int group = blockIdx.y; group < groups; group += gridDim.y) {
++        const auto* blob = reinterpret_cast<const uint8_t*>(grp_ptr[group]);
++        const int end = grp_start[group + 1];
++        for (int entry = grp_start[group]; entry < end; entry += GRP_NC) {
++            const int n = min(GRP_NC, end - entry);
++            if (n == 1) paired_gate_up_features<1,true>(blob,xq,layout,ent_tok,entry,n,tile,hidden);
++            else if (n == 2) paired_gate_up_features<2,true>(blob,xq,layout,ent_tok,entry,n,tile,hidden);
++            else paired_gate_up_features<GRP_NC,false>(blob,xq,layout,ent_tok,entry,n,tile,hidden);
++            __syncthreads();
++            if (warp < n) {
++                const long long i = (long long)(entry + warp) * layout.n_ff + tile + lane;
++                q8_1_store(hidden[warp][lane], hq, i);
++            }
++            __syncthreads();
++        }
++    }
++}
++
+ enum class Act { Plain, Clamp, Softcap };
+
+ // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
+@@ -3524,6 +3585,12 @@
+     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
+     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
+     if (g_exp_phase != 2) {
++    if (ACT == Act::Softcap && !v1 && !g_old_kernels && L.gu_type == 40 && L.up_type == 40 &&
++        L.n_embd == 2304 && L.n_ff == 1152 && cap_entries <= 64) {
++        inkling_paired_gate_up_q8_kernel<<<dim3((unsigned)L.n_ff / 32, (unsigned)gy), 256, 0, s>>>(
++            grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
++        check("inkling_paired_gate_up_q8");
++    } else {
+     if (L.up_type != L.gu_type) {   // a mixed layer: the gu2 rows only
+         if (v1 || !g_gu2 || g_old_kernels || !gu2_usable(L)) {
+             basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d rows need the default kernels",
+@@ -3581,6 +3648,7 @@
+     }
+     check("native_expert_grouped/swiglu");
+     }
++    }
+     if (g_exp_phase == 1) return;
+     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);

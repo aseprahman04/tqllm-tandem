@@ -1,0 +1,15 @@
+--- a/src/models/inkling2/kernels/attn.cu
++++ b/src/models/inkling2/kernels/attn.cu
+@@ -1921,7 +1921,11 @@
+     }
+     const bool seg_mode = a.seg.at.n > 0 || a.seg.at_d != nullptr;
+     const bool use_mma = !a.int8;
+-    const int mma_z = a.window > 0 ? kWindowMmaSplits : z;
++    // Use Ingine's 16-way full-attention decomposition on long, single-sequence FP8 verify windows.
++    // Keep the allocation stride z for scratch, including the final partial-sum merge.
++    const bool long_fp8 = a.window == 0 && a.fp8 && !seg_mode && rows <= 8 && max_keys >= 32768;
++    const int full_splits = long_fp8 ? std::min(z, 16) : z;
++    const int mma_z = a.window > 0 ? kWindowMmaSplits : full_splits;
+     if (use_mma) {
+         int nseg = 1, max_seg_rows = rows;
+         if (a.seg.at.n > 0) {

@@ -1,0 +1,158 @@
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -1,3 +1,4 @@
++#include <cuda_bf16.h>
+ // src/kernels/cuda/iq_kernels.cu - see include/basalt/kernels/iq_kernels.hpp.
+ //
+ // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
+@@ -3499,6 +3500,122 @@
+     }
+ }
+
++// Experiment based on Ingine's MoE method: one warp contributes a 128-channel
++// slice of a 16-by-8 BF16 product. The upper tile computes the gate and the
++// lower tile computes up for the same eight features. Basalt supplies the
++// packed weight pointers and expert-to-token routing on each owning GPU.
++__device__ __forceinline__ unsigned ink_pair(float a, float b) {
++    const __nv_bfloat162_raw raw = __floats2bfloat162_rn(a, b);
++    return (unsigned)raw.x | ((unsigned)raw.y << 16);
++}
++
++__global__ void inkling_prepare_bf16(const block_q8_1* x, const int* ent_tok, const int* starts, const int* groups, unsigned* out) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    const int entry = i / (2304 / 2);
++    if (entry < starts[0] || entry >= starts[*groups]) return;
++    const block_q8_1& block = x[ent_tok[entry] * (2304 / 32) + (i / 16) % (2304 / 32)];
++    const int k = 2 * (i % 16);
++    const float d = __low2float(block.ds);
++    out[i] = ink_pair(d * block.qs[k], d * block.qs[k+1]);
++}
++
++// Reorder each pair of Basalt's split nibbles to adjacent E2M1 lanes.
++__device__ __forceinline__ unsigned ink_weight_pair(unsigned byte, __half2 scale, float gain) {
++    unsigned raw;
++    asm("{ .reg .b8 b0,b1,b2,b3; mov.b32 {b0,b1,b2,b3},%1; cvt.rn.f16x2.e2m1x2 %0,b0; }"
++        : "=r"(raw) : "r"(byte));
++    const __half2_raw packed{(unsigned short)raw, (unsigned short)(raw >> 16)};
++    const float2 v = __half22float2(__hmul2(static_cast<__half2>(packed), scale));
++    return ink_pair(v.x * gain, v.y * gain);
++}
++__device__ __forceinline__ void ink_unpack32(
++        const uint8_t* row, int chunk, float gain, unsigned (&values)[16]) {
++    const block_nvfp4& b = reinterpret_cast<const block_nvfp4*>(row)[chunk / 2];
++#pragma unroll
++    for (int sub = 0; sub < 2; ++sub) {
++        const int sb = (chunk % 2) * 2 + sub;
++        const __half2 scale = __float2half2_rn(2.f * nvfp4_scale_dev(b.d[sb]));
++#pragma unroll
++        for (int w = 0; w < 2; ++w) {
++            const unsigned bits = get_int_b4(b.qs, 2 * sb + w);
++#pragma unroll
++            for (int j = 0; j < 2; ++j) {
++                const unsigned pair = bits >> (j * 16);
++                const unsigned lo = (pair & 15u) | ((pair >> 4) & 240u);
++                const unsigned hi = ((pair >> 4) & 15u) | ((pair >> 8) & 240u);
++                values[sub*8+w*2+j] = ink_weight_pair(lo,scale,gain);
++                values[sub*8+4+w*2+j] = ink_weight_pair(hi,scale,gain);
++            }
++        }
++    }
++}
++
++__global__ void __launch_bounds__(576,1) inkling_moe_gate_up_bf16_kernel(
++        const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
++        const int32_t* ent_tok, const unsigned* x, NativeExpertLayout layout, float* h) {
++    constexpr int kWarps = 18;
++    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
++    const int row = lane / 4, col = lane % 4, chunk = warp * 4 + col;
++    const int feature = blockIdx.x * 8 + row;
++    const int groups = *n_groups;
++    if (groups <= (int)gridDim.y) pdl_launch_dependents();
++    if (blockIdx.y >= groups) return;
++    __shared__ float partial[kWarps][32][4];
++    for (int group = blockIdx.y; group < groups; group += gridDim.y) {
++        const auto* blob = reinterpret_cast<const uint8_t*>(grp_ptr[group]);
++        const auto* gate_row = blob + feature * (size_t)layout.gu_row;
++        const int end = grp_start[group + 1];
++        for (int first = grp_start[group]; first < end; first += 8) {
++            unsigned gate[16], up[16];
++            ink_unpack32(gate_row, chunk, nvfp4_tail(blob,layout)[0], gate);
++            ink_unpack32(gate_row + layout.up_off, chunk, nvfp4_tail(blob,layout)[1], up);
++            const unsigned* input = first + row < end ? x + (first + row) * (2304/2) + 16 * chunk : nullptr;
++            float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
++#pragma unroll
++            for (int i = 0; i < 16; i += 2) {
++                const unsigned x0 = input ? input[i] : 0, x1 = input ? input[i+1] : 0;
++                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
++                    : "r"(gate[i]), "r"(up[i]), "r"(gate[i+1]), "r"(up[i+1]), "r"(x0), "r"(x1));
++            }
++            partial[warp][lane][0] = d0; partial[warp][lane][1] = d1;
++            partial[warp][lane][2] = d2; partial[warp][lane][3] = d3;
++            __syncthreads();
++            if (warp == 0) {
++                float sum[4] = {};
++#pragma unroll
++                for (int w = 0; w < kWarps; ++w) {
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) sum[j] += partial[w][lane][j];
++                }
++#pragma unroll
++                for (int i = 0; i < 2; ++i) {
++                    const int e = first + 2 * col + i;
++                    if (e < end) {
++                        const float g = sum[i], u = sum[2+i];
++                        h[e * (size_t)layout.n_ff + feature] =
++                            __fmul_rn(__fmul_rn(layout.gate_softcap * tanhf(g/layout.gate_softcap), 1.f/(1.f+expf(-g))),
++                                      layout.up_softcap * tanhf(u/layout.up_softcap));
++                    }
++                }
++            }
++            __syncthreads();
++        }
++    }
++}
++
++template<bool Dep>
++__global__ void inkling_quantize_grouped_activation(const float* h, block_q8_1* hq,
++        const int32_t* start, const int32_t* n_groups, int features) {
++    if constexpr (Dep) pdl_trigger();
++    const int base = start[0] * features;
++    const int end = start[*n_groups] * features;
++    if constexpr (Dep) pdl_wait();
++    const int i = base + blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < end) q8_1_store(h[i], hq, i);
++}
++
+ enum class Act { Plain, Clamp, Softcap };
+
+ // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
+@@ -3524,6 +3641,19 @@
+     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
+     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
+     if (g_exp_phase != 2) {
++    if (ACT == Act::Softcap && !v1 && !g_old_kernels && L.gu_type == 40 && L.up_type == 40 &&
++        L.n_embd == 2304 && L.n_ff == 1152 && cap_entries <= 64 && cap_entries % 8 == 0) {
++        const int entries = (int)cap_entries;
++        auto* xbf = reinterpret_cast<unsigned*>(gate);
++        const int xpairs = entries * (2304 / 2);
++        inkling_prepare_bf16<<<(xpairs+255)/256,256,0,s>>>(X,ent_tok,grp_start,n_groups,xbf);
++        inkling_moe_gate_up_bf16_kernel<<<dim3((unsigned)L.n_ff / 8, (unsigned)gy),576,0,s>>>(
++            grp_ptr, grp_start, n_groups, ent_tok, xbf, L, h);
++        const dim3 qgrid((unsigned)((cap_entries*L.n_ff+255)/256));
++        if (chain) launch_dependent(inkling_quantize_grouped_activation<true>,qgrid,s,h,hq,grp_start,n_groups,(int)L.n_ff);
++        else inkling_quantize_grouped_activation<false><<<qgrid,256,0,s>>>(h,hq,grp_start,n_groups,(int)L.n_ff);
++        check("inkling_moe_gate_up_bf16");
++    } else {
+     if (L.up_type != L.gu_type) {   // a mixed layer: the gu2 rows only
+         if (v1 || !g_gu2 || g_old_kernels || !gu2_usable(L)) {
+             basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d rows need the default kernels",
+@@ -3581,6 +3711,7 @@
+     }
+     check("native_expert_grouped/swiglu");
+     }
++    }
+     if (g_exp_phase == 1) return;
+     const int d_rows = (!g_old_kernels && L.n_ff == 640) ? (kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);

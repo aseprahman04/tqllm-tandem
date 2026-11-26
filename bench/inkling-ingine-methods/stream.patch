@@ -1,0 +1,24 @@
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -1416,6 +1416,12 @@
+     }
+ };
+
++// Ingine's older-toolkit streaming-weight policy, applied to Basalt's 4-byte-aligned NVFP4 blocks.
++__device__ __forceinline__ int inkling_stream_weight(const void* ptr) {
++    unsigned value;
++    asm("ld.global.nc.L1::no_allocate.L2::256B.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
++    return value;
++}
+ template<> inline constexpr bool kSplit<40> = true;
+ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expert FP32 scale is the kernels' (tail_scale)
+     struct W { int2 v[2]; float d4; };
+@@ -1424,7 +1430,7 @@
+         const block_nvfp4* b = (const block_nvfp4*) vbq + kbx;
+         W r;
+ #pragma unroll
+-        for (int i = 0; i < 2; ++i) r.v[i] = get_int_from_table_16(get_int_b4(b->qs, 2 * iqs + i), kvalues_fp4);
++        for (int i = 0; i < 2; ++i) r.v[i] = get_int_from_table_16(inkling_stream_weight(b->qs + 8 * iqs + 4 * i), kvalues_fp4);
+         r.d4 = nvfp4_scale_dev(b->d[iqs]);
+         return r;
+     }

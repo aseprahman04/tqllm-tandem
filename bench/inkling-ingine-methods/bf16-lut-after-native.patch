@@ -1,0 +1,43 @@
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -3519,33 +3519,19 @@
+     out[i] = ink_pair(d * block.qs[k], d * block.qs[k+1]);
+ }
+
+-// Reorder each pair of Basalt's split nibbles to adjacent E2M1 lanes.
+-__device__ __forceinline__ unsigned ink_weight_pair(unsigned byte, __half2 scale, float gain) {
+-    unsigned raw;
+-    asm("{ .reg .b8 b0,b1,b2,b3; mov.b32 {b0,b1,b2,b3},%1; cvt.rn.f16x2.e2m1x2 %0,b0; }"
+-        : "=r"(raw) : "r"(byte));
+-    const __half2_raw packed{(unsigned short)raw, (unsigned short)(raw >> 16)};
+-    const float2 v = __half22float2(__hmul2(static_cast<__half2>(packed), scale));
+-    return ink_pair(v.x * gain, v.y * gain);
+-}
+ __device__ __forceinline__ void ink_unpack32(
+         const uint8_t* row, int chunk, float gain, unsigned (&values)[16]) {
+     const block_nvfp4& b = reinterpret_cast<const block_nvfp4*>(row)[chunk / 2];
+ #pragma unroll
+     for (int sub = 0; sub < 2; ++sub) {
+         const int sb = (chunk % 2) * 2 + sub;
+-        const __half2 scale = __float2half2_rn(2.f * nvfp4_scale_dev(b.d[sb]));
+-#pragma unroll
+-        for (int w = 0; w < 2; ++w) {
+-            const unsigned bits = get_int_b4(b.qs, 2 * sb + w);
+-#pragma unroll
+-            for (int j = 0; j < 2; ++j) {
+-                const unsigned pair = bits >> (j * 16);
+-                const unsigned lo = (pair & 15u) | ((pair >> 4) & 240u);
+-                const unsigned hi = ((pair >> 4) & 15u) | ((pair >> 8) & 240u);
+-                values[sub*8+w*2+j] = ink_weight_pair(lo,scale,gain);
+-                values[sub*8+4+w*2+j] = ink_weight_pair(hi,scale,gain);
+-            }
++        const float sc = nvfp4_scale_dev(b.d[sb]);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const unsigned x = b.qs[sb * 8 + j * 2];
++            const unsigned y = b.qs[sb * 8 + j * 2 + 1];
++            values[sub * 8 + j] = ink_pair((sc * kvalues_fp4[x & 15]) * gain, (sc * kvalues_fp4[y & 15]) * gain);
++            values[sub * 8 + 4 + j] = ink_pair((sc * kvalues_fp4[x >> 4]) * gain, (sc * kvalues_fp4[y >> 4]) * gain);
+         }
+     }
+ }
