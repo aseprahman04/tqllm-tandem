@@ -11,6 +11,7 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_TP` | off | Tandem Qwen3.8-27B: set to 1 for tensor parallelism on two CUDA devices |  |
 | `TQLLM_SPLIT` | off | Tandem Qwen3.8-27B layer split: number of initial decoder layers assigned to CUDA device 1 |  |
 | `TQLLM_INKLING2_LOOPCD` | off | Inkling 2 only: adaptive contrasts the final head with a separate first-pass coda and head (maximum strength 0.5); off uses standard decoding |  |
+| `TQLLM_INKLING2_SAMPLED_DRAFT` | off | Inkling CUDA pack with --mtp: set to 1 to verify proposals using the target sampler at nonzero temperature |  |
 | `TQLLM_MLX_CACHE_LIMIT_MIB` | - | MiB: MLX buffer-cache limit for the Mac tools (default 512) |  |
 | `TQLLM_MLX_PREFILL_CHUNK` | - | N: prefill chunk rows for tqmlx-dflash (>= 128; 2048 is the measured best) |  |
 | `TQLLM_MATVEC_RULE` | - | override the matvec kernel rule table (src/formats/weight/matvec_rules.hpp) per format bits: "BITS:KERNEL[:PF],... (KERNEL legacy or split16)", e.g. "3:split16:2,21:legacy" (3 TQ3, 4 TQ4, 14 IQ4N, 21 IQ3) |  |

@@ -21,8 +21,11 @@ tqserve --model Inkling-2-Mini-NVFP4-MX8.basalt --tokenizer Inkling-2-Mini-UD-Q4
 
 Generation defaults to plain decode. For greedy requests, `--mtp --draft-max 3`
 enables the DSpark drafter shipped in the same pack. The target model verifies
-each proposed token. A nonzero sampling temperature or an active repetition,
-frequency or presence penalty selects single-token decoding. The API returns
+each proposed token. Set `TQLLM_INKLING2_SAMPLED_DRAFT=1` to use the drafter
+at nonzero temperature. Each verifier row draws from the target distribution using
+the seed and its output position. A mismatch commits the sampled target token and
+discards the remaining proposals. By default, sampled requests use single-token
+decoding. Repetition, frequency and presence penalties also select that path. The API returns
 the proposal and acceptance counts in `timings.draft_n` and `timings.draft_n_accepted`.
 
 Draft limits from one to seven use fixed DSpark windows. A larger limit enables

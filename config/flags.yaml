@@ -19,6 +19,10 @@ flags:
     kind: debug
     default: "0"
     doc: "Synchronize the Inkling CUDA device after each group of operations to locate errors; 2 also logs each checkpoint"
+  - name: TQLLM_INKLING2_SAMPLED_DRAFT
+    kind: user
+    default: "off"
+    doc: "Inkling CUDA pack with --mtp: set to 1 to verify proposals using the target sampler at nonzero temperature"
   - name: TQLLM_MLX_CACHE_LIMIT_MIB
     kind: user
     default: "-"

@@ -13,10 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iterator>
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 namespace basalt::models::inkling2 {
 std::unique_ptr<model::ModelAdapter> make_adapter();
@@ -90,9 +92,12 @@ public:
         require(basalt::models::inkling2::make_adapter()->start(load, started_));
         require(session().prepare());
         dspark_ = load.draft;
+        const char * sampled = std::getenv("TQLLM_INKLING2_SAMPLED_DRAFT");
+        sampled_draft_ = dspark_ && sampled && std::string_view(sampled) == "1";
         if (dspark_ && session().max_window() < 2) throw std::invalid_argument("Inkling pack has no usable DSpark drafter");
         note = "Inkling pack, Basalt CUDA in-process, KV " + load.kv;
         if (dspark_) note += ", DSpark";
+        if (sampled_draft_) note += " (sampled verification)";
         for (int i = 0; i < count; ++i) note += "; " + started_.model->gpu_report(i);
     }
 
@@ -207,7 +212,7 @@ public:
         if (output_.size() >= limit_ || (!ignore_eos_ && output_.back() == eos())) return false;
         const nvtx3::scoped_range range{"Inkling decode step"};
         const size_t before = output_.size();
-        if (dspark_ && sampling_.greedy && !has_penalty() && limit_ - before > 1) verify_drafts();
+        if (dspark_ && (sampling_.greedy || sampled_draft_) && !has_penalty() && limit_ - before > 1) verify_drafts();
         else output_.push_back(pick(int32_t(output_.back())));
         if (lookup_)
             for (size_t i = before; i < output_.size(); ++i) lookup_->append(int32_t(output_[i]));
@@ -348,7 +353,7 @@ private:
     uint32_t user_token_, end_message_;
     uint32_t capacity_, limit_ = 0, next_pos_ = 0;
     bool cache_, ignore_eos_ = false;
-    bool dspark_ = false;
+    bool dspark_ = false, sampled_draft_ = false;
     int draft_limit_ = 0;
     int lookup_limit_ = 0, lookup_match_ = 8, next_drafts_ = 3;
     std::optional<basalt::spec::DraftPolicy> policy_;
