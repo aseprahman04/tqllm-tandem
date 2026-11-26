@@ -28,6 +28,9 @@ This product includes third-party code under its own licence:
 
 * third_party/stb/stb_image.h - stb_image by Sean Barrett, public domain or MIT (licence text at the end of the file).
 
+* Optional Inkling pack support links Basalt 0.5.7, copyright (c) 2026 Jesús Gulfo, under the MIT License.
+  Distributions of this build include Basalt's LICENSE and THIRD_PARTY_LICENSES under licenses/basalt.
+
 Credits - work this project builds on or learned from (ideas and formats, no code unless listed above):
 
 * ggml / llama.cpp (Georgi Gerganov and contributors): the GGUF file format and the K-quant and IQ block layouts that
