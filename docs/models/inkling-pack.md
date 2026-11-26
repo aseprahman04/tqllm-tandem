@@ -3,7 +3,9 @@
 The optional CUDA build links the Basalt Inkling model library into
 `tqserve`. It accepts the Inkling NVFP4/MXFP8 `.basalt` pack, a matching Inkling GGUF
 tokenizer, one slot, and one or two visible SM120 devices. On two cards the backend
-splits layers according to free VRAM. The GGUF backend remains available in the same build.
+splits layers according to free VRAM. Use `--split-at N` to move the boundary, or
+`--split experts` to keep the attention layers on the first card while the second
+card handles experts. The GGUF backend remains available in the same build.
 
 The Windows SM120 binary requires an NVIDIA driver compatible with CUDA 13.2, the
 CUDA 13.2 cuBLAS and cuSOLVER libraries on PATH, and the Microsoft Visual C++ x64 runtime.
@@ -11,17 +13,25 @@ The pack contains the weights. The matching GGUF supplies the tokenizer and chat
 
 ```sh
 git clone https://github.com/jesdga95/basalt
-git -C basalt checkout --detach f9e689df02d8f5075b6660812656c222a51790aa
+git -C basalt checkout --detach 0810b58d54eda7517d96fe1e0a8dd1556c8512ec
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DTQLLM_BASALT_SOURCE=/absolute/path/to/basalt
 cmake --build build --config Release --target tqserve
 tqserve --model Inkling-2-Mini-NVFP4-MX8.basalt --tokenizer Inkling-2-Mini-UD-Q4_K_XL.gguf --kv fp8 --exact off --context 264192 --prompt-cache on --host 127.0.0.1 --port 19558
 ```
 
-Generation defaults to plain decode. For greedy requests, `--mtp --draft-max 7`
+Generation defaults to plain decode. For greedy requests, `--mtp --draft-max 3`
 enables the DSpark drafter shipped in the same pack. The target model verifies
 each proposed token. A nonzero sampling temperature or an active repetition,
 frequency or presence penalty selects single-token decoding. The API returns
 the proposal and acceptance counts in `timings.draft_n` and `timings.draft_n_accepted`.
+
+Draft limits from one to seven use fixed DSpark windows. A larger limit enables
+adaptive verification, using the drafter's confidence and the elapsed time of
+previous verification rounds within the current request. The embedded drafter
+predicts at most seven tokens. With `--lookup 15`, a repeated suffix can propose
+up to 15 tokens from the current prompt or from tokens already generated in this
+request. The minimum matching suffix is eight tokens, adjustable with
+`--lookup-first`. Each proposal still passes through the target model.
 
 Prefill uses the pack's batched CUDA kernels. With
 `--prompt-cache on`, Tandem saves sliding attention rings and convolution state for

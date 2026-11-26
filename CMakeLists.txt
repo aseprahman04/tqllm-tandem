@@ -337,7 +337,7 @@ if(TQLLM_CUDA)
     target_compile_definitions(vision_core PRIVATE STB_IMAGE_STATIC)  # both libraries use their own stb decoder
     target_sources(tqserve PRIVATE src/backends/cuda/inkling_pack.cpp)
     target_include_directories(tqserve PRIVATE "${TQLLM_BASALT_SOURCE}/include" "${TQLLM_BASALT_SOURCE}/src")
-    target_link_libraries(tqserve PRIVATE model_inkling2)
+    target_link_libraries(tqserve PRIVATE model_inkling2 spec)
     install(FILES "${TQLLM_BASALT_SOURCE}/LICENSE" "${TQLLM_BASALT_SOURCE}/THIRD_PARTY_LICENSES"
             DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/tqllm/basalt")
   endif()

@@ -5,6 +5,8 @@
 #include "tqllm/tokenizer.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/spec/draft_policy.hpp"
+#include "basalt/spec/suffix_drafter.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -12,6 +14,7 @@
 #include <chrono>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace basalt::models::inkling2 {
@@ -44,6 +47,11 @@ public:
         load.max_context = ctx;
         load.draft = options.native_mtp;
         load.spec = load.draft ? kWindow : 1;
+        if (load.draft && options.lookup > 0) {
+            lookup_limit_ = std::min(options.lookup, kWindow - 1);
+            lookup_match_ = options.lookup_first > 0 ? options.lookup_first : 8;
+            lookup_.emplace(3, std::max(32, lookup_match_), ctx);
+        }
         load.kv = options.kv.empty() ? "fp16" : options.kv;
         if (!options.cache_k.empty() || !options.cache_v.empty() ||
             (load.kv != "fp8" && load.kv != "fp16" && load.kv != "int8"))
@@ -62,12 +70,21 @@ public:
             basalt::model::GpuCards::Card card;
             card.device = card.index = i;
             card.info.name = props.name;
+            card.info.cc_major = props.major;
+            card.info.cc_minor = props.minor;
             card.info.vram = total_bytes;
             card.free = free_bytes;
             card.label = "CUDA " + std::to_string(i) + " (" + props.name + ")";
             load.gpus.cards.push_back(std::move(card));
         }
-        if (count == 2) load.gpus.mode = basalt::program::GpuMode::Split;
+        if (options.split_experts && (count != 2 || options.split_layers || options.split_at != -1))
+            throw std::invalid_argument("Inkling expert split requires two local GPUs and no layer cut");
+        if (options.split_at != -1 && (count != 2 || options.split_at < 1 || options.split_at >= 24))
+            throw std::invalid_argument("Inkling --split-at requires two GPUs and a layer boundary from 1 to 23");
+        if (count == 2) {
+            load.gpus.mode = options.split_experts ? basalt::program::GpuMode::Peer : basalt::program::GpuMode::Split;
+            if (options.split_at > 0) load.gpus.diag_cut = options.split_at;
+        }
         check_cuda(cudaSetDevice(0));
         require(basalt::models::inkling2::make_adapter()->start(load, started_));
         require(session().prepare());
@@ -118,6 +135,10 @@ public:
             throw std::invalid_argument("Inkling token outside pack vocabulary");
         output_.clear();
         draft_limit_ = draft_count > 0 ? std::min(draft_count, kWindow - 1) : 4;
+        policy_.reset();
+        if (dspark_ && (draft_limit_ > kNeuralDrafts || lookup_))
+            policy_.emplace(std::max(draft_limit_, lookup_limit_) + 1);
+        next_drafts_ = 3;
         steps_ = drafted_ = accepted_ = 0;
         limit_ = count;
         const uint32_t tail = uint32_t(ids.size() - 1);
@@ -146,6 +167,10 @@ public:
                 return pos % stride && pos != reference_end && pos != tail;
             });
             std::vector<int32_t> input(ids.begin(), ids.end());
+            if (lookup_) {
+                lookup_->reset();
+                lookup_->append(input.data(), input.size());
+            }
             while (pos < tail) {
                 uint32_t end = cache_ ? std::min(tail, (pos / stride + 1) * stride) : tail;
                 if (pos < reference_end) end = std::min(end, reference_end);
@@ -166,6 +191,7 @@ public:
             if (cache_) previous_ = ids;
             next_pos_ = tail;
             if (count) output_.push_back(pick(input.back()));
+            if (lookup_ && count) lookup_->append(int32_t(output_.back()));
             if (prefill_observer) prefill_observer(uint32_t(ids.size()), uint32_t(ids.size()), reused);
         } catch (...) {
             spec_abort(0);
@@ -177,8 +203,11 @@ public:
     }
     bool spec_advance() override {
         if (output_.size() >= limit_ || (!ignore_eos_ && output_.back() == eos())) return false;
-        if (dspark_ && sampling_.greedy && !has_penalty() && limit_ - output_.size() > 1) verify_drafts();
+        const size_t before = output_.size();
+        if (dspark_ && sampling_.greedy && !has_penalty() && limit_ - before > 1) verify_drafts();
         else output_.push_back(pick(int32_t(output_.back())));
+        if (lookup_)
+            for (size_t i = before; i < output_.size(); ++i) lookup_->append(int32_t(output_[i]));
         return true;
     }
     const std::vector<uint32_t>& spec_tokens(int) const override { return output_; }
@@ -194,7 +223,8 @@ public:
     }
 
 private:
-    static constexpr int kWindow = 8;
+    static constexpr int kWindow = 16;
+    static constexpr int kNeuralDrafts = 7;
     basalt::model::ModelSession& session() { return *started_.sessions.front(); }
     bool has_penalty() const {
         return sampling_.penalty_present || sampling_.penalty_freq || sampling_.penalty_repeat != 1.f;
@@ -217,16 +247,28 @@ private:
         std::array<int32_t, kWindow> window{}, picks{};
         std::array<float, kWindow> confidence{};
         window[0] = int32_t(output_.back());
-        const int room = std::min({draft_limit_ + 1, session().max_window(), int(limit_ - output_.size())});
+        const int room = std::min({std::max(draft_limit_, lookup_limit_) + 1, session().max_window(), int(limit_ - output_.size())});
         const int want = available_rows(session(), next_pos_, room) - 1;
         if (!want) {
             output_.push_back(pick(window[0]));
             return;
         }
-        require(session().draft_begin(window[0], next_pos_, want));
+        const auto start = Clock::now();
         int proposed = 0;
-        require(session().draft_end(window.data() + 1, confidence.data(), want, proposed, {}));
-        if (proposed < 0 || proposed > want) throw std::runtime_error("Invalid Inkling draft count");
+        int match_length = 0;
+        if (lookup_) {
+            proposed = lookup_->propose(std::min(lookup_limit_, want), window.data() + 1);
+            match_length = lookup_->last_match();
+            if (match_length < lookup_match_) proposed = 0;
+        }
+        const bool copied = proposed > 0;
+        if (!copied) {
+            const int ask = std::min({want, draft_limit_, policy_ ? next_drafts_ : kNeuralDrafts});
+            require(session().draft_begin(window[0], next_pos_, ask));
+            require(session().draft_end(window.data() + 1, confidence.data(), ask, proposed, {}));
+            if (proposed < 0 || proposed > ask) throw std::runtime_error("Invalid Inkling draft count");
+            if (policy_) proposed = policy_->window(confidence.data(), proposed) - 1;
+        }
         basalt::model::DecodeRequest r;
         r.tokens = window.data();
         r.pos = next_pos_;
@@ -237,17 +279,27 @@ private:
         r.sampling = &sampling_;
         require(session().decode_window(r));
         int kept = 0;
+        int matched = 0;
         for (int i = 0; i <= proposed; ++i) {
             if (picks[i] < 0 || uint32_t(picks[i]) >= vocab()) throw std::runtime_error("Invalid Inkling verifier token");
             output_.push_back(uint32_t(picks[i]));
             ++kept;
             const bool match = i < proposed && picks[i] == window[i + 1];
-            if (match) ++accepted_;
+            if (match) ++matched;
             if (!match || (!ignore_eos_ && uint32_t(picks[i]) == eos())) break;
         }
         drafted_ += proposed;
+        accepted_ += matched;
         next_pos_ += kept;
         commit_window(kept);
+        if (policy_) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+            if (copied) policy_->observe(true, proposed + 1, matched, match_length, ms);
+            else {
+                policy_->observe_window(confidence.data(), proposed + 1, matched, ms);
+                next_drafts_ = std::clamp(proposed + 1, 2, kNeuralDrafts);
+            }
+        }
     }
     void transfer(uint32_t pos, bool save) {
         basalt::core::RunningState state;
@@ -291,6 +343,9 @@ private:
     bool cache_, ignore_eos_ = false;
     bool dspark_ = false;
     int draft_limit_ = 0;
+    int lookup_limit_ = 0, lookup_match_ = 8, next_drafts_ = 3;
+    std::optional<basalt::spec::DraftPolicy> policy_;
+    std::optional<basalt::spec::SuffixDrafter> lookup_;
     uint64_t steps_ = 0, drafted_ = 0, accepted_ = 0;
     Clock::time_point decode_started_;
     uint64_t prefill_us_ = 0;
