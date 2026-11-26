@@ -868,6 +868,7 @@ int main(int argc, char ** argv) {
                 }
                 // --prompt-cache on, after a chat reply: the engine may prefill the reply as the client will return it while the server is idle
                 // (Engine::prefill_ahead). Not for tool calls (the next request follows at once) or image prompts.
+                const bool native_tool_budget = parsed.tools && !scheduler && model.incremental() && tqserve::InklingTokens(tokenizer).enabled();
                 auto prefill_ahead = [&](const tqserve::DecodeResult & reply) {
                     if (!engine.prompt_cache || scheduler || !chat || !reply.error.empty() || !reply.tool_calls.empty() || !parsed.images.empty()) return;
                     // rendered on the worker: a non-streamed reply is sent without waiting for it
@@ -910,12 +911,12 @@ int main(int argc, char ** argv) {
                     };
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {
                         auto phase1 = parsed;  // thinking budget, streamed: phase 1 deltas, then phase 2 continues the answer
-                        phase1.max_tokens = parsed.thinking_budget;
+                        if (!native_tool_budget) phase1.max_tokens = parsed.thinking_budget;
                         phase1.continuation = 1;
                         tqserve::StreamWriter w1(tokenizer, phase1, name, send);
                         auto first = run_stream(phase1, w1);
                         if (!first.error.empty()) w1.error(first.error);
-                        else if (first.finish_reason != "length") w1.close(first);
+                        else if (first.finish_reason != "length" || (native_tool_budget && !first.hit_thinking_budget)) w1.close(first);
                         else {
                             const bool closed = !first.text.empty();
                             if (!closed) first.reasoning = tqserve::trim_incomplete_utf8(first.reasoning) + parsed.budget_message;
@@ -962,11 +963,11 @@ int main(int argc, char ** argv) {
                         // thinking budget (Qwen's method): think for at most N tokens; if the block is still open, close it with
                         // the documented sentence and continue the answer from prompt + thinking (one extra prefill)
                         auto phase1 = parsed;
-                        phase1.max_tokens = parsed.thinking_budget;
+                        if (!native_tool_budget) phase1.max_tokens = parsed.thinking_budget;
                         phase1.continuation = 1;
                         generated = run(phase1);
                         const bool closed = !generated.text.empty() || generated.finish_reason == "stop";
-                        if (generated.error.empty() && generated.finish_reason == "length") {
+                        if (generated.error.empty() && generated.finish_reason == "length" && (!native_tool_budget || generated.hit_thinking_budget)) {
                             auto phase2 = parsed;
                             phase2.thinking = false;
                             phase2.continuation = 2;

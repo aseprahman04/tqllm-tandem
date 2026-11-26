@@ -49,7 +49,7 @@ std::string utf8(uint32_t cp) {
     return s;
 }
 // byte-level vocabulary: ids 0..255 are the 256 bytes (GPT-2 byte-to-unicode pieces), then specials
-std::string mock(const std::string & dir) {
+std::string mock(const std::string & dir, bool inkling = false) {
     std::vector<int> bs;
     for (int b = 33; b < 127; ++b) bs.push_back(b);
     for (int b = 161; b < 173; ++b) bs.push_back(b);
@@ -65,6 +65,11 @@ std::string mock(const std::string & dir) {
     tokens.push_back("</think>"); types.push_back(3);     // 257
     tokens.push_back("<|user|>"); types.push_back(3);     // 258: end of turn (GLM ends a turn with it, not with EOS)
     tokens.push_back("<|content_text|>"); types.push_back(3);  // Inkling's visible channel
+    if (inkling) for (const char * s : {"<|message_model|>", "<|content_thinking|>", "<|content_invoke_tool_json|>",
+                           "<|end_message|>", "<|message_tool|>", "<|message_user|>", "<|message_system|>"}) {
+        tokens.push_back(s);
+        types.push_back(3);
+    }
     GgufWriter w;
     w.kv_str("general.architecture", "qwen35");
     w.kv_str("tokenizer.ggml.model", "gpt2");
@@ -74,11 +79,66 @@ std::string mock(const std::string & dir) {
     w.kv_strs("tokenizer.ggml.merges", {});
     w.kv_u32("tokenizer.ggml.eos_token_id", 256);
     w.kv_u32("tokenizer.ggml.eot_token_id", 258);
-    const auto path = dir + "/mock_stream.gguf";
+    const auto path = dir + (inkling ? "/mock_inkling.gguf" : "/mock_stream.gguf");
     w.write(path);
     return path;
 }
 std::vector<uint32_t> bytes(const std::string & s) {std::vector<uint32_t> v; for (unsigned char c : s) v.push_back(c); return v;}
+
+bool inkling_tools(tqllm::Tokenizer & tok) {
+    const std::string model = "<|message_model|>", end = "<|end_message|>", invoke = "<|content_invoke_tool_json|>";
+    const std::string text = "<|content_text|>", thinking = "<|content_thinking|>";
+    const std::string args = R"({"key":9007199254740993,"nested":[true,{}]})";
+    const std::string payload = R"({"name":"read","args":)" + args + "}";
+    const std::string call = model + "read" + invoke + payload + end;
+    const std::string prefix = model + thinking + "reason" + end + model + text + "hello" + end;
+    tqserve::ChatRequest req;
+    req.chat = req.tools = req.thinking = true;
+    req.declared_tools = {"read"};
+    req.stop = {"STOP"};
+    auto check = [&](const std::string & sequence, const std::string & visible, const std::string & thought, size_t expected) {
+        const auto ids = tok.encode(sequence);
+        tqserve::DecodeResult result;
+        tqserve::finish(tok, req, ids, result);
+        if (result.text != visible || result.reasoning != thought || result.tool_calls.size() != expected) return false;
+        if (expected && result.finish_reason != "tool_calls") return false;
+        std::string prose, reasoning;
+        std::vector<tqserve::ToolCall> calls;
+        tqserve::StreamWriter writer(tok, req, "test", [&](const std::string & line) {
+            if (line.rfind("data: {", 0) != 0) return true;
+            const auto data = tqllm::parse_json(line.substr(6));
+            const auto * delta = data.get("choices")->arr.front().get("delta");
+            if (const auto * v = delta->get("content")) prose += v->str;
+            if (const auto * v = delta->get("reasoning_content")) reasoning += v->str;
+            if (const auto * v = delta->get("tool_calls")) for (const auto & c : v->arr) {
+                const auto * fn = c.get("function");
+                calls.push_back({fn->get("name")->str, fn->get("arguments")->str});
+            }
+            return true;
+        });
+        writer.update(ids);
+        writer.close(result);
+        if (prose != visible || reasoning != thought || calls.size() != expected) return false;
+        for (size_t i = 0; i < expected; ++i)
+            if (calls[i].name != "read" || calls[i].arguments != args ||
+                result.tool_calls[i].name != "read" || result.tool_calls[i].arguments != args) return false;
+        return true;
+    };
+    req.thinking_budget = 12;
+    req.continuation = 1;
+    tqserve::InklingBudget reasoning_budget(tok, req), tool_budget(tok, req);
+    return reasoning_budget.reached(tok.encode(model + thinking + "long unfinished reasoning")) &&
+           !tool_budget.reached(tok.encode(call)) && !tool_budget.limit() &&
+           check(prefix + call + call, "hello", "reason", 2) &&
+           check(model + text + payload + end, payload, "", 0) &&
+           check(model + thinking + payload + end, "", payload, 0) &&
+           check(prefix + model + "read" + invoke + payload, "hello", "reason", 0) &&
+           check(prefix + model + "other" + invoke + payload + end, "hello", "reason", 0) &&
+           check(model + "read" + invoke + R"({"name":"read","args":{"k":2e}})" + end, "", "", 0) &&
+           check(model + "other" + invoke + R"({"name":"other","args":{}})" + end, "", "", 0) &&
+           check(prefix + "<|message_user|>" + call, "hello", "reason", 0) &&
+           check(model + text + "ok STOP" + end + call, "ok", "", 0);
+}
 }  // namespace
 
 int main() {
@@ -189,8 +249,12 @@ int main() {
         eog_ok = eog_ok && r.reasoning == "think it over" && r.text == "answer";
     }
     std::printf("STREAM_EOG end of turn + reasoning split: %s\n", eog_ok ? "PASS" : "FAIL");
+    tqllm::Tokenizer inkling_tok;
+    inkling_tok.load(mock(dir.string(), true));
+    const bool inkling_ok = inkling_tools(inkling_tok);
+    std::printf("INKLING_TOOL_CHANNELS %s\n", inkling_ok ? "PASS" : "FAIL");
     std::filesystem::remove_all(dir);
-    const bool ok = failures == 0 && final_failures == 0 && linear && eog_ok;
+    const bool ok = failures == 0 && final_failures == 0 && linear && eog_ok && inkling_ok;
     std::puts(ok ? "STREAM_INCREMENTAL_PASS" : "STREAM_INCREMENTAL_FAIL");
     return ok ? 0 : 1;
 }

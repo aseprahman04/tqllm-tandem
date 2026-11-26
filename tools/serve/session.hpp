@@ -32,6 +32,29 @@
 
 namespace tqserve {
 
+enum class InklingChannel { idle, header, thinking, text, arguments, foreign };
+
+struct InklingTokens {
+    uint32_t model, thinking, text, invoke, end, user, system, tool;
+    explicit InklingTokens(const tqllm::Tokenizer & t)
+        : model(t.special_id("<|message_model|>")), thinking(t.special_id("<|content_thinking|>")),
+          text(t.special_id("<|content_text|>")), invoke(t.special_id("<|content_invoke_tool_json|>")),
+          end(t.special_id("<|end_message|>")), user(t.special_id("<|message_user|>")),
+          system(t.special_id("<|message_system|>")), tool(t.special_id("<|message_tool|>")) {}
+    bool enabled() const { return model != ~0u && thinking != ~0u && text != ~0u && invoke != ~0u && end != ~0u; }
+    bool advance(uint32_t id, InklingChannel & channel) const {
+        if (id == user || id == system || id == tool) channel = InklingChannel::foreign;
+        else if (channel == InklingChannel::foreign) return true;
+        else if (id == model) channel = InklingChannel::header;
+        else if (id == end) channel = InklingChannel::idle;
+        else if (id == invoke) channel = channel == InklingChannel::header ? InklingChannel::arguments : InklingChannel::idle;
+        else if (id == thinking) channel = InklingChannel::thinking;
+        else if (id == text) channel = InklingChannel::text;
+        else return false;
+        return true;
+    }
+};
+
 struct ServeOptions {
     int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
@@ -154,6 +177,7 @@ struct ChatRequest {
     uint32_t max_tokens = 64;
     bool chat = true;
     bool tools = false;  // tool schemas were rendered: parse <tool_call> blocks in the output
+    std::vector<std::string> declared_tools;
     bool thinking = false;  // prompt opens a <think> block: split the output into reasoning_content / content
     // reasoning budget, llama.cpp semantics: -1 unlimited, 0 end thinking immediately, N > 0 at most N thinking tokens, then the
     // message + end-of-thinking tag are forced and the answer continues. budget_set / message_set: the request named them
@@ -427,6 +451,13 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                     }
                 }
                 req.tools = tools && tools->kind == tqllm::Json::Array && !tools->arr.empty();
+                if (req.tools) {
+                    for (const auto & tool : tools->arr) {
+                        const auto * fn = tool.get("function");
+                        const auto * name = (fn ? fn : &tool)->get("name");
+                        if (name && name->kind == tqllm::Json::String) req.declared_tools.push_back(name->str);
+                    }
+                }
                 req.prompt_text = (*renderer)(msgs, req.tools ? tools : nullptr, kw);
                 if (!req.thinking) req.prompt_text += serve_options().think_off;
                 req.ok = true;
@@ -606,10 +637,33 @@ struct DecodeResult {
     double prefill_ms = 0, decode_ms = 0;
     uint64_t draft_n = 0, draft_accepted = 0;
     std::string finish_reason = "length";
+    bool hit_thinking_budget = false;
     std::string error;
 };
 
 inline void extract_tool_calls(DecodeResult & r);
+
+// Keep an in-progress native tool call in one decode. A large write may exceed the thinking
+// budget after the model has already left its reasoning channel.
+class InklingBudget {
+public:
+    InklingBudget(const tqllm::Tokenizer & tokenizer, const ChatRequest & req)
+        : tags_(tokenizer), limit_(req.continuation == 1 && req.tools && tags_.enabled() && req.thinking_budget > 0
+                                      ? static_cast<size_t>(req.thinking_budget) : 0) {}
+    bool reached(const std::vector<uint32_t> & ids) {
+        if (!limit_ || ids.size() < limit_) return false;
+        const auto end = ids.begin() + limit_;
+        const bool left_thinking = std::any_of(ids.begin(), end, [&](uint32_t t) {
+            return t == tags_.end || t == tags_.text || t == tags_.invoke;
+        });
+        if (left_thinking) limit_ = 0;
+        return !left_thinking;
+    }
+    size_t limit() const { return limit_; }
+private:
+    InklingTokens tags_;
+    size_t limit_;
+};
 
 // The prompt a chat client's next request most likely begins with: this request's messages plus the reply as it comes
 // back (its content and tool calls; its reasoning too when the client returns reasoning), rendered as any request is, up to
@@ -851,6 +905,63 @@ inline void split_reasoning(const tqllm::Tokenizer & tokenizer, const ChatReques
     for (const auto & stop : req.stop)
         if (const auto p = stop.empty() ? std::string::npos : result.text.find(stop); p != std::string::npos) result.text.resize(p);
 }
+// Inkling emits a tool name in its message header and a JSON envelope in a dedicated token channel.
+// Only a closed, consistently named call declared by the client can become an OpenAI tool call.
+inline bool split_inkling_tools(const tqllm::Tokenizer & tokenizer, const ChatRequest & req,
+                                const std::vector<uint32_t> & output, DecodeResult & result) {
+    if (!req.tools) return false;
+    const InklingTokens tags(tokenizer);
+    if (!tags.enabled()) return false;
+    auto channel = req.thinking ? InklingChannel::thinking : InklingChannel::text;
+    std::string header;
+    result.text.clear();
+    result.reasoning.clear();
+    size_t start = 0;
+    for (size_t i = 0; i <= output.size(); ++i) {
+        const auto previous = channel;
+        if (i < output.size() && !tags.advance(output[i], channel)) continue;
+        if (previous == InklingChannel::foreign) break;
+        if (i != start) {
+            const auto part = tokenizer.decode({output.begin() + start, output.begin() + i});
+            if (previous == InklingChannel::text) {
+                result.text += part;
+                size_t cut = std::string::npos;
+                for (const auto & stop : req.stop)
+                    if (!stop.empty()) cut = std::min(cut, result.text.find(stop));
+                if (cut != std::string::npos) {
+                    result.text.resize(cut);
+                    result.finish_reason = "stop";
+                    break;
+                }
+            } else if (previous == InklingChannel::thinking) {
+                if (req.thinking) result.reasoning += part;
+            } else if (previous == InklingChannel::header) {
+                header = part;
+            } else if (previous == InklingChannel::arguments && i < output.size() && output[i] == tags.end &&
+                       std::find(req.declared_tools.begin(), req.declared_tools.end(), header) != req.declared_tools.end()) {
+                try {
+                    std::string arguments;
+                    const auto envelope = tqllm::Parser::parse_with_member(part, "args", arguments);
+                    const auto * name = envelope.get("name");
+                    const auto * args = envelope.get("args");
+                    if (name && name->kind == tqllm::Json::String && name->str == header &&
+                        args && args->kind == tqllm::Json::Object &&
+                        std::count_if(envelope.obj.begin(), envelope.obj.end(), [](const auto & field) { return field.first == "name"; }) == 1)
+                        result.tool_calls.push_back({header, std::move(arguments)});
+                } catch (const std::runtime_error &) {
+                    // An incomplete or invalid envelope cannot be dispatched.
+                }
+            }
+        }
+        if (channel == InklingChannel::header) header.clear();
+        start = i + 1;
+    }
+    result.text = trim(result.text);
+    result.reasoning = trim(result.reasoning);
+    if (!result.tool_calls.empty()) result.finish_reason = "tool_calls";
+    return true;
+}
+
 inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & gen,
                    DecodeResult & result) {
     {
@@ -866,6 +977,7 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
             output.push_back(tok);
         }
         if (req.return_token_ids) result.token_ids = output;
+        if (split_inkling_tools(tokenizer, req, output, result)) return;
         result.text = tokenizer.decode(output);
         for (const auto & stop : req.stop) {
             if (stop.empty()) continue;
@@ -904,13 +1016,16 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
         if (req.observation) req.observation->decoding();
         RepeatGuard guard;
-        while (model.spec_advance()) {
+        InklingBudget budget(tokenizer, req);
+        while (!(result.hit_thinking_budget = budget.limit() && budget.reached(model.spec_tokens(0))) && model.spec_advance()) {
             const auto & ids = model.spec_tokens(0);  // used before the next advance only
             if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
             if (guard.check(ids)) break;
         }
         uint64_t st[5] = {};
-        finish(tokenizer, req, model.spec_finish(st), result);
+        auto generated = model.spec_finish(st);
+        if (result.hit_thinking_budget) generated.resize(budget.limit());
+        finish(tokenizer, req, generated, result);
         set_timings(result, st);
         return result;
     }
@@ -957,6 +1072,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         if (i + 1 < count) next = model.forward(next, static_cast<uint32_t>(prompt.size()) + i, true);
     }
     if (req.return_token_ids) result.token_ids = output;
+    if (split_inkling_tools(tokenizer, req, output, result)) return result;
     split_reasoning(tokenizer, req, output, result);
     if (req.tools) extract_tool_calls(result);
     return result;
@@ -1102,8 +1218,9 @@ public:
     using Send = std::function<bool(const std::string &)>;  // false: the client went away
     StreamWriter(const tqllm::Tokenizer & tok, const ChatRequest & req, std::string model, Send send)
         : tok_(tok), req_(req), plain_(req), model_(std::move(model)), send_(std::move(send)),
-          created_(std::to_string(std::time(nullptr))) {
-        plain_.tools = false;
+          created_(std::to_string(std::time(nullptr))), tags_(tok), native_tools_(req.tools && tags_.enabled()),
+          channel_(req.thinking ? InklingChannel::thinking : InklingChannel::text) {
+        plain_.tools = native_tools_;
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
         const auto te = tok_.encode(serve_options().think_close);  // finish() splits on this id only when it is one token
         think_id_ = te.size() == 1 ? int64_t(te[0]) : -1;
@@ -1116,7 +1233,7 @@ public:
             take(gen[k - 1]);
             if (req_.thinking && !emit_view(view(rraw_, rlead_, rlast_), sr_, true)) return false;
             const std::string_view text = answer_view();
-            if (req_.tools) { if (!emit_view(text.substr(0, rstrip(text, tool_limit(text))), sc_, false)) return false; }
+            if (req_.tools && !native_tools_) { if (!emit_view(text.substr(0, rstrip(text, tool_limit(text))), sc_, false)) return false; }
             else if (!emit_view(text, sc_, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
@@ -1128,7 +1245,7 @@ public:
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
             if (!emit(r.reasoning, sr_, true, false)) return false;
-            if (req_.tools) { if (!emit_tool_text(r.text, sc_)) return false; }
+            if (req_.tools && !native_tools_) { if (!emit_tool_text(r.text, sc_)) return false; }
             else if (!emit(r.text, sc_, false, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
@@ -1168,7 +1285,7 @@ public:
     // thinking budget: send what is left of a phase's deltas without the final chunk; a phase-2 writer skips the role
     bool flush(const DecodeResult & r) {
         if (!emit(r.reasoning, sr_, true, true)) return false;
-        if (!req_.tools) return emit(r.text, sc_, false, true);
+        if (!req_.tools || native_tools_) return emit(r.text, sc_, false, true);
         const size_t end = rstrip(r.text, tool_text_limit(r.text));  // tool markup: nothing past the first block is ours to send
         return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
     }
@@ -1217,8 +1334,12 @@ private:
     void take(uint32_t t) {  // the same token handling as finish(): stop at EOS, split reasoning at </think>
         if (done_) return;
         if (tok_.is_eog(t)) {if (!req_.ignore_eos) done_ = true; return;}  // ignore_eos: counted, not printed
-        if (req_.thinking && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
-        std::string & raw = req_.thinking && !in_answer_ ? rraw_ : araw_;
+        if (native_tools_) {
+            if (tags_.advance(t, channel_) || stop_at_ != std::string::npos) return;
+            if (channel_ != InklingChannel::text && channel_ != InklingChannel::thinking) return;
+        } else if (req_.thinking && !in_answer_ && think_id_ >= 0 && int64_t(t) == think_id_) {in_answer_ = true; return;}
+        const bool reasoning = native_tools_ ? channel_ == InklingChannel::thinking : req_.thinking && !in_answer_;
+        std::string & raw = reasoning ? rraw_ : araw_;
         const size_t from = raw.size();
         raw += tok_.decode({t});
         if (&raw == &rraw_) extend_trim(rraw_, from, rlead_, rlast_);
@@ -1226,7 +1347,7 @@ private:
     }
     // the answer as finish() returns it: trimmed (thinking) or raw, cut at the first stop string
     std::string_view answer_view() {
-        const std::string_view t = req_.thinking ? view(araw_, alead_, alast_)
+        const std::string_view t = (req_.thinking || native_tools_) ? view(araw_, alead_, alast_)
                                  : req_.tools ? (alead_ == std::string::npos ? std::string_view() : std::string_view(araw_).substr(alead_))
                                               : std::string_view(araw_);
         if (stop_at_ != std::string::npos) return t.substr(0, std::min(stop_at_, t.size()));
@@ -1315,6 +1436,9 @@ private:
     std::string model_;
     Send send_;
     std::string created_, sr_, sc_;
+    InklingTokens tags_;
+    bool native_tools_;
+    InklingChannel channel_;
     size_t hold_ = 0, seen_ = 0;
     bool role_sent_ = false;
     // incremental update() state
@@ -1358,15 +1482,19 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
         model.spec_begin(prompt, count, draft_length(model.native_mtp())); }
     if (req.observation) req.observation->decoding();
     RepeatGuard guard;
+    InklingBudget budget(tokenizer, req);
     send_first();
-    while (live && model.spec_advance()) {
+    while (live && !(result.hit_thinking_budget = budget.limit() && budget.reached(model.spec_tokens(0))) && model.spec_advance()) {
         const auto & ids = model.spec_tokens(0);  // used before the next advance only
         if (req.observation) req.observation->tokens(static_cast<uint32_t>(ids.size()));
         if (guard.check(ids)) break;
+        if ((result.hit_thinking_budget = budget.reached(ids))) break;
         if (!on_tokens(ids)) { if (req.observation) req.observation->finish("cancelled"); break; }
     }
     uint64_t st[5] = {};
-    finish(tokenizer, req, model.spec_finish(st), result);
+    auto generated = model.spec_finish(st);
+    if (result.hit_thinking_budget) generated.resize(budget.limit());
+    finish(tokenizer, req, generated, result);
     set_timings(result, st);
     return result;
 }

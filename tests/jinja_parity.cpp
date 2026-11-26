@@ -36,6 +36,15 @@ int main(int argc, char ** argv) {
     const std::string cases_text = slurp(cases_path);
     tqllm::Json cases = tqllm::Parser(cases_text).parse();
     int bad = 0;
+    {
+        const auto nested = tqllm::parse_json(R"([{"z":{"b":2,"a":1},"a":0}])");
+        tqserve::JinjaTemplate sorted(R"({{ tools | tojson(sort_keys=true, separators=(",", ":")) }}|{{ tools | tojson(separators=(",", ":")) }})");
+        const auto actual = sorted.render(tqllm::parse_json("[]"), &nested, false, nullptr);
+        if (actual != R"([{"a":0,"z":{"a":1,"b":2}}]|[{"z":{"b":2,"a":1},"a":0}])") {
+            std::cerr << "tojson nested sorting failed: " << actual << "\n";
+            ++bad;
+        }
+    }
     for (const auto & [name, body_json] : cases.obj) {
         // re-serialise the case body for parse_request
         std::string body;

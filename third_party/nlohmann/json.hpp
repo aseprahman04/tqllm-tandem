@@ -28,6 +28,15 @@ struct Json {
 class Parser {
 public:
     explicit Parser(const std::string & s) : s_(s) {}
+    // Extract a top-level member's original JSON while validating the envelope. Tool
+    // arguments may carry integer identifiers wider than the metadata reader's double.
+    static Json parse_with_member(const std::string & source, const std::string & key, std::string & raw) {
+        Parser parser(source);
+        parser.raw_key_ = &key;
+        parser.raw_value_ = &raw;
+        raw.clear();
+        return parser.parse();
+    }
     Json parse() {
         Json v = value();
         ws();
@@ -38,6 +47,8 @@ public:
 private:
     const std::string & s_;
     size_t i_ = 0;
+    const std::string * raw_key_ = nullptr;
+    std::string * raw_value_ = nullptr;
     int depth_ = 0;  // arrays / objects open; request bodies are untrusted, so recursion is bounded
     static constexpr int kMaxDepth = 512;
     struct Nest {
@@ -140,7 +151,14 @@ private:
             for (;;) {
                 auto k = string();
                 expect(':');
-                v.obj.emplace_back(std::move(k), value());
+                ws();
+                const size_t begin = i_;
+                auto member = value();
+                if (raw_key_ && depth_ == 1 && k == *raw_key_) {
+                    if (!raw_value_->empty()) fail("duplicate captured member");
+                    *raw_value_ = s_.substr(begin, i_ - begin);
+                }
+                v.obj.emplace_back(std::move(k), std::move(member));
                 if (peek() == ',') { ++i_; continue; }
                 expect('}');
                 return v;
@@ -167,11 +185,21 @@ private:
         if (s_.compare(i_, 5, "false") == 0) return i_ += 5, v.kind = Json::Bool, v;
         if (s_.compare(i_, 4, "null") == 0) return i_ += 4, v;
         const size_t start = i_;
-        while (i_ < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[i_])) || std::strchr("+-.eE", s_[i_])))
-            ++i_;
-        if (start == i_) fail("bad value");
+        auto take = [&](char ch) { if (i_ < s_.size() && s_[i_] == ch) { ++i_; return true; } return false; };
+        auto digits = [&] {
+            const size_t begin = i_;
+            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') ++i_;
+            if (begin == i_) fail("expected digit");
+        };
+        take('-');
+        if (!take('0')) digits();
+        if (take('.')) digits();
+        if (take('e') || take('E')) {
+            if (!take('+')) take('-');
+            digits();
+        }
         v.kind = Json::Number;
-        v.num = std::stod(s_.substr(start, i_ - start));
+        if (!raw_key_) v.num = std::stod(s_.substr(start, i_ - start));
         return v;
     }
 };
