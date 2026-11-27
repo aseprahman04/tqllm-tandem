@@ -4,6 +4,7 @@
 #include "prefill_observer.hpp"
 #include "tqllm/tokenizer.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
+#include "basalt/core/model_file.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/spec/draft_policy.hpp"
 #include "basalt/spec/suffix_drafter.hpp"
@@ -38,7 +39,7 @@ public:
     InklingPack(const std::string &path, const std::string &tokenizer, uint32_t ctx,
                 int slots, const EngineOptions &options) : capacity_(ctx), cache_(options.prompt_cache) {
         if (slots != 1 || options.tp_world != 1 || options.kv_compact || !options.draft_model.empty())
-            throw std::invalid_argument("Inkling pack requires one slot and local GPUs; its optional DSpark drafter is in the pack");
+            throw std::invalid_argument("Inkling pack requires one slot and local GPUs; its optional drafter is embedded in the pack");
         Tokenizer tokens;
         tokens.load(tokenizer);
         if (tokens.special_id("<|content_text|>") != 200004 || tokens.eos_id() != eos())
@@ -49,6 +50,23 @@ public:
         load.paths = {path};
         load.max_context = ctx;
         load.draft = options.native_mtp;
+        if (load.draft) {
+            basalt::core::ModelFile file;
+            std::string error;
+            if (!file.open(path, error) || !file.load_meta(error)) throw std::runtime_error(error);
+            const auto *kv = file.meta().get("gguf_kv");
+            if (kv && kv->get("inkling2.dflash2.block_count")) {
+#if __has_include("models/inkling2/dflash2.hpp")
+                drafter_ = Drafter::DFlash2;
+#else
+                throw std::invalid_argument("Rebuild Tandem with DFlash2-capable Basalt kernels for this pack");
+#endif
+            } else if (kv && kv->get("inkling2.dspark.block_count")) {
+                drafter_ = Drafter::DSpark;
+            } else {
+                throw std::invalid_argument("Inkling --mtp requires a pack with an embedded drafter");
+            }
+        }
         load.spec = load.draft ? kWindow : 1;
         if (load.draft && options.lookup > 0) {
             lookup_limit_ = std::min(options.lookup, kWindow - 1);
@@ -91,19 +109,18 @@ public:
         check_cuda(cudaSetDevice(0));
         require(basalt::models::inkling2::make_adapter()->start(load, started_));
         require(session().prepare());
-        dspark_ = load.draft;
         const char * sampled = std::getenv("TQLLM_INKLING2_SAMPLED_DRAFT");
-        sampled_draft_ = dspark_ && sampled && std::string_view(sampled) == "1";
-        if (dspark_ && session().max_window() < 2) throw std::invalid_argument("Inkling pack has no usable DSpark drafter");
+        sampled_draft_ = has_drafter() && sampled && std::string_view(sampled) == "1";
+        if (has_drafter() && session().max_window() < 2) throw std::invalid_argument("Inkling pack has no usable draft window");
         note = "Inkling pack, Basalt CUDA in-process, KV " + load.kv;
-        if (dspark_) note += ", DSpark";
+        if (has_drafter()) note += drafter_ == Drafter::DFlash2 ? ", DFlash2" : ", DSpark";
         if (sampled_draft_) note += " (sampled verification)";
         for (int i = 0; i < count; ++i) note += "; " + started_.model->gpu_report(i);
     }
 
     bool incremental() const override { return true; }
-    bool has_drafter() const override { return dspark_; }
-    bool native_mtp() const override { return dspark_; }
+    bool has_drafter() const override { return drafter_ != Drafter::None; }
+    bool native_mtp() const override { return has_drafter(); }
     uint32_t layers() const override { return uint32_t(started_.model->desc().n_layers); }
     uint32_t hidden() const override { return uint32_t(started_.model->desc().n_embd); }
     uint32_t vocab() const override { return uint32_t(started_.model->desc().n_vocab); }
@@ -143,7 +160,7 @@ public:
         output_.clear();
         draft_limit_ = draft_count > 0 ? std::min(draft_count, kWindow - 1) : 4;
         policy_.reset();
-        if (dspark_ && (draft_limit_ > kNeuralDrafts || lookup_))
+        if (has_drafter() && (draft_limit_ > kNeuralDrafts || lookup_))
             policy_.emplace(std::max(draft_limit_, lookup_limit_) + 1);
         next_drafts_ = 3;
         steps_ = drafted_ = accepted_ = 0;
@@ -212,7 +229,7 @@ public:
         if (output_.size() >= limit_ || (!ignore_eos_ && output_.back() == eos())) return false;
         const nvtx3::scoped_range range{"Inkling decode step"};
         const size_t before = output_.size();
-        if (dspark_ && (sampling_.greedy || sampled_draft_) && !has_penalty() && limit_ - before > 1) verify_drafts();
+        if (has_drafter() && (sampling_.greedy || sampled_draft_) && !has_penalty() && limit_ - before > 1) verify_drafts();
         else output_.push_back(pick(int32_t(output_.back())));
         if (lookup_)
             for (size_t i = before; i < output_.size(); ++i) lookup_->append(int32_t(output_[i]));
@@ -271,7 +288,7 @@ private:
         }
         const bool copied = proposed > 0;
         if (!copied) {
-            const nvtx3::scoped_range range{"Inkling DSpark proposal"};
+            const nvtx3::scoped_range range{drafter_ == Drafter::DFlash2 ? "Inkling DFlash2 proposal" : "Inkling DSpark proposal"};
             const int ask = std::min({want, draft_limit_, policy_ ? next_drafts_ : kNeuralDrafts});
             require(session().draft_begin(window[0], next_pos_, ask));
             require(session().draft_end(window.data() + 1, confidence.data(), ask, proposed, {}));
@@ -353,7 +370,9 @@ private:
     uint32_t user_token_, end_message_;
     uint32_t capacity_, limit_ = 0, next_pos_ = 0;
     bool cache_, ignore_eos_ = false;
-    bool dspark_ = false, sampled_draft_ = false;
+    enum class Drafter { None, DSpark, DFlash2 };
+    Drafter drafter_ = Drafter::None;
+    bool sampled_draft_ = false;
     int draft_limit_ = 0;
     int lookup_limit_ = 0, lookup_match_ = 8, next_drafts_ = 3;
     std::optional<basalt::spec::DraftPolicy> policy_;

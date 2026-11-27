@@ -13,14 +13,14 @@ The pack contains the weights. The matching GGUF supplies the tokenizer and chat
 
 ```sh
 git clone https://github.com/jesdga95/basalt
-git -C basalt checkout --detach 0810b58d54eda7517d96fe1e0a8dd1556c8512ec
+git -C basalt checkout --detach 0f578db2e5f5601980f00dde09e0ba9e13c43718
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DTQLLM_BASALT_SOURCE=/absolute/path/to/basalt
 cmake --build build --config Release --target tqserve
 tqserve --model Inkling-2-Mini-NVFP4-MX8.basalt --tokenizer Inkling-2-Mini-UD-Q4_K_XL.gguf --kv fp8 --exact off --context 264192 --prompt-cache on --host 127.0.0.1 --port 19558
 ```
 
 Generation defaults to plain decode. For greedy requests, `--mtp --draft-max 3`
-enables the DSpark drafter shipped in the same pack. The target model verifies
+enables the embedded DSpark or DFlash2 drafter. The target model verifies
 each proposed token. Set `TQLLM_INKLING2_SAMPLED_DRAFT=1` to use the drafter
 at nonzero temperature. Each verifier row draws from the target distribution using
 the seed and its output position. A mismatch commits the sampled target token and
@@ -28,13 +28,27 @@ discards the remaining proposals. By default, sampled requests use single-token
 decoding. Repetition, frequency and presence penalties also select that path. The API returns
 the proposal and acceptance counts in `timings.draft_n` and `timings.draft_n_accepted`.
 
-Draft limits from one to seven use fixed DSpark windows. A larger limit enables
+Draft limits from one to seven use fixed proposal counts. A larger limit enables
 adaptive verification, using the drafter's confidence and the elapsed time of
 previous verification rounds within the current request. The embedded drafter
 predicts at most seven tokens. With `--lookup 15`, a repeated suffix can propose
 up to 15 tokens from the current prompt or from tokens already generated in this
 request. The minimum matching suffix is eight tokens, adjustable with
 `--lookup-first`. Each proposal still passes through the target model.
+
+To use DFlash2 with an existing Inkling target quantization, embed the weights once
+using the Basalt checkout above and the matching Inkling DFlash2 checkpoint.
+The converter copies the target tensors and experts from the source pack. It requires
+NumPy, enough disk space for another pack, and a volume supporting hard links.
+
+```sh
+hf download incoai/Inkling-2-Mini-DFlash2 --revision 4f9088ea --local-dir Inkling-DFlash2 --include config.json model.safetensors
+python tools/inkling_dflash2_pack.py Inkling-DSpark.basalt Inkling-DFlash2 Inkling-DFlash2.basalt --basalt-source /absolute/path/to/basalt
+```
+
+Select the resulting pack with `--model`. The service's startup note identifies
+the selected drafter. Both drafters use the same Tandem target sampler and prefix
+cache. DFlash2 stores its five sliding 2,048-token KV windows with the checkpoint.
 
 For long-context greedy coding, the optional local-draft pack limits DSpark's
 middle proposal layer to the same 1,024-token window as its other two layers.
